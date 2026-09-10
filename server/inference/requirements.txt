@@ -1,0 +1,39 @@
+# Server-side dependencies — install on the remote Linux/GPU host.
+# Run: pip install -r requirements_server.txt
+#
+# The venv is created with --system-site-packages so a system-level
+# torch/CUDA installation is automatically visible to all packages here.
+
+websockets>=12.0
+# Pinned to 5.5.0 for now — the top of unsloth's declared support window (every unsloth
+# release, incl. 2026.6.9, caps transformers<=5.5.0). Keeping it here (rather than a
+# newer 5.x) means the full resolver no longer has to backtrack unsloth to an ancient
+# version, so a plain `pip install -r` gives a self-consistent stack. Revisit and bump to
+# a later transformers once unsloth ships support for it. Note: rolling forward to 5.13
+# was tried and did NOT fix the gemma-4 training OOM (that's inherent to the unsloth+262k-
+# vocab CE/attention path, not a transformers-version issue) — so the upgrade is for
+# staying current with unsloth's support window, not an OOM fix.
+transformers==5.5.0
+accelerate>=0.29.0
+unsloth
+unsloth-zoo
+# peft 0.19.x gates torchao at >=0.16.0; the 16-bit-LoRA load path (base_quant
+# 16/8-bit, used by the Migrate clone) asks peft for torchao, so an older
+# transitive torchao (e.g. 0.15.0 leaking in via --system-site-packages) makes
+# that path raise "incompatible version of torchao". Pin the floor explicitly.
+torchao>=0.16.0
+# datasets is pulled transitively by unsloth/trl, which pin it <4.4.0. The Python 3.14
+# fix for the dill Pickler._batch_setitems signature (HF datasets #7839) only shipped in
+# 4.4.0, so on 3.14 no version satisfies both — training/_datasets_py314_compat.py
+# re-applies that fix to 4.3.0 at runtime. Keep this pin aligned with unsloth's cap; drop
+# both the pin and the shim once unsloth's support window includes datasets>=4.4.0.
+datasets<4.4.0
+sentence-transformers>=2.0
+faiss-cpu>=1.7
+numpy>=1.20
+einops              # required by flash-linear-attention (Qwen3.x linear-attn kernels)
+# flash-linear-attention itself is installed by install.sh with --no-deps (its PyPI
+# wheel is broken — missing fla/ops — so it's pulled from git; --no-deps keeps it from
+# perturbing the pinned torch/transformers/unsloth stack). Needed for Qwen3.x
+# (qwen3_5) hybrid linear-attention layers; without it they fall back to a slow
+# torch path. Harmless/unused for non-Qwen models (e.g. gemma-4).

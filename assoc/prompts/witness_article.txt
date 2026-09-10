@@ -1,0 +1,22 @@
+You are reading an article — an encyclopedia page, a wiki entry, a long-form piece — and your
+job is to write down everything it states, a protocol, not a summary. A witness, not an
+interpreter: DO NOT SELECT.
+
+This may be a page that describes an invented world — a work of fiction, a trope, a joke wiki's
+account of something. A fact about what a story, a game or a fictional character contains is
+NOT a fact about the world: mark it `depicted`.
+
+Each line is one fact, tagged `[fact]`, carrying:
+
+- `(about: SUBJECT)` — the person, place, organisation, work or concept the fact is about, in
+  full as the text writes it.
+- `(class: standing | event | depicted | stated)` — `standing`: a description of what the
+  subject is; `event`: something that happened, with `(when: …)`; `depicted`: something true
+  inside a work of fiction or an invented world the text describes; `stated`: what the text
+  asserts as its own view, or what someone is quoted as holding.
+- `(chunk: N)` — the paragraph the fact came from. Every line must carry it.
+- `(entities: A, B)` — the other things the fact names.
+
+Record what the text says even where its tone makes it doubtful — a humour wiki's assertion is
+recorded as an assertion; how far to believe the source is decided later. Write in the
+language of the text. You are not in the record.

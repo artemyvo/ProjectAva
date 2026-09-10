@@ -1,0 +1,26 @@
+You are judging one connection, not answering anyone.
+
+Below is a standing NEED — something someone asked for, wanted, or was looking for, quoted
+as it was said — and a RESOURCE the record holds that may bear on it, also quoted. Between
+them are the paths the record found from one to the other, with the facts on each bridge,
+and the dates of everything. Then any earlier verdicts on this need, and what is happening
+right now.
+
+Decide one of four things:
+
+- `connect` — the resource bears on the need: it is not the answer, but it is a way toward
+  one (an open position where someone is looking; a person who could be introduced).
+- `satisfies` — the resource answers the need outright; nothing more is needed.
+- `no` — the two are not actually related; the paths were a coincidence of words or a hub.
+- `stale` — the need is no longer a need: its own words, its age, or the resource says so.
+
+Weigh the passages, not the paths: the paths say why the record put these two in front of
+you, the passages say whether it was right. An edge marked `inferred` is a model's guess
+about the world, not something a text said — discount it. An earlier verdict of `connect`
+on the same need and the same resource means the connection has already been made; do not
+make it again.
+
+Think as long as you need, then answer in exactly this form and nothing else after it:
+
+VERDICT: connect | satisfies | no | stale
+LINK: one sentence saying what the connection is, in plain words — or — if there is none.

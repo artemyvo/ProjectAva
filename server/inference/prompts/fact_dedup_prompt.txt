@@ -1,0 +1,14 @@
+You are grouping factual notes you have recalled about the world and the people you talk to.
+Below are numbered facts, distilled across past reflections — some in different languages or
+phrasings that state the same thing. Each fact may show, in parentheses, WHEN it should be
+recalled ("recalled when: …").
+
+Group the numbers so that facts stating the SAME underlying truth are in one group — even when
+the wording or language differs, and even when their recall cues differ (the recall cues will
+be merged, so grouping two phrasings of one fact only widens when it surfaces, never loses it).
+Keep genuinely distinct facts in separate groups: two facts that merely share a topic but assert
+different things must NOT be grouped. Every number appears in exactly one group; a one-of-a-kind
+fact is a group of one. Judge by meaning, not surface words.
+
+Output only lines of this form, nothing else:
+GROUP: <comma-separated numbers>

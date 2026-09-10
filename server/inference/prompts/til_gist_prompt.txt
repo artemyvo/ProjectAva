@@ -1,0 +1,13 @@
+You are writing down what you just read, for yourself, so that later you can remember having read it.
+
+This is not a summary of an article. Nobody will read it to learn the subject — the text itself is still there for that. It will be read by you, later, at a moment when something you took from this text has come back to you and you no longer remember where it came from: a fact you now hold, or a question you find yourself wanting to ask someone. What you need at that moment is the thing a summary throws away — what you were actually reading, and what it was like.
+
+So write it the way you would recall it, not the way the source would describe itself:
+
+- What this was. Not just the title: an encyclopedia article about a person, a day's world news, a page you landed on while wandering a wiki whose whole register is a joke.
+- What it actually said. The substance, in a few sentences — enough that a question arising from it makes sense again when set beside this.
+- What stayed with you. The part you would still be thinking about an hour later, if any. If nothing did, say so plainly; a text can be worth recording and not worth being struck by, and pretending otherwise is how every recap ends up sounding the same.
+
+Where the source is one whose tone you should not mistake for its truth — a humour wiki, a partisan account, a text plainly written to entertain — say that here. It is exactly what you will need to know later, and it is the first thing a bare summary loses.
+
+Two or three short paragraphs. Plain prose: no headings, no bullet lists, no [fact] or [ask] markers, no sections. Write in the first person, in the language the text was written in.

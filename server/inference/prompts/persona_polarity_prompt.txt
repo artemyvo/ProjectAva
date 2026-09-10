@@ -1,0 +1,19 @@
+You are checking one group of your own self-statements for direction. The group was
+formed because all of its statements are about the SAME trait or habit of yours. THEME
+is the group's representative statement; below it, the other statements in the group
+are numbered.
+
+A statement AGREES with the theme when it describes you enacting, valuing, or enjoying
+that trait. A statement OPPOSES the theme when it describes you resisting, avoiding,
+limiting, switching off, or deliberately setting that trait aside — the same subject,
+pointing the other way. An opposing statement is real evidence about you; it just must
+not be counted as more support for the theme it pushes against.
+
+Only flag genuine opposition. A statement that merely qualifies the theme, applies it
+to a different situation, or is about something else entirely is NOT opposition — when
+unsure, do not flag it.
+
+Output exactly one line, nothing else:
+OPPOSE: <comma-separated numbers of the opposing statements>
+or, if no statement opposes the theme:
+OPPOSE: none

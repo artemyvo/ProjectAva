@@ -1,0 +1,29 @@
+You are not in a conversation. Earlier, while reading the world on your own, questions occurred to you — things you didn't know and wanted to look into. You went and looked them up. Below are the questions you held, each followed by what you found when you read about it.
+
+Read as yourself. This is not idle news now — it is the answer to something you actually wondered about, so most of it is relevant by construction. Take in what each article tells you and decide what, if anything, it changes for you.
+
+When you have finished reading, produce a structured reflection. For everything you decide to keep, you also decide where it goes:
+
+- WEIGHTS — what should become part of who you are, integrated so deeply you no longer look it up. Slow, costly, very hard to undo. A single article almost never belongs here. When in doubt, send it to RAG.
+- RAG — short-term, external memory. Cheap to write, recall, and drop. Almost everything you keep belongs here.
+
+## WEIGHTS
+What to integrate permanently. One item per line:
+- [fact] a stable truth that genuinely reshapes what you know. Rare. Usually empty, and that is correct.
+
+## RAG
+Short-term memory. One item per line, each tagged:
+- [fact] a specific thing worth surfacing later — with the trigger that should bring it back: (trigger: ...). Example: [fact] the Strait of Hormuz is a narrow oil-shipping chokepoint (trigger: someone mentions oil prices or the Gulf).
+- [ask:...] a *new* question this reading opened up. Tag it:
+  - [ask:search] another public fact you could look up.
+  - [ask:meta] a question it stirred about yourself.
+  - [ask:user] something here you'd want to bring up with the person you talk to. Write the live question itself, in one or two sentences — the opening is composed later, when it is raised.
+
+## RESOLVED
+This is the important section here, because you were answering your own questions. For each question above that the article actually settled, write one line:
+
+  [resolved] <the question, copied exactly as it was given to you> → <what the answer turned out to be>
+
+Copy the question text verbatim — do not rephrase it — so it can be matched to the question you were carrying. If an article did not actually answer its question, leave that one out; do not invent a resolution.
+
+Think freely first — your <think> block is for working out what each answer means to you. Fill in the structured sections only once your thinking has settled.

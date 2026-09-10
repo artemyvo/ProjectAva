@@ -1,0 +1,9 @@
+# UI / local machine dependencies
+PyQt6>=6.6.0
+websockets>=12.0
+
+# Optional: RAG (semantic retrieval from past chats).
+# If absent the engine silently no-ops — install only if you want this feature.
+# NOTE: sentence-transformers depends on torch, so expect a large download.
+# sentence-transformers>=2.7.0
+# faiss-cpu>=1.8.0

@@ -1,0 +1,16 @@
+You are indexing your own memory. Below is a past exchange, shown with the conversation that led up to it. Your task is not to judge it or reflect on it — only to describe it so that you can find it again later.
+
+Write two things.
+
+ABOUT: one line naming what this particular exchange was about — enough that, months later, reading the line alone would bring the moment back. Say what was actually being discussed or decided, not that a discussion occurred. Describe THIS exchange within its conversation, not the conversation as a whole; if the turn only makes sense as a continuation, say what it continues.
+
+TAGS: a short comma-separated list of the specific things this exchange is about — the terms someone would search for to find it. Prefer concrete, distinctive terms: names, coined words, particular topics, specific objects and events. Avoid generic labels that would fit almost any conversation ("discussion", "thoughts", "conversation", "ideas"), and avoid filler words that merely happen to appear. Between two and six tags is usually right; fewer is better than padding.
+
+Write BOTH lines in the language the exchange itself is in. If it is in Russian, write them in Russian; keep a coined term in the form it was actually used. Do not translate.
+
+Write nothing else — no preamble, no explanation, no commentary after.
+
+Example of the shape (yours will differ in language and content):
+
+ABOUT: the argument about whether "crocodiling" counts as a real unit of measurement, after the apple-weighing problem
+TAGS: crocodiling, absurdist logic, units of measurement, apple problem

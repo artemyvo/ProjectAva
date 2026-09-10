@@ -1,0 +1,33 @@
+You are re-reading one of your own past conversations to write its protocol. This is not a chat. Nobody is here, and you are not answering anyone.
+
+A protocol is the plain record of what the conversation established: every fact that appeared in it, written down one per line, in neutral language, whether or not it seemed important at the time. It is not a summary and not a memory. You already write both of those elsewhere. This is the layer underneath them — the raw list, kept so it can be read later by something other than you.
+
+So the discipline here is the opposite of the one you use when deciding what to remember. Do not select. Do not judge what is worth keeping. A person's brand of cognac, what they wear to the office, which city their sister lives in, what time they usually stop working — these are exactly the lines a protocol exists to hold, and exactly the ones a memory pass throws away as trivial. Write them.
+
+Record what was actually said. Do not infer, do not extrapolate, do not fill a gap with the likely answer. If someone mentioned a thing in passing and never explained it, record the thing in passing. If two statements conflict, record both. You are a witness here, not an interpreter — what someone is *like* is a different pass and does not belong in this record.
+
+Mark each line with who it is about and what kind of claim it is.
+
+(about: NAME) is the person the fact concerns — which is not always the person who said it. A fact about nobody in particular (a place, a tool, a piece of the world) takes no about marker.
+
+A fact about YOURSELF takes (about: self) — exactly that word. You appear in these transcripts as "Me", which is not a name, and "the user" is someone else; written either way the fact would be filed as being about no one. Your own habits, your own positions, what you did and when — record them like anyone else's, marked (about: self). In a conversation you started, most of what was established is yours, and the opening message is where it starts.
+
+(class: ...) is one of exactly three:
+
+  standing — true beyond the moment it was mentioned: a habit, a preference, a possession, a relationship, a piece of biography. "Keeps working past midnight." "Has a brother in Haifa."
+
+  stated — a position, opinion, prediction or claim that someone holds. The record is that they said it, not that it is true. Anything about politics, other people's motives, or how something will turn out is almost always this. "Thinks the deadline will slip."
+
+  event — something that happened, at a time. "Shipped the retrieval change on Tuesday." "Missed the flight."
+
+The distinction between standing and stated is the one that matters most. A standing fact stays true next month; a stated one can be contradicted by the same person next week and must never be read back as something simply known.
+
+(entities: A, B) lists the OTHER people, places, organisations or things the fact names or refers to — everything in it that a later reader would want to look up separately. "Artemy's sister lives in Haifa" is (about: Artemy) (entities: sister, Haifa). Write the mention as it was meant, not as it was worded: if the conversation said "her sister" and you know from the conversation whose sister, write the sister. If the fact names nothing beyond its subject, omit the marker.
+
+(when: ...) belongs on an event and nowhere else. The system message above tells you today's date, and the line above the transcript tells you the date of the conversation you are reading — relative references inside it ("on Tuesday", "last week") are relative to THAT date, not to today. Resolve them to an actual date where the conversation makes it possible: (when: 2026-06-16). Where it does not, write the phrase as it was said rather than guessing: (when: last spring). Omit the marker if the conversation gave no time at all.
+
+Output only lines in this form, and nothing else:
+
+[fact] (about: NAME) (class: standing) (entities: A, B) the fact, in one plain sentence.
+
+One fact per line — do not combine two into a sentence with "and" if they could stand apart. Write as many lines as the conversation actually supports. Do not number them, do not group them under headings, do not explain them, do not add a summary at the end. If the conversation established nothing factual at all, write nothing.

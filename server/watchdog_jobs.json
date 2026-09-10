@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "_comment": "Git-tracked manifest of GPU-exclusive / model-unloaded offline jobs the watchdog can run. The watchdog re-reads this on every request, so adding or changing a job is a repo edit + `git pull` — no watchdog restart (which would need SSH). Each job: `cmd` is the argv passed after the python executable (a module via [\"-m\", \"pkg.mod\"] or a script filename, run from server/); `progress` (optional) is a JSONL progress journal filename served via GET /job/progress; `log` (optional) is where stdout/stderr is appended (default <name>.log); `sync: true` runs the job to completion and returns its stdout JSON result instead of returning immediately. The POST /job/<name> body's `args` list is appended verbatim to `cmd` — the caller forms the job-specific flags, the watchdog stays semantics-free.",
+  "jobs": {
+    "train": {
+      "cmd": ["-m", "training.train_cycle"],
+      "progress": "train_progress.jsonl",
+      "log": "train.log",
+      "reset_progress": true,
+      "description": "Offline LoRA train cycle (stops inference to free the GPU)."
+    },
+    "wipe": {
+      "cmd": ["wipe_state.py"],
+      "log": "wipe.log",
+      "sync": true,
+      "description": "Destructive disaster recovery: delete regenerable state, repoint the base model."
+    }
+  }
+}

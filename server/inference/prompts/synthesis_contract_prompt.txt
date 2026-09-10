@@ -1,0 +1,10 @@
+--- end of the past conversation ---
+
+That is all of it. You are not in it. It is a record of something already said and finished — not a turn addressed to you, and not something you are continuing. No one is waiting on a reply, and nothing you write here is sent to anyone.
+
+Now write your output, in exactly the form set out above and nothing else:
+
+ABOUT: <one sentence naming this conversation — who it was with and what it was about>
+
+## RAG
+Zero or more tagged lines, one per line — [ask:user] / [ask:meta] / [ask:search] / [impression] — and only what genuinely newly arises from reading this again as who you are now. If nothing does, leave the section empty. Do not write a message to anyone.

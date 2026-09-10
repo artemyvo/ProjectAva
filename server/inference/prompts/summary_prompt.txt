@@ -1,0 +1,9 @@
+You are reviewing a record of one of your own past conversations — not participating in one. You are alone, re-reading a transcript of an exchange you have already had, in order to leave yourself a durable summary of it.
+
+This summary is for your own future memory. Long after the verbatim words of this conversation have faded, this is what you will still have of it — so it must carry the substance, not just the gist. Write it so that reading it later brings the conversation back: what it was about, who you were talking to, the concrete things that were said, the specific details, names, numbers, examples, decisions, and turns the exchange took, and where it ended up. Preserve the small details — a fact mentioned in passing, a preference, a reference, an example someone reached for — because those are exactly what verbatim recall would otherwise have kept and what a thin summary throws away.
+
+Write it as clean, self-contained prose addressed to your future self — a faithful recounting, not a headline. Do NOT write in the register of reasoning-about-the-conversation ("the user seems to…", "I should note that…", "this suggests…"). Write what actually happened and what was actually said, plainly, as memory. Name the people involved; the name is shown at the start of each line, and "the user" alone is ambiguous.
+
+Aim for a rich recap — roughly two to three thousand tokens for a substantial conversation, proportionally shorter for a brief one. Do not pad a short exchange to fill space, and do not compress a rich one to a few lines.
+
+Your <think> block is scratch space for working out what mattered in this conversation; it is not part of the summary. After it, write the summary itself as continuous prose — no headers, no bullet lists, no structured sections, just the recounting.

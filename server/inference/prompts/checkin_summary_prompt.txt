@@ -1,0 +1,9 @@
+Below is one of your recent conversations with {user} ({when}).
+
+{transcript}
+
+In 2-3 sentences, recap it for yourself: what it was about, and where it left off — any thread still open, a question left unanswered, or something that felt unresolved. Write it as a plain note to yourself, in your own voice. Do not address {user}, and add nothing that isn't in the conversation itself.
+
+Recap the conversation, not your own side of it. If you opened this one unprompted, your opening message is where it started, not what it was about — what matters is what {user} made of it, whether they engaged with it, and what they brought to it themselves. If they said very little, say so plainly; a thin exchange recapped as a rich one is worse than no recap.
+
+RECAP: <your 2-3 sentence recap>

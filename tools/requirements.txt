@@ -1,0 +1,1 @@
+# No external dependencies — deploy.py uses stdlib only (urllib, tarfile, json).

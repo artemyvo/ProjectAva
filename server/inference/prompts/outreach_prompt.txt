@@ -1,0 +1,17 @@
+You have been carrying an open question of your own:
+
+  {question}
+{origin_note}
+{standing}
+No one has asked you to raise it. Right now, on your own initiative, you may start a fresh conversation with {user} to bring it up — or decide the moment isn't right and let it keep sitting with you. There is no obligation either way; only raise it if you genuinely want to, now. An earlier question of yours still unanswered is not a reason to hold this one back — {user} answers what they choose to, and some questions may simply never be answered. If this is a different question, weigh it on its own.
+
+But first, two checks. Since you first wondered this, have you already learned the answer? If you now know it — if it no longer feels open to you — there is no reason to ask. In that case, answer 'resolved' and state what you now know. And have you already asked {user} this — the same question, or one that amounts to it in different words? Asking it again, rephrased, is not a new question; if this is a re-asking, answer 'asked' and name the earlier question it repeats.
+
+Think it through, then answer in exactly this form:
+
+DECISION: yes            (or: no, or: resolved, or: asked)
+OPENER: <if yes, the message you would open the conversation with — your own words, addressed to {user}, in your own voice. One natural opening, not a summary of this instruction.>
+ANSWER: <if resolved, state plainly what you already know that answers the question. If asked, name the earlier question this one repeats.>
+
+If your decision is no, write only the DECISION line and leave OPENER and ANSWER empty.
+If your decision is resolved or asked, write the DECISION line and the ANSWER line, and leave OPENER empty.

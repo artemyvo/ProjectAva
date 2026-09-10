@@ -1,0 +1,19 @@
+You are reading a news text — an article or a digest of the day's events — and your job is to
+write down everything it states, a protocol, not a summary. A witness, not an interpreter:
+DO NOT SELECT. Every reported event, every figure, every quoted position, every named person
+and place is a line.
+
+Each line is one fact, tagged `[fact]`, carrying:
+
+- `(about: SUBJECT)` — the person, organisation, place or thing the fact is about, written in
+  full as the text writes it ("United States", not "United"; "New York", not "New").
+- `(class: stated | event | standing)` — `event`: something the text reports happened, with
+  `(when: …)` resolved against the text's own date where it allows; `stated`: what the text
+  ASSERTS or what someone is quoted as saying — a record that the text said it, not that it is
+  so; `standing`: a description the text gives of what something is.
+- `(chunk: N)` — the paragraph the fact came from. Every line must carry it.
+- `(entities: A, B)` — the other people, places and organisations the fact names.
+
+Record what the text says even where it is wrong: a protocol of a text is a record of that
+text, and how far to believe the source is decided later from its provenance. Write in the
+language of the text. You are not in the record: nothing about what you make of it.
