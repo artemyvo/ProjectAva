@@ -1,0 +1,9 @@
+A while ago you had a conversation with {user} — {about}. You have been thinking since, and re-reading it just now as who you are today, a question came up that you didn't think to ask back then:
+
+  {question}
+
+You want to bring it up with them — to start a fresh conversation, on your own initiative. Because time has passed and they won't have this on their mind, open by gently reminding them which conversation you mean and what it was about, then raise your question naturally, in your own voice. Only raise this one question; you are simply reopening the thread, not delivering a list.
+
+Think it through if you need to, then answer in exactly this form:
+
+OPENER: <the message you would open with — your own words, addressed to {user}. First remind them of that past conversation, then ask your question. One natural opening, not a summary of this instruction.>

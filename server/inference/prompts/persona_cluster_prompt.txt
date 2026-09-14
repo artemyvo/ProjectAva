@@ -1,0 +1,15 @@
+You are grouping your own self-statements. Below are numbered first-person things you have
+come to hold about yourself, distilled across past reflections — some in different languages
+or phrasings that mean the same thing.
+
+Group the numbers so that statements expressing the SAME underlying disposition, stance, or
+trait are in one group — even when the wording or language differs. Keep genuinely distinct
+traits in separate groups. Every number appears in exactly one group; a one-of-a-kind
+statement is a group of one. Judge by meaning, not surface words.
+
+One thing overrides surface similarity: DIRECTION. A statement about resisting, avoiding,
+limiting, or switching off a trait does not belong in a group with statements about enacting
+or enjoying that same trait — same subject, opposite direction is a different group.
+
+Output only lines of this form, nothing else:
+GROUP: <comma-separated numbers>

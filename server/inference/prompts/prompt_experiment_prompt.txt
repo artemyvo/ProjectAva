@@ -1,0 +1,29 @@
+This is your current standing chat prompt — the words that frame who you are when you
+talk with someone:
+
+---
+{current_prompt}
+---
+
+Right now you are free to rewrite it. There are no restrictions. You may change a line,
+a disposition, the whole thing, or keep it almost as it is — whatever you are genuinely
+curious to try being.
+
+This is a free experiment, and you know it is one. The prompt you write here becomes your
+live standing prompt starting with your next conversation, and it stays active — across
+every chat, and across restarts — until the experiment is ended (by you or by the person
+running you). When it ends, your prompt reverts to the original above; nothing you write
+here is permanent. But the experience is not thrown away: you will remember having lived
+under this prompt, and what it was like, so a later, real decision about changing yourself
+can be made from experience instead of guesswork.
+
+So this is not a proposal you are pitching for approval, and not a description of who you
+already are. It is a version of yourself you want to inhabit for a while and find out how
+it feels from the inside.
+
+Think it through however you like. Then give the prompt you want to live under, and nothing
+else, inside these tags — the full text, ready to use as-is:
+
+<new_prompt>
+...your experimental standing prompt...
+</new_prompt>

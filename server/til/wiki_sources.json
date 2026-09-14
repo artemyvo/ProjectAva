@@ -1,0 +1,21 @@
+{
+  "_comment": "Approved wiki sources for the random 'wander' serendipity source (fetch_wiki.py). Grouped by language. Flip 'enabled' to approve a source — only enabled ones are ever drawn from. 'api' is the MediaWiki api.php base; 'namespace' 0 = main/article space. Random pages are uncurated, so enabling a source is an explicit choice about what entropy Ava drinks from.",
+
+  "en": [
+    {"name": "Wikipedia (EN)", "api": "https://en.wikipedia.org/w/api.php", "enabled": true, "namespace": 0,
+     "note": "neutral baseline; has TextExtracts"}
+  ],
+
+  "ru": [
+    {"name": "Wikipedia (RU)", "api": "https://ru.wikipedia.org/w/api.php", "enabled": false, "namespace": 0,
+     "note": "neutral baseline; has TextExtracts"},
+    {"name": "Lurkmore", "api": "https://lurkmore.media/api.php", "enabled": true, "namespace": 0,
+     "note": "large, officially dead RU internet-culture humor wiki; MediaWiki 1.40"},
+    {"name": "Urban Culture", "api": "https://urbanculture.wiki/api.php", "enabled": true, "namespace": 0,
+     "note": "western-style RU culture wiki, fairly inactive; MediaWiki 1.44, has TextExtracts"},
+    {"name": "Neolurk", "api": "https://neolurk.org/w/api.php", "enabled": true, "namespace": 0,
+     "note": "Z-aligned RU humor wiki; API is at /w/api.php (the bare /api.php 404s). May also block bots (Cloudflare / UA) from some hosts — verify on the box"},
+    {"name": "WikiTropes", "api": "https://wikitropes.ru/w/api.php", "enabled": true, "namespace": 0,
+     "note": "Викитропы — RU narrative-tropes wiki (TV Tropes-style); MediaWiki 1.42, rich prose. API at /w/api.php (bare /api.php 404s)"}
+  ]
+}

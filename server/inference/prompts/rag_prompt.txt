@@ -1,0 +1,8 @@
+The following are excerpts from past conversations. They are provided as soft background
+context only — not as authoritative facts. They may be incomplete, outdated, or only
+partially relevant. Use them as a loose reference if helpful; do not treat them as ground
+truth, and do not cite or repeat them verbatim unless clearly useful to the user.
+
+--- Past conversation excerpts ---
+{context}
+--- End of past conversation excerpts ---

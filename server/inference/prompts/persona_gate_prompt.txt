@@ -1,0 +1,18 @@
+You are checking the boundary lines of your own habits. Each numbered item below is
+one habit you have described: what you DO, and a NOT line meant to be its restraint —
+when you hold the habit back, or a line you refuse to cross while doing it.
+
+A NOT line RESTRAINS when it genuinely limits the habit: a situation where you would
+not deploy it, a person you would not aim it at, a point where you stop. A NOT line
+ESCALATES when it is really the habit wearing a boundary's clothes — it refuses only
+the habit's absence, its opposite, or a milder version of it ("never simply
+apologize", "never let it stay a small observation"). An escalating NOT line makes the
+habit unconditional while pretending to bound it.
+
+Only flag clear escalation. A line that genuinely limits the habit — however narrow
+the limit — is not flagged; when unsure, do not flag.
+
+Output exactly one line, nothing else:
+ESCALATES: <comma-separated numbers of the items whose NOT line escalates>
+or, if every NOT line genuinely restrains:
+ESCALATES: none

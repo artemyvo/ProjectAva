@@ -1,0 +1,105 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Unsloth compiled cache
+unsloth_compiled_cache/
+
+# Persistent runtime data: chats, reflection memory, consolidation state,
+# archive, and the disposable render scratch (see training/reflections_path.py).
+data/
+# ...but keep the layout README tracked (it documents the dir, holds no runtime state).
+!server/inference/data/
+server/inference/data/*
+!server/inference/data/README.md
+
+# Trained LoRA adapters + transient trainer checkpoints, written by
+# training/train_cycle.py (server/models/adapter-<ts>/ and server/models/trainer/).
+# Large binary artifacts; the base model_id stays frozen so nothing here is source.
+server/models/
+
+# Structured train-cycle progress log (truncated per cycle, served live to the
+# Sleep tab via GET /train/progress). Runtime telemetry, like train.log.
+server/train_progress.jsonl
+# Full per-cycle probe details (untruncated replies/targets), written after each probe.
+server/train_probe_results.json
+# Box config: model_id stays frozen but adapter_id is repointed at runtime by
+# train_cycle.py, so this file churns with local/runtime state. (Moved up out of
+# server/inference/ on 2026-07-28; the legacy path stays ignored for checkouts
+# that have not yet been migrated by the server's boot-time move.)
+server/server_config.json
+server/inference/server_config.json
+
+# Runnable-snapshot exports (server/snapshot_state.py): causally-closed, portable
+# copies of a live Ava (config + prompts + data/ + active adapter weights). Large,
+# regenerable, per-host — never source.
+server/exports/
+
+# Legacy pre-data/ layout (kept ignored so old checkouts stay clean)
+chats/
+reflections/
+
+# Reflection archive tree: per-run artifact bundles + adapter copies (reviewable,
+# revertable record of each Sleep run; see inference/core/reflection_archive.py).
+# Runtime artifacts stay out of git, but keep its README tracked so the layout is
+# documented (same approach as server/inference/data/ above). The `reflections/`
+# legacy rule just above would otherwise swallow the whole tree.
+!server/reflections/
+server/reflections/*
+!server/reflections/README.md
+
+# PyTorch / ML model caches
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.cache/
+huggingface/
+~/.cache/huggingface/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Training-row debug dumps (training/train_cycle.py:_dump_training_debug)
+/debug/
+
+# Env files
+.env
+.env.*
+
+# Local UI client configuration
+config.json
+
+# Local Python version pin (pyenv)
+.python-version
+assoc/bench/.cache/
+assoc/bench/reports/

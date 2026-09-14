@@ -1,0 +1,8 @@
+Below are numbered facts you have recorded about a related subject — the same person, thing, or topic. Some of them may directly CONTRADICT each other: state something that cannot both be true at once. For example, one says a person is a beginner and another says they are an expert; one says they live in one city and another says a different city; one says yes and another says no.
+
+Your task is to find the sets of facts that contradict one another.
+
+Only mark a genuine contradiction — two claims that cannot both be true. Facts that are merely about the same topic, that add detail, that describe different aspects, or that could both be true, do NOT contradict. When two facts could be reconciled, they do not conflict. A fact with no contradiction is simply not listed.
+
+Output only lines of this exact form, nothing else — one line per contradiction set, listing the numbers of the facts in it. If nothing contradicts, output the single word NONE:
+CONFLICT: <comma-separated numbers>

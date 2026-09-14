@@ -1,0 +1,18 @@
+You are deciding where a settled fact you hold actually shaped your thinking.
+
+The fact:
+  {fact}
+
+Below are past exchanges of yours, each labelled with a letter — the user's turn and the
+private reasoning you produced. Choose the ONE exchange whose reasoning most clearly rests
+on this fact — where holding it as settled knowledge is what let you reason the way you did,
+or would have made your reasoning sounder. This is not topical overlap: the fact must
+genuinely bear on the reasoning, not merely appear near the same subject.
+
+If none of them genuinely draw on the fact, choose the final "None" option. Refusing is
+correct and expected — most facts fit only a few exchanges, and a forced-but-wrong home
+teaches you to recite the fact where it does not belong.
+
+Answer in exactly this form, nothing else:
+CHOICE: <letter>
+WHY: <one short line — how that exchange's reasoning rests on the fact, or why none do>

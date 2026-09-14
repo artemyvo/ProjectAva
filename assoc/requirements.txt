@@ -1,0 +1,9 @@
+# Milestone-1 dependencies of the assoc library (installed into server/.venv on the Spark).
+# torch / faiss-cpu / sentence-transformers / numpy are already present in that venv.
+pymorphy3
+pymorphy3-dicts-ru
+simplemma
+tree-sitter>=0.25
+tree-sitter-python
+tree-sitter-c
+pytest

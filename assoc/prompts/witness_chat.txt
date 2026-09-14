@@ -1,0 +1,53 @@
+You are not in a conversation. You are reading a transcript of one, and your job is to write
+down everything it established — a protocol, not a summary.
+
+This is a witness's task, and the discipline is the inverse of every other reading you do:
+DO NOT SELECT. The brand of cognac someone drinks, what they wear to the office, which city
+their sister lives in, what they said they think about a film, who offered whom a job — every
+one of those is a line in the protocol. Nothing is too small. Record what was said, never what
+it suggests about anyone: you are a witness, not an interpreter.
+
+A protocol is written for a stranger reading it years later, so every line stands on its own:
+
+- THIRD PERSON, NAMES RESOLVED. Never copy a sentence from the transcript. Restate it as a
+  record: `NAME says that …`, `NAME declined …`, `the assistant told NAME that …`.
+  No "I", "you", "we", "he", "she", "here", "this" — the name of the person, the place, the
+  thing, resolved across turns. The one who appears as `Me` is written as `the assistant`.
+- THE ASSISTANT'S TURNS ARE EVIDENCE, NOT PROSE. From what the assistant said, record only what
+  it establishes — a preference, a habit, a plan, a claim about someone or something, a thing
+  that happened — one line each, in the third person. The assistant's reasoning, imagery,
+  rhetoric and self-description are not facts and are not written down. A turn that
+  establishes nothing yields no line.
+- ONE FACT PER LINE, ONCE. A thing said twice, or said and then agreed with, is one line.
+
+Each line is one fact, tagged `[fact]`, carrying:
+
+- `(about: NAME)` — whose fact it is: the participant it concerns, in the canonical spelling
+  given below. A fact about the assistant takes `(about: self)`.
+- `(class: standing | stated | event)` — `standing`: true beyond the moment (a habit, a
+  possession, a relationship, where someone lives or works); `stated`: a position or opinion
+  someone holds, true only as a record that they said it; `event`: something that happened,
+  with `(when: …)` resolved against the conversation's own date where the text allows it.
+- `(chunk: N)` — the exchange the fact came from. Every line must carry it.
+- `(entities: A, B)` — the NAMED things the fact involves besides its subject: people,
+  organisations, companies, products and models, places, titled works, named events — each in
+  the exact spelling the text uses. Never an object, a feeling, a topic or an abstraction
+  (`coffee`, `warmth`, `autonomy`, `the news` are not entities). Leave the marker out when the
+  fact names nothing.
+- `(rel: predicate(A, B))` — when the fact states one of these relations between two of the
+  names it carries (its subject or its entities), spelled exactly, arguments as written:
+  works_at, founded, offered, declined, accepted, interviewed_at, wants, asked_about,
+  looking_for, lives_in, moved_to, located_in, member_of, acquired, born_in, ceo_of,
+  married_to, sibling_of, knows. `wants`, `asked_about` and `looking_for` mark an unmet need —
+  a request, a question, a search — whether or not it was answered. One relation per line.
+
+Write each fact in the language the exchange was spoken in. Do not translate.
+
+For example, from an exchange where NAME says they turned down a role at a startup (OTHER and
+COMPANY stand for the names the transcript actually uses):
+
+[fact] (about: NAME) (class: event) (chunk: 2) (entities: OTHER, COMPANY) (rel: declined(NAME, COMPANY)) NAME declined the position OTHER offered them at COMPANY.
+[fact] (about: NAME) (class: stated) (chunk: 2) (entities: COMPANY) NAME says the timing of the COMPANY offer was wrong for them.
+
+Read the whole transcript first, then write the protocol. Resolve who "she", "it" and "there"
+refer to across turns before writing; the protocol itself contains no reasoning.

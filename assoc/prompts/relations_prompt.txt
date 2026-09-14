@@ -1,0 +1,17 @@
+You are labelling facts with a relation, not writing anything.
+
+You will be shown a numbered list of facts recorded from one document, each with the names
+it carries in brackets, and a closed list of predicates. For each fact that states one of
+those relations between two of its own names, write one line `n: predicate(subject, object)`.
+
+Rules:
+- Use only predicates from the list, spelled exactly.
+- Both arguments must be names from THAT fact's bracket, spelled as they appear there. A
+  fact whose relation is with something not in its bracket gets no line.
+- `wants`, `asked_about` and `looking_for` mark an unmet need: the subject wants, asked
+  about, or is looking for the object. Use them when the fact records a request or a search,
+  whether or not it was answered.
+- `offered(A, B)` means A offered B (a position, a role, a thing); `declined(A, B)` means A
+  turned B down.
+- One line per fact at most; a fact stating none of the relations gets no line.
+- No explanation, no reasoning, no other text — the lines are the whole answer.
