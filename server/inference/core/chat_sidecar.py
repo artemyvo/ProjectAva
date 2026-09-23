@@ -38,6 +38,7 @@ SIDECAR_SUFFIXES = (
     ".summary.json",   # the consolidation gist — Ava's long memory of the chat
     ".facts.json",     # the immutable per-chat fact-extraction record
     ".shareml.json",   # legacy export artifact
+    ".hidden.npz",     # residual-stream capture per exchange (core/hidden_capture.py)
 )
 
 # The subset a reflection run PRODUCES, and therefore the subset that has to travel
@@ -386,8 +387,18 @@ class ChatSidecar:
         persona_context: str = "",
         locked: bool = False,
         live_session: Optional[str] = None,
+        why: str = "",
+        pass_info: Optional[dict] = None,
+        run_kind: str = "",
+        judgement_raw: str = "",
     ) -> bool:
         """Persist a revision vetting outcome. Stage is **not** advanced here.
+
+        Every successful write also appends one event to the revisions ledger
+        (`core.revision_ledger`, ``data/revisions/ledger.jsonl``): the record as written,
+        the record it replaced, and the judgement's *why*, *pass_info* (truncated /
+        looped / retried, as the runner saw them), *run_kind* and raw text — the parts
+        the sidecar itself does not keep. Best-effort: the ledger never fails a verdict.
 
         Returns False when the write is skipped (invalid session, live session,
         or untrustworthy target). Returns True on success.
@@ -441,7 +452,19 @@ class ChatSidecar:
             # train at all). Only set_exchange_banned writes it.
             "banned": bool(prev.get("banned")),
         }
-        return self._save(path, data)
+        ok = self._save(path, data)
+        if ok:
+            try:
+                from core import revision_ledger
+                revision_ledger.record_verdict(
+                    self.chats_dir, source_session=source_session, exchange_index=exchange_index,
+                    record=exchanges[key], prev=(prev or None),
+                    chat_path=self.resolve_chat_path(source_session),
+                    why=why, pass_info=pass_info, run_kind=run_kind, judgement_raw=judgement_raw,
+                )
+            except Exception as e:
+                print(f"[ledger] verdict event skipped: {e}")
+        return ok
 
     def write_anchor(
         self, *, source_session: str, exchange_index: int,
@@ -508,7 +531,20 @@ class ChatSidecar:
         if not isinstance(ex, dict) or not isinstance(ex.get(key), dict):
             return False
         ex[key]["locked"] = bool(locked)
-        return self._save(path, data)
+        ok = self._save(path, data)
+        if ok:
+            self._ledger_flag("lock", source_session, exchange_index, bool(locked))
+        return ok
+
+    def _ledger_flag(self, kind: str, source_session: str, exchange_index: int, value: bool) -> None:
+        """Provenance for the Training review's curation toggles (best-effort)."""
+        try:
+            from core import revision_ledger
+            revision_ledger.record_flag(self.chats_dir, kind, source_session=source_session,
+                                        exchange_index=exchange_index, value=value,
+                                        chat_path=self.resolve_chat_path(source_session))
+        except Exception as e:
+            print(f"[ledger] {kind} event skipped: {e}")
 
     def set_exchange_banned(self, source_session: str, exchange_index: int,
                             banned: bool) -> bool:
@@ -550,7 +586,10 @@ class ChatSidecar:
             rec["banned"] = True
         else:
             rec.pop("banned", None)
-        return self._save(path, data)
+        ok = self._save(path, data)
+        if ok:
+            self._ledger_flag("ban", source_session, exchange_index, bool(banned))
+        return ok
 
     def banned_exchange_indices(self, source_session: str) -> set:
         """Exchange indices the operator banned from training (record ``banned``)."""

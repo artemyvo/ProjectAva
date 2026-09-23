@@ -1383,7 +1383,7 @@ def _selftest() -> None:
         def reflect_aha(user, system, **kw):
             reflect_aha.last_truncated = False
             if user.rstrip().endswith("OPENER:"):
-                return "<think>ok</think>\nOPENER: Слушай — та самая позиция CTO у Шая, кажется, всё ещё открыта."
+                return "<think>ok</think>\nOPENER: Слушай — та самая позиция CTO у Ноама, кажется, всё ещё открыта."
             return "<think>they match</think>\nVERDICT: connect\nLINK: Starling's open CTO seat is exactly what he turned down."
 
         configure(chats_dirs=[chats], til_snippets_dir=root / "til" / "snippets", root=root / "assoc", prompts_dir=prompts,

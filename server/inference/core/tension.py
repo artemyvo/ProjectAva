@@ -21,6 +21,11 @@ Design notes:
     our logs different languages), so divergence must be normalized against a corpus
     baseline that does not exist at log time. It is computed offline in the
     validation step. We store raw per-segment stats + provenance instead.
+  * `relief_series` is the one *derived* per-token signal: the entropy drop from one
+    step to the next, causally z-scored. It is the green channel of the chat colouring
+    (AVA_REWARD_LOOP.md §7 item 1) and a stand-in until a relief axis exists. It is the
+    model's own confidence change — a view, never a gate (P3 there) — and it is not
+    stored: the entropies it is derived from are.
 """
 
 from __future__ import annotations
@@ -90,6 +95,51 @@ def find_think_end(token_ids: Sequence[int], close_markers: Sequence[Sequence[in
         if idx != -1:
             return idx + len(marker)
     return None
+
+
+# ── relief (green channel): causal entropy drop ──────────────────────────────
+
+# Steps before the running z-score is trusted: with fewer samples the running std is
+# noise and the first tokens of every reply would light up. Zero until then.
+RELIEF_WARMUP = 8
+
+
+def relief_series(entropies: Sequence[float], *, warmup: int = RELIEF_WARMUP) -> list:
+    """Per-token relief: the entropy drop H(t-1) - H(t), causally z-scored, positive part.
+
+    Aligned with `entropies` (same length; position 0 is 0.0). "Causal" means the
+    running mean/std at step t use only steps <= t — no whole-response normalization,
+    which would leak later tokens into an earlier colour and is exactly the offline
+    z-scoring AVA_REWARD_LOOP.md §1 warns against reusing online. Negative values
+    (entropy rose — surprise) are clipped to 0: that side is what the red channel already
+    shows through the margin, and mixing the two into one series would make green mean
+    two things. Output is a z-score, unbounded above; the client maps it to [0,1] with
+    its own threshold and gamma (typical: 1σ = first visible, 3σ = full).
+    """
+    n = len(entropies)
+    out = [0.0] * n
+    if n < 2:
+        return out
+    # Welford running mean/variance over the raw deltas seen so far (including the
+    # current one, so a lone spike is measured against a std it has already widened).
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    for t in range(1, n):
+        d = float(entropies[t - 1]) - float(entropies[t])
+        count += 1
+        delta = d - mean
+        mean += delta / count
+        m2 += delta * (d - mean)
+        if count < warmup:
+            continue
+        std = (m2 / (count - 1)) ** 0.5 if count > 1 else 0.0
+        if std < 1e-6:
+            continue
+        z = (d - mean) / std
+        if z > 0.0:
+            out[t] = z
+    return out
 
 
 # ── reduction ────────────────────────────────────────────────────────────────
@@ -214,8 +264,14 @@ def summarize(
     token_ids: Optional[Sequence[int]] = None,
     decode: Optional[Callable[[Sequence[int]], str]] = None,
     top2_ids: Optional[Sequence[Sequence[int]]] = None,
+    axes: Optional[dict] = None,
 ) -> Optional[dict]:
     """Build the `tension` block from the per-token series.
+
+    `axes` (optional): per-token projections onto stored hidden-state directions,
+    ``{name: [z per token]}`` from `hidden_capture.reduce_capture`, aligned with
+    `token_ids`. Stored under ``axes`` only when non-empty — a box with no axis files
+    writes no key, so "absent" and "zero" stay distinguishable downstream.
 
     `answer_start` is the index in the series where the answer begins (CoT is
     everything before it). None → no CoT block; the whole series is the answer.
@@ -279,4 +335,34 @@ def summarize(
         block["margins"] = [float(m) for m in margins]
         if top2_ids is not None:
             block["top2_ids"] = [[int(x) for x in pair] for pair in top2_ids]
+    if axes:
+        block["axes"] = {str(k): [float(x) for x in v] for k, v in axes.items() if v}
+        if not block["axes"]:
+            del block["axes"]
     return block
+
+
+if __name__ == "__main__":
+    # GPU-free self-test of the derived relief series (python -m core.tension).
+    import random
+
+    assert relief_series([]) == []
+    assert relief_series([1.0]) == [0.0]
+    assert relief_series([2.0, 1.0]) == [0.0, 0.0], "under warm-up must stay dark"
+
+    # A flat-noise series with one sharp drop well past warm-up: only that step lights.
+    random.seed(7)
+    series = [3.0 + random.uniform(-0.05, 0.05) for _ in range(40)]
+    series[30] = 0.5                       # the model suddenly became certain
+    rel = relief_series(series)
+    assert len(rel) == len(series)
+    assert all(v == 0.0 for v in rel[:RELIEF_WARMUP]), "warm-up region lit"
+    assert rel[30] == max(rel) and rel[30] > 2.0, f"drop not the peak: {rel[30]:.2f}"
+    assert rel[31] == 0.0, "the rebound (entropy rising) must be clipped, not lit"
+    # Causality: truncating the input never changes the prefix already computed.
+    assert rel[:25] == relief_series(series[:25])[:25]
+    # Monotone rise (entropy climbing) never lights green.
+    assert all(v == 0.0 for v in relief_series([float(i) for i in range(40)]))
+    # A constant series has zero std and must not divide by it.
+    assert all(v == 0.0 for v in relief_series([1.5] * 40))
+    print("tension relief_series self-test: OK")

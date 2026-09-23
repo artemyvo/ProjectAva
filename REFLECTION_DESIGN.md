@@ -1,5 +1,7 @@
 # Reflection Stage — Design Rationale & Invariants
 
+> **Scope clarification (2026-09-18):** Historical rationale for the pre-rebuild repetition/annotation design. Current training has one resolved target per exchange (apart from contamination), wall-clock LR multipliers, durable wander retrained each build, and no explicit persona CoT prepend. The implemented replacement has run on the GPU box. Read `documentation/AVA_DESIGN.md` and `REBUILD.md` for current behavior; the 3-2-1, one-shot wander, and persona-injection language below describes the earlier design.
+
 *Why the reflection→training loop is shaped the way it is, and the invariants that protect
 it — so a future change (human or AI) cannot silently break the design the way the
 persona-injection overfitting incident did.*

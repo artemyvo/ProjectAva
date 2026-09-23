@@ -1,5 +1,7 @@
 # Facts tree — implementation brief
 
+> **Current status (2026-09-18, code `9ecb488`):** the tree and its retrieval channel are built and exercised on the GPU box. Live chat uses the associative library by default and falls back to the tree when that library has no build; outreach/synthesis also use dedicated fact-fetch lanes. The dated workbench-only notes below describe the earlier rollout, not current availability. `tree.json` is derived, but hand-maintained `aliases.json` is not; current runnable snapshots omit those aliases. See `documentation/AVA_STATUS.md` and `AVA_OPEN_PROBLEMS.md`.
+
 Status: **stage 1 built (2026-08-10)**, stages 2–5 designed. The build is pure/GPU-free and
 runs — `cd server && .venv/bin/python -m graph.build`; see `server/graph/DESIGN.md` for
 implementation notes and the first real build's numbers. Everything below stage 1 in §11 is

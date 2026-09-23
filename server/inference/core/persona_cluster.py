@@ -107,7 +107,8 @@ def _is_blob(groups: list[list[int]], n: int) -> bool:
 
 def group_block(items: list[dict], generate_fn: Callable,
                 *, prompt: Optional[str] = None,
-                listing_fn: Optional[Callable] = None) -> Optional[list[list[dict]]]:
+                listing_fn: Optional[Callable] = None,
+                reject_blobs: bool = True) -> Optional[list[list[dict]]]:
     """One grouping call over ONE block → member lists, or ``None`` when the block
     produced nothing usable (generation failed, nothing parsed, or the blob guard
     rejected it). ``None`` means "treat these as singletons" — the caller decides, so
@@ -139,7 +140,7 @@ def group_block(items: list[dict], generate_fn: Callable,
     except Exception:
         return None
     groups = _parse_groups(resp, len(items))
-    if not groups or _is_blob(groups, len(items)):
+    if not groups or (reject_blobs and _is_blob(groups, len(items))):
         return None
     return [[items[i] for i in g] for g in groups]
 
@@ -147,7 +148,7 @@ def group_block(items: list[dict], generate_fn: Callable,
 def _map_phase(base: list[dict], generate_fn: Callable, *, block_size: int,
                prompt: Optional[str], on_stage: Optional[Callable],
                stats: dict, listing_fn: Optional[Callable] = None,
-               order_key: Optional[Callable] = None
+               order_key: Optional[Callable] = None, reject_blobs: bool = True
                ) -> list[list[dict]]:
     """Group within fixed blocks. Returns proto-themes (each a list of base items)."""
     ordered = sorted(base, key=order_key or (lambda it: it.get("key") or ""))
@@ -155,7 +156,7 @@ def _map_phase(base: list[dict], generate_fn: Callable, *, block_size: int,
     themes: list[list[dict]] = []
     for i, block in enumerate(blocks, 1):
         groups = group_block(block, generate_fn, prompt=prompt,
-                             listing_fn=listing_fn)
+                             listing_fn=listing_fn, reject_blobs=reject_blobs)
         stats["calls"] += 1
         rejected = groups is None
         if rejected:
@@ -171,7 +172,7 @@ def _map_phase(base: list[dict], generate_fn: Callable, *, block_size: int,
 def _reduce_round(themes: list[list[dict]], generate_fn: Callable, *, block_size: int,
                   rotation: int, prompt: Optional[str],
                   stats: dict, listing_fn: Optional[Callable] = None,
-                  order_key: Optional[Callable] = None
+                  order_key: Optional[Callable] = None, reject_blobs: bool = True
                   ) -> list[list[dict]]:
     """One pass of regrouping theme REPRESENTATIVES, merging the themes that group.
 
@@ -189,7 +190,7 @@ def _reduce_round(themes: list[list[dict]], generate_fn: Callable, *, block_size
     for chunk in _blocks(reps, block_size):
         rep_items = [rep for rep, _theme in chunk]
         groups = group_block(rep_items, generate_fn, prompt=prompt,
-                             listing_fn=listing_fn)
+                             listing_fn=listing_fn, reject_blobs=reject_blobs)
         stats["calls"] += 1
         if groups is None:
             stats["rejected_blocks"] += 1
@@ -222,6 +223,7 @@ def map_reduce_groups(base: list[dict], generate_fn: Callable, *,
                       prompt: Optional[str] = None,
                       listing_fn: Optional[Callable] = None,
                       order_key: Optional[Callable] = None,
+                      reject_blobs: bool = True,
                       on_stage: Optional[Callable] = None
                       ) -> tuple[list[list[dict]], dict]:
     """The map-reduce grouping itself: ``(groups, stats)``, each group a list of the
@@ -234,8 +236,11 @@ def map_reduce_groups(base: list[dict], generate_fn: Callable, *,
     same in both stores, so the machinery is shared and only the collapse differs.
 
     *prompt* and *listing_fn* let a caller supply its own grouping instruction and item
-    rendering; everything else — block sizing, the blob guard, rotation, the early exit
+    rendering; everything else — block sizing, rotation, the early exit
     when a round merges nothing — is the persona path's, unchanged.
+
+    ``reject_blobs`` keeps the persona guard by default. Prompt patterns opt out:
+    recurring proposals can legitimately occupy most or all of a scope's block.
 
     *order_key* decides which items share a block, and so which items can merge at all: the
     default is ``key``, a content hash, i.e. random adjacency. That is survivable for a
@@ -250,7 +255,7 @@ def map_reduce_groups(base: list[dict], generate_fn: Callable, *,
 
     themes = _map_phase(base, generate_fn, block_size=block_size, prompt=prompt,
                         on_stage=on_stage, stats=stats, listing_fn=listing_fn,
-                        order_key=order_key)
+                        order_key=order_key, reject_blobs=reject_blobs)
     stats["map_themes"] = len(themes)
 
     for rnd in range(1, max(0, int(max_reduce_rounds)) + 1):
@@ -262,7 +267,7 @@ def map_reduce_groups(base: list[dict], generate_fn: Callable, *,
         themes = _reduce_round(themes, generate_fn, block_size=block_size,
                                rotation=(rnd - 1) * (max(1, block_size) // 2),
                                prompt=prompt, stats=stats, listing_fn=listing_fn,
-                               order_key=order_key)
+                               order_key=order_key, reject_blobs=reject_blobs)
         after = len(themes)
         stats["rounds"].append({"round": rnd, "before": before, "after": after})
         _emit(on_stage, {"stage": "reduce", "round": rnd, "before": before,

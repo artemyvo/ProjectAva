@@ -1,20 +1,12 @@
 # REBUILD.md — data-centric from-scratch training (implementation brief)
 
-Status: **adopted 2026-07-05, not built.** This is the implementation brief for the
-successor to the resumed-persistent-adapter training scheme, written to be executed
-by a coding agent against this repository. Motivation and post-mortem:
-`documentation/AVA_OPEN_PROBLEMS.md → Cumulative Adapter Drift` (the 2026-07
-sequential fine-tune collapse). The built system this replaces is described in
-`server/training/DESIGN.md`, which stays authoritative for the code until the
-corresponding phase below lands. Read that file (and `CLAUDE.md`'s training/
-reflection sections) before starting — this brief assumes its vocabulary.
+Status: **built and exercised on the GPU box**. Last code check: 2026-09-18, against `9ecb488`. The implementation is operationally sane. The adapter is a disposable fresh LoRA fitted from durable data; behavioral validation is deliberately disabled.
 
-Scope discipline: this is a **PoC of the idea**, not a platform rewrite. Prefer the
-smallest change that realizes each phase; keep everything in "What stays unchanged"
-untouched; when this brief marks a choice as free, choose the simplest option and
-note it in code comments.
+**Current contract.** `build_dataset` reads frozen transcript/sidecar bundles from `server/data/chats`, fact hosts from the live ledger, and the durable wander corpus. It emits one resolved target per eligible exchange, with optional contamination split/fold. Persona CoT prepending is retired; persona-conditioned IDEAL targets preserve their context. Default row LR samples are `1→2→4`, capped after 72 h following the 24 h RAG-only window. Default global schedule is `age_ramp`; optional `triangular` adds warmup/plateau/decay epochs. No training stage counter or directory move drives age.
 
----
+Sections 1–6 and 8–11 retain the original implementation brief and its design reasoning; proposed data layouts, numeric examples, migration steps, and acceptance criteria there are historical where they differ from the current contract above. Section 7 records the current evidence/validation policy. For precise maintained behavior use `documentation/AVA_DESIGN.md`, `AVA_MEMORY.md`, and `AVA_STATUS.md`; do not execute the old migration/wipe plan as routine operation.
+
+The July collapse motivated this design, but its best current explanation is reflection RAG pollution. From-scratch reconstruction has independent correction/portability benefits; the historical failure does not prove resumed training intrinsically unsafe.
 
 ## 1. Core principle
 
@@ -299,76 +291,21 @@ temporary shim, if that is the smaller diff).
 
 ---
 
-## 7. Build history, the validation stance & forensic snapshots
+## 7. Build history, validation policy, and forensic snapshots
 
-**Build history.** New append-only `server/models/builds.jsonl`, one line per build
-attempt: `{build_id, ts, built_at, run_id, corpus_fingerprint, rows, seed,
-outcome: promoted|rejected, probe_summary, base_lr, snapshot_dir?, adapter_dir?}`.
-It is the reproducibility record and the instrumentation spine. `built_at` is the
-`as_of` timestamp every row age was computed against — required, since wall-clock
-age (§1) is only reproducible relative to a frozen build time, not "now."
-`builds.jsonl` is **no longer** the source of `age()` (age is wall-clock, not a
-count of promoted lines).
+**Build history.** `server/models/builds.jsonl` records build outcomes with `build_id`, `built_at`, `run_id`, seed, row count, base LR, corpus fingerprint, probe summary, and optional adapter/snapshot paths. Wall-clock age is computed against `built_at`; the log is not the age clock. Early failures may exit before a build record is written.
 
-**The validation stance: a failed probe is an alarm, not a routine veto.**
-> **Superseded as *current behavior* (2026-07-06): validation is DISABLED**
-> (`train_cycle._VALIDATION_ENABLED = False` — every build promotes unguarded). The
-> monolingual tier-5 language alarm can't gate real multilingual users, and it shares its
-> "user's voice" model with §5e contamination, so a correct probe is a **separate design
-> project** (`documentation/AVA_OPEN_PROBLEMS.md → Validation`). The stance below is the
-> *aspiration* for that redesign, not what runs today; §1's no-veto-freeze holds for a
-> different reason now (there is simply no gate to freeze against).
+**Validation policy.** `training.validation_switch.VALIDATION_ENABLED=False` disables behavioral probes and baselines, including judge-override cycles. This is deliberate. The deliverable is the process; a failing adapter is discardable, and obvious failure in ordinary chat informs a process or corpus adjustment. No blocking promotion gate or mandatory per-build behavioral measurement is planned by this document. Technical integrity checks and quarantine remain active.
 
-The goal is a system where, given correct training data, the probe *always passes*. A
-failure is therefore not something to auto-retry around — it is the signal that something
-is wrong, and the pipeline **halts for a human**. This is why §1 needs no veto-freeze on
-age. The load-bearing consequence: with no auto-retry safety net, a probe **false
-negative** (a bad build the probe passes) now gets promoted and served unguarded — so
-the probe's freedom from false negatives becomes a hard requirement, not a nicety.
-Concretely, the tier-5 CoT-collapse / language-drift alarm is load-bearing and its
-language half carries the hard-coded-Russian-user problem
-(`training/train_cycle.py` / `training/DESIGN.md`): under this stance that is a
-prerequisite, not cleanup — a half-wired tier-5 is a silent hole in the alarm.
+**Investigation.** Inspect the recorded rows and effective settings when a build behaves badly. A malformed target calls for tracing its source/reflection history; coherent rows still leave dosage, masking, retrieval contamination, and generation settings as possible causes. Do not infer the cause solely from whether the text looks well formed. Change one mechanism from a held starting state when attribution matters.
 
-**Triage protocol on failure — the snapshot is the first thing you open:**
-1. Is the training data *technically coherent* (well-formed rows, expected shapes, no
-   truncation / encoding damage)? If yes → the fault is **code/design**, and the
-   snapshot reproduces the exact build for debugging.
-2. If the data is **corrupt** → trace back through the snapshot's copies to see what
-   could have corrupted it **at chat/reflection stage** (a bad resolved target, a
-   mis-hosted fact, a malformed CoT); fix the source, rebuild.
+**Forensic capture.** `build_snapshot.write_snapshot` attempts materialized copies of `sft_render.jsonl`, `sft_quarantine.jsonl`, wander records, persona digest, and build metadata. The adapter directory is referenced by metadata/build history, not embedded in this forensic directory; runnable persona snapshots separately include weights. Optional preview rows are tagged and never trained. Live sidecar edits do not rewrite a successful capture.
 
-**Forensic snapshot bundle.** Each promoted build — and *every* failed one, that is
-the investigation packet — writes an **immutable** `snapshot_dir` holding
-**materialized copies**, not references into live mutable state:
-- the exact rendered training rows (the build's `sft_render.jsonl` — see below),
-- the wander/news bundles used,
-- the persona-digest version active for the build (id or copy),
-- the config (`server_config.json` + effective decay/curve params + `base_lr` +
-  `seed` + `built_at`),
-- the produced adapter (promoted builds) or none (rejected).
+Capture is currently best-effort: it returns `None` on error, possibly leaving partial files. Promotion may already have repointed config; the cycle still records the outcome and deletes the scratch render. Preserving evidence until a complete capture is confirmed remains open. This is independent of adapter validation.
 
-Because the snapshot owns frozen copies, editing a live sidecar later (the §1
-debuggability principle) cannot corrupt it — live corpus stays editable, the snapshot
-stays evidence. This **dissolves the immutability-vs-debuggability tension**: the
-archive is the mutable build *recipe*; the snapshot is a frozen *state*. It also
-promotes `sft_render.jsonl` out of `scratch/` — for a snapshotted build the render is
-copied in as a permanent artifact instead of deleted, cheap now precisely because
-rebuild removed copy-multiplication (render ≈ 1× corpus, one row per exchange, not
-6×). Frozen corpus + config + a later design fix = deterministic **regeneration of
-the personality under the new design**: §1's "the corpus is the character, and it is
-debuggable" taken to its endpoint — a failure is not a dead end but a fully-specified
-reproduction case.
+`corpus_fingerprint` covers row identity, target, and contamination metadata, not all message-prefix content or LR multipliers. A matching fingerprint is useful but is not proof of identical effective input. Seed/build-time recording improves reproducibility without guaranteeing bit-identical GPU execution or a pinned dependency environment.
 
-**Instrument from the first build** (with repetition gone, loss will *not* bottom near
-zero — "loss looks healthy" becomes the norm, so the alarms move):
-
-- **loss-vs-age curve**: log per-row loss against `age`/`lr_multiplier` (is ancient
-  material converging harder than fresh?). Cheap: rows are already ordered, so
-  logging per-step loss with the row's age tag suffices.
-- Tier-5 absolute rates stay the sampling-collapse alarm; tiers 3–4 now compare
-  against the currently-serving build (tier 4 is near-trivially satisfied — every
-  trainable item is in every build).
+**Runnable snapshots.** `snapshot_state.py` captures the active adapter, linked forensic snapshot when available, inference data, chats, TIL, prompts, digest, and config. It omits associative generated protocols/access history and graph aliases, and its dependency manifest does not name the associative embedder. Full causal closure is not currently achieved; see `documentation/AVA_OPEN_PROBLEMS.md` → Snapshot State Coverage and Forensic Evidence Durability.
 
 ---
 

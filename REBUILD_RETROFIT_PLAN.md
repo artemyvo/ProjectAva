@@ -1,5 +1,7 @@
 # REBUILD_RETROFIT_PLAN.md — working plan for the wall-clock retrofit
 
+> **Scope clarification (2026-09-18):** This completed July execution record is historical. Current behavior uses the durable wander corpus, default age_ramp schedule, weighted persona gate, and deliberately disabled behavioral validation. Forensic capture remains best-effort. See `documentation/AVA_STATUS.md` and `AVA_OPEN_PROBLEMS.md`; references below to pending commits or validation redesign are not current tasks.
+
 Status: **COMPLETE (Steps 1–7 landed, 2026-07-06).** This is now the execution
 record of the wall-clock retrofit; the design truth lives in the maintained docs
 (`training/DESIGN.md`, `documentation/AVA_STATUS.md`, `documentation/AVA_OPEN_PROBLEMS.md`,

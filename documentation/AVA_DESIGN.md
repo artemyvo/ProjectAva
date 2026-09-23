@@ -2,7 +2,7 @@
 
 This document is the stable architecture baseline for Ava. It describes what the system is meant to keep true conceptually, not every experiment or dated implementation note.
 
-Last code check: 2026-07-14. Main files consulted: `server/inference/server.py`, `server/inference/core/reflection_runner.py`, `server/inference/core/reflection_service.py`, `server/inference/core/reflection_writer.py`, `server/inference/core/reflection_memory.py`, `server/inference/core/rag_engine.py`, `server/inference/core/rag_policy.py`, `server/inference/core/reflection_digest.py`, `server/inference/core/prompt_mutation.py`, `server/inference/core/prompt_experiment.py`, `server/inference/core/synthesis.py`, `server/inference/core/mgmt_http.py`, `server/training/build_dataset.py`, `server/training/train_cycle.py`, `server/training/render.py`, `server/training/ledger.py`, `server/watchdog.py`, and `client/ui/sleep_widget.py`.
+Last code check: 2026-09-18, against `9ecb488`. The operator confirms that implemented paths have been exercised on the GPU box and are operationally sane. Remaining gaps concern specific behavior, state coverage, calibration, and causal attribution; they are not claims that the implementation has never run.
 
 ## Core Model
 
@@ -19,15 +19,15 @@ Ava is not treated as a single prompt or a single adapter. Ava is the whole clos
 
 The design goal is a single-user, non-reactive subject whose future responses are shaped by accumulated interaction, reflection, and weight updates, rather than only by the immediate prompt.
 
-The project does not maintain an explicit truth graph. Facts, dispositions, and revised dialogue targets move through memory and training artifacts, then gradually into adapter weights. RAG is a temporary recall scaffold, not the desired final home of consolidated material.
+Facts, dispositions, and revised dialogue targets move through several distinct channels. The facts tree and associative library maintain explicit source-backed claims and relations; neither is an authoritative truth oracle. Dialogue and hosted facts also enter adapter weights. Retrieval is not uniformly temporary: verbatim chat expires, while gist floors, facts, source protocols, and associative access history carry persistent memory.
 
 ## Character Formation Dynamics
 
 Ava has two influence paths.
 
-The slow path is the designed consolidation path: live chat is logged, reflection vets it, sidecars and ledger anchors record the trainable result, decay controls rehearsal count, the regression probe can block bad promotions when enabled, and the persona digest gates some target overrides only after cross-session maturity. This path has inertia, audit trails, and rollback points.
+The slow path logs chat, vets replies through reflection, records resolved targets in sidecars, and uses wall-clock age to set row learning-rate multipliers. A weighted persona maturity gate controls judge overrides. Adapters are disposable builds of that stored interpretation. Behavioral validation is deliberately disabled: a failed adapter leads to investigation of the process or its inputs, not a requirement to recover an adapter-quality gate.
 
-The fast path is ordinary in-context conditioning during a live session. It is useful because Ava must be responsive to the person in front of her, but it has no built impedance yet: a persuasive frame can shape the current conversation immediately, and that conversation can then enter the slow path. The current design therefore rate-limits consolidation but does not yet fully distinguish healthy relational imprint from coercive first-user capture. That unresolved line is tracked in `AVA_OPEN_PROBLEMS.md` under Impedance, Restoring Force, and First-User Imprint.
+The fast path is in-context conditioning during a live session. A standing persona portrait supplies accumulated dispositions when available, with persona RAG as the fallback. This provides historical context but no measured guarantee of resistance to a persuasive frame. Such a conversation can still enter the slow path. The open question is the strength and quality of influence, not an absent self-portrait; see `AVA_OPEN_PROBLEMS.md` under Impedance and First-User Imprint.
 
 ## Runtime Topology
 
@@ -39,6 +39,8 @@ The server owns all model and data state. `server/inference/server.py` keeps pro
 
 The watchdog is the process-management boundary. It starts the inference subprocess, exposes restart/update/log endpoints, and owns operations that require the model to be unloaded: LoRA training and destructive wipe. Read-mostly, data-layout-coupled management endpoints such as artifact export, clone export, snapshot export, chat sync, and precision writes live on the inference HTTP sidecar so they can evolve with ordinary `git pull` + inference restart, without changing the root watchdog.
 
+The deliberation executive reads the autobiographical worklog, open threads, and persona portrait, then dispatches one chosen activity. Default `deliberation.mode=sole` removes independent timers for outreach, synthesis, check-in, wander, aha, and pivot; maintenance jobs retain their clocks. `shadow` runs both executive and drive timers, and `off` leaves the manual button as a dry run. Job registration changes at startup; the running executive also reads its settings per wake.
+
 ## State Lifetimes
 
 Runtime state is split across two data roots: reflection/runtime state under `server/inference/data/`, and ordered user/ambient state under `server/data/`.
@@ -46,6 +48,9 @@ Runtime state is split across two data roots: reflection/runtime state under `se
 - `server/inference/data/hot/`: active reflection state, including reflection memory, ledger, persona digest, prompt deltas, prompt experiments, staging, and reflection run logs.
 - `server/data/chats/`: active transcripts and sidecars. The old hot/archive chat split is no longer a training or RAG lifecycle; fully consolidated material fades by wall-clock age, not by being moved between directories.
 - `server/data/til/`: durable ambient-learning state, including the keep-forever wander corpus and provenance snippets.
+- `server/data/assoc/`: associative source/protocol records, model-generated relations, derived retrieval structures, needs, and persistent access/activation history. The whole directory is not a disposable index.
+- `server/data/graph/`: derived facts tree plus hand-maintained `aliases.json`.
+- `server/data/persona/<run_id>/`: materialized persona bundles selected by `current.json`, including the flat `digest.json` live chat reads.
 - `server/inference/data/scratch/`: disposable render products such as `sft_render.jsonl`.
 
 The reflection archive lives outside `inference/data/`, under `server/reflections/`. It is review material for rollback and diagnosis: per-run logs, committed artifact deltas, persona snapshots, and adapter copies for train-bearing runs. It deliberately has no manifest or ordered replay semantics.
@@ -54,13 +59,13 @@ Adapter lineages live under `server/models/`; `server/server_config.json` points
 
 ## State Durability Contract
 
-Two invariants govern which state is essential versus derived. They are load-bearing: a feature or tool is correct only if it preserves them.
+The intended contract is that durable inputs support a fresh build and a snapshot preserves the running system's relevant state. Current coverage has three concrete limits:
 
-1. **The data roots are the ground truth — technically sufficient to rebuild any Ava state.** The relevant roots are `server/data/` plus `server/inference/data/`. Everything downstream is a pure function of those roots plus a chosen base model and training/config settings: the RAG indexes (rebuilt in-memory on boot), the training corpus (`build_dataset` reads chats, sidecars, ledger, reflection memory, and wander corpus), the LoRA adapter (`train_cycle`), and the persona digest. The data roots hold the un-regenerable material — raw transcripts and frozen reflection decisions (sidecars), the anchor ledger, reflection memory, wander corpus/snippets, run logs, prompt experiments/deltas, and persona digests. Because the base model is a config field, the same data can be retrained onto a different base (Qwen, GPT-OSS, …) or with different settings — that portability is the test of this invariant. `server/models/` (adapters, build log, forensic snapshots) and `server/reflections/` (review snapshots) are therefore **derived**: convenient for rollback and audit, but reconstructible from data and never a unique source of truth.
+1. **Live rebuild inputs and historical evidence have different lifetimes.** The two data roots hold transcripts, frozen targets, ledgers, portraits, wander material, and associative state. Together with code, prompts, base weights, config, seed, and build time they support a new build. After live repairs, they need not reconstruct an old build's exact inputs. Forensic snapshots and build records can therefore hold unique historical evidence even though adapters are replaceable outputs. Re-running a generated extraction is not the same as preserving its original result.
+2. **Runnable exports cover the older memory layout, not all current state.** `snapshot_state.py` embeds inference data minus scratch/activity/persona-history, chats, TIL, prompts, current digest, config, active adapter, and its forensic training snapshot when available. It currently omits `server/data/assoc/` (including generated protocols and access history) and graph aliases. The external-dependency manifest names the base and RagEngine's MiniLM embedder, not the associative BGE-M3 embedder; model repository names are not pinned revisions. Code commit and dirty status are recorded, not an environment lock. Full causal closure and exact replay are not current guarantees.
+3. **Forensic capture is best-effort.** `build_snapshot.write_snapshot` logs and returns `None` on failure. Training can already have repointed the adapter; it records the build and deletes the scratch render even if capture failed. Early training failures need not reach snapshot creation. Reliable evidence retention remains an implementation gap.
 
-2. **A runnable snapshot (`server/exports/…`, written by `snapshot_state.py`) contains everything needed to run live chat plus the complete training dataset — except the external Hugging Face models.** That is: the LoRA adapter weights, all RAG sources (the full `data/`), the prompts and config, and the exact rendered rows fed to the trainer (`training/<build_id>/sft_render.jsonl`). The two deliberate exclusions are **the base model and the RAG embedder (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`)** — both external, immutable, and fetched from Hugging Face by id; the snapshot's `MANIFEST.json` names both under `external_dependencies`. Everything else that shapes a reply is in the folder, so a snapshot answers both "run her here" and "where did that reply come from?" from its own contents.
-
-Everything else on disk is disposable: code lives in git, and the remainder is config or regenerable/temporary files (`scratch/`, trainer checkpoints, progress logs, the exports themselves).
+See `AVA_OPEN_PROBLEMS.md` → Snapshot State Coverage and Forensic Evidence Durability. These gaps limit restoration and investigation; they do not invalidate the working training or export paths.
 
 ## Memory Architecture
 
@@ -72,15 +77,17 @@ Reflection memory is distilled recall. `rag_memory.jsonl` is an append-only op-l
 
 Operator persona cleanup acts only on the connected server's live operational state. A removed persona is tombstoned in reflection recall and in the live consolidation ledger, so it is absent from the next digest and training fold. Cleanup must never rewrite a runnable snapshot, a reflection archive, adapter weights, or a previously materialized digest; those remain historical/rollback evidence, and the next reflection derives a new digest from the cleaned live set.
 
-Weights are long-term memory. Dialogue anchors, persona anchors, hostable fact anchors, and wander examples can be rendered into SFT rows and trained into the active LoRA adapter. Each promoted adapter is a fresh build artifact compiled from the frozen base plus the current frozen-bundle corpus; the base model is frozen, and prior adapters are rollback artifacts rather than the starting point for the next fit.
+Weights are long-term memory. Resolved dialogue targets, hostable fact injections, and durable wander examples form SFT rows. Explicit build-time persona CoT prepending is retired; persona influences targets through original reasoning or a deliberately persona-conditioned re-answer. Every promoted adapter is a fresh build on the frozen base; prior adapters are rollback artifacts, not the starting point for the next fit.
 
 ## RAG Contract
 
-RAG retrieves separate past-chat and distilled-reflection-memory blocks, plus an optional wander passage in live chat/encounter. The active chat is excluded both when an index is built and when it is queried, so an in-place resumed transcript cannot inject a duplicate of its own prompt. Reflection passes use a temporal cutoff so a session under review cannot retrieve itself or knowledge that became available later. Reflection-memory availability is read from the op-log insertion timestamp; `source_session` remains provenance and may be a typed external id such as `wiki:…` or `til:…`, not a sortable chat clock. Historical rows without an insertion timestamp fall back to timestamped chat filenames.
+RAG retrieves separate past-chat and distilled-reflection-memory blocks, with anchors and source nominations. Direct wander and open-ask injection into live chat/encounter/gossip are disabled by `_INJECT_WANDER=False` and `_INJECT_OPEN_ASKS=False`; their stored material and other consumers remain. The active chat is excluded both when an index is built and when it is queried, so an in-place resumed transcript cannot inject a duplicate of its own prompt. Reflection passes use a temporal cutoff so a session under review cannot retrieve itself or knowledge that became available later. Reflection-memory availability is read from the op-log insertion timestamp; `source_session` remains provenance and may be a typed external id such as `wiki:…` or `til:…`, not a sortable chat clock. Historical rows without an insertion timestamp fall back to timestamped chat filenames.
 
 Verbatim chat and reflection-memory persona retrieval use separate wall-clock curves. A reflected verbatim exchange fades linearly `1.0→0` over 96 hours and is absent at/after the cap; the hard raw-age cutoff also applies if reflection lagged, while the pre-cap unfrozen path keeps its gentler hourly fresh-window discount. Opening additional chats does not alter an older chat's modifier—there is no count-based recency penalty. The consolidation gist rises `0→1.0` over the same 96 hours, then decays affinely to `0.2` exactly at 192 hours and holds that semantic floor. Persona recall retains its own `0.2` floor. Facts deliberately remain at modifier `1.0`; stale corrections are handled by explicit reversible supersession rather than age. Asks do not decay by this mechanism. Wall-clock modifiers are recomputed when querying the index, and a committed summary sidecar triggers an immediate serving-index refresh.
 
-The retrieval embedder is `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, run explicitly on CPU so RAG consumes host RAM rather than model VRAM. The multilingual replacement stays in the MiniLM family because RagEngine's embedder is also reused by branch/persona/fact semantic gates whose cosine thresholds were calibrated in that score range. Long and mixed-language chat inputs, queries, and wander articles are split into bounded overlapping passages instead of being silently truncated at the encoder's beginning; passage hits collapse back to one exchange/article, and only a bounded best wander passage + reaction is injected. Wander relevance is gated on raw semantic similarity and age affects ranking, so the final nonzero decay step remains retrievable. Post-search temporal filtering backfills from the complete eligible result set. Consolidation retrieves reflection memory independently for each fitted chunk rather than reusing one session-wide query/context. These are implementation choices, not architectural requirements.
+For RagEngine channels, the retrieval embedder is `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, run explicitly on CPU so RAG consumes host RAM rather than model VRAM. The multilingual replacement stays in the MiniLM family because RagEngine's embedder is also reused by branch/persona/fact semantic gates whose cosine thresholds were calibrated in that score range. Long and mixed-language chat inputs, queries, and wander articles are split into bounded overlapping passages instead of being silently truncated at the encoder's beginning; passage hits collapse back to one exchange/article, and the wander query returns a bounded best passage plus reaction when a caller enables that channel (direct live-chat injection is currently disabled). Wander relevance is gated on raw semantic similarity and age affects ranking, so the final nonzero decay step remains retrievable. Post-search temporal filtering backfills from the complete eligible result set. Consolidation retrieves reflection memory independently for each fitted chunk rather than reusing one session-wide query/context. These are implementation choices, not architectural requirements.
+
+Live fact fetch uses `assoc/` by default (`assoc.enabled=true`), with the facts tree as fallback when no associative build/library is available. Its default embedder is BGE-M3, separate from RagEngine. The library combines source protocols, lexical/dense retrieval, model selection, and persistent activation touches on injected material. Its feed/witness jobs maintain the store; the executive can choose aha and pivot activities.
 
 ## Reflection Loop
 
@@ -96,13 +103,15 @@ The revision judgement sees the original exchange with CoT. It emits only `VERDI
 
 The speaker may attach one post-reply **Meta feedback** note while that reply is still Ava's latest completed turn. It is stored on the raw exchange and shown only in this revision judgement, explicitly as notification-only evidence of the speaker's reaction: Ava may accept, reject, reinterpret, or ignore it, and the criterion remains whether the reply was genuinely hers. A stable exchange id fences the write so a delayed UI action cannot annotate an older turn. Once another reply lands the old window is immutable. Feedback never becomes a live chat turn, consolidation fact, RAG query, branch-replay input, re-answer prompt, or training prompt; it can affect weights only indirectly through the judgement/persona decision that causes a clean re-answer. The transcript keeps it for the normal reflect-once pass and any later deliberate revisit.
 
-When the judgement is `revise`, a separate normal-dialogue generation produces the `IDEAL` target from the stored system prompt, the answer-only conversation before the exchange, and the final user turn. The rejected answer and CoT, Meta feedback, reflection prompt/RAG, `WHY`, and judgement CoT are outside this message list. This is the same prefix `training.render.build_messages` later reconstructs, so the generated `<think>` belongs to the target answer rather than to a retrospective critique. A malformed or truncated re-answer retries once from the same clean prefix with perturbed sampling; confirmed language drift may add only a neutral final-user-language constraint. If no CoT-bearing answer survives, the exchange is `revised_missing_ideal` and contributes no training target—there is no fallback to the rejected original. Sidecars and anchors record `target_kind` plus `target_generation` (`chat_reanswer_v1`, `branch_replay`, or `original`) in addition to the compatibility `target_source` field.
+When judgement is `revise`, a separate normal-dialogue generation produces the target from the pre-answer prefix. The rejected answer/CoT, Meta feedback, diagnosis, and inline legacy IDEAL are excluded. General RAG is off; the explicit persona-only context seam may condition the re-answer, and the winning target records that context for render parity. An unusable target retries cleanly and then contributes no training row. Sidecars record target kind and generation provenance.
 
 Branch replay generates alternate replies from contested token points. A blind chooser picks a trainable target among original, branches, and IDEAL.
 
 Some exchanges deliberately skip branch replay. Language-drift repairs and revisit runs train the current-state clean re-answer directly, and CoT-less originals with a usable CoT-bearing IDEAL do the same. Branching remains the normal first-time reflection path for eligible new chats.
 
-After sessions finish, the runner synthesizes a persona digest from committed persona anchors. The digest is a versioned self-portrait with voice, stances, dispositions, lines, and a second-pass first-person prose portrait for human/debug inspection and future peer introductions. Its evidence fold combines 30-to-180-day recency decay, geometric tenure discount for successive same-theme affirmations, and recency-weighted counter-evidence from sustained user pushback; the clean-base judge maturity gate deliberately continues to use raw distinct-session recurrence.
+After sessions finish, the runner plans digest regeneration from committed evidence. The clean-base batch judges branch jobs against the existing digest, places facts, clusters persona/user/self evidence, and deduplicates facts. After adapter restoration, Ava synthesizes the new portraits. Without a clean-base callback, clustering falls back to the adapter, while branch judge and fact placement are skipped. Persona evidence combines recency decay, geometric tenure discount, and counter-evidence; the judge gate requires at least two themes with `weighted_recurrence >= 1.9`.
+
+The active persona supplies a standing chat portrait of established voice/dispositions/lines; declarative stances are deliberately excluded from that render. A thin or absent portrait falls back to persona RAG. Polarity screening separates opposing members of merged themes, records counter plans, and exposes detected opposition to synthesis; arbitrary opposition between already-separate themes is not yet detected.
 
 A clean-base judge can score branch choices against the persona digest. When enabled and the digest maturity gate passes, its pick can override the trainable sidecar target. On thin corpora it is logged-only.
 
@@ -165,8 +174,8 @@ Implemented by `reflection_runner._run_clean_base_judge`, `_digest_maturity_gate
 
 ```text
 jobs = branch choices collected during revision
-digest = latest persona digest
-gate = count(digest.evidence.themes where recurrence >= 3) >= 2
+digest = existing persona digest
+gate = count(digest.evidence.themes where weighted_recurrence >= 1.9) >= 2
 
 with adapter unloaded and clean base loaded:
     for each job:
@@ -178,7 +187,7 @@ with adapter unloaded and clean base loaded:
             increment judge_overrides
 ```
 
-The digest is authored by Ava on the current adapter; the clean base only applies it as an evaluator. If the corpus is thin, the judge remains logged-only. If it overrides any target, the train hand-off requests validation when the validation switch is enabled; while validation is globally disabled, the override is logged honestly but the adapter still promotes unguarded.
+The digest is authored by Ava on the adapter; the clean base only applies it as an evaluator. If the corpus is thin, the judge remains logged-only. If it overrides any target, the train hand-off requests validation when the validation switch is enabled; while validation is globally disabled, the override is logged honestly but the adapter promotes without a behavioral gate by design.
 
 **Fact Placement And Snapshot**
 
@@ -208,13 +217,13 @@ Training renders the full frozen-bundle corpus. Each reflected chat contributes 
 
 Render/inference parity is load-bearing. Training rows are assembled to match the live inference conversation shape, including speaker prefixes and model-family reasoning-channel handling.
 
-Persona and fact anchors ride host exchanges. They are injected into the beginning of a trainable CoT for an exchange already being trained, with caps per exchange. The ledger is read as the host/provenance store; training no longer advances persona stages or fact trained-copy counts as the lifecycle clock.
+Hostable fact anchors ride their source exchanges: up to two are injected as `I know that ...` lines into an existing trainable CoT. Persona anchors remain evidence for portraits and recall, but explicit persona CoT injection is retired. Training does not advance persona stages or fact trained-copy counts.
 
-Fact-to-weights training is implemented as of commit `23164e0ca73306c70d97ba5401ae3fede1948958` and was reshaped by the rebuild. The clean-base placement judge assigns each unhosted `[fact]` one host exchange or `None`, restricted to the fact's own chat for data locality. The build then injects hosted facts after persona lines as `I know that ...`, with `FACT_INJECT_CAP=2` facts per exchange. A placed fact rides its host every build; its mirrored RAG copy stays at `1.0` rather than fading. When a newer fact directly contradicts it, reversible supersession removes the stale anchor from live recall and future training folds.
+Fact-to-weights training uses clean-base placement within the fact’s own chat. The build reads the recorded host rather than re-judging it. A placed fact rides its host each build; its RAG mirror remains at weight 1.0. Supersession removes stale anchors from future folds, while unhosted facts remain retrieval-only. Placement currently collapses unparseable output and an explicit None into the same no-host outcome; see the failure-outcome gap in `AVA_OPEN_PROBLEMS.md`.
 
 The train cycle runs offline while inference is unloaded. It loads the frozen base, fits a fresh LoRA, trains with response-only masking, keeps only the final assistant span in multi-turn examples, optionally emits a cap-age user-contamination row that unmasks the user's final turn, saves/repoints a new adapter, records build history, writes a forensic snapshot, and clears consumed scratch state. It does not resume the prior adapter, advance sidecar stages, move chats to archive, or clear the durable wander corpus.
 
-The regression probe is the promotion gate when validation is enabled. It is designed to catch abrupt capability, format, continuity, and acute-retention failures, not to decide whether Ava's beliefs are acceptable.
+The retained regression probe is force-skipped by `training.validation_switch.VALIDATION_ENABLED = False`, including judge-override runs. This is an intentional process choice, not an unfinished promotion gate. Technical row integrity checks and quarantine remain active. The global LR schedule is configurable: default `age_ramp` uses the requested epoch count; optional `triangular` uses one warmup epoch, `train_plateau_epochs` plateau epochs, and one decay epoch, in chronological order each pass.
 
 ## External Learning
 
@@ -222,7 +231,7 @@ The TIL/wander subsystem gives Ava controlled exposure to material outside the u
 
 Manual learning can fetch Wikipedia current-events digests, resolve search asks, or wander into an approved wiki page. The operator applies the resulting findings.
 
-Autonomous wander runs from the idle heartbeat, after enough user-token budget has accumulated. It fetches a random approved article, runs a voice pass and a learning pass, applies the result, and records a durable wander corpus that is re-consolidated by each from-scratch build and also available to live chat as an age-faded RAG channel.
+Autonomous wander runs from the idle heartbeat, after enough user-token budget has accumulated. It fetches a random approved article, runs a voice pass and a learning pass, applies the result, and records a durable wander corpus that is re-consolidated by each from-scratch build and retained for training and retrieval machinery. Direct wander-channel injection into live chat is currently disabled; external source material can still reach the facts/associative channels.
 
 This is rationed by conversation-derived budget so ambient reading stays coupled to lived interaction rather than becoming an unbounded crawler.
 

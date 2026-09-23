@@ -26,7 +26,8 @@ from typing import Callable, Optional
 from core.reflection_chunking import (
     build_consolidation_chunks, format_chunk_content, append_closing, SUMMARY_CLOSING,
 )
-from core.reflection_config import ReflectionRunConfig, ReflectionRunStore
+from core.reflection_config import (
+    DEFAULT_MAX_NEW_TOKENS_SETTING, ReflectionRunConfig, ReflectionRunStore)
 from core.reflection_lang import detect_language_drift
 from core.reflection_memory import ReflectionMemory
 from core.reflection_source import (
@@ -59,7 +60,7 @@ _DEFAULT_TOP_P = 0.95
 # That fixed overhead sits on every revision pass and OOMs the card on deep exchanges.
 # Observed reflection output is far smaller — revision ~600 tokens, consolidation ~2.2k —
 # so a bounded fixed cap fits it with wide margin and keeps the KV cache small.
-_DEFAULT_MAX_NEW_TOKENS = "8192"
+_DEFAULT_MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS_SETTING   # "8192" — one definition
 # Branch chooser + clean-base judge both run thinking OFF (disable_thinking=True), emitting
 # only a short CHOICE/WHY — observed max ~70 tokens of WHY, chooser_cot empty on 80/86
 # exchanges. So the shared 8K default (_DEFAULT_MAX_NEW_TOKENS) is ample margin; both use it.
@@ -605,11 +606,32 @@ class ReflectionRunner:
         on_session_committed: Optional[Callable] = None,
         on_chat_reflected: Optional[Callable] = None,
         consume_pending_clean_base_fn: Optional[Callable] = None,
+        ack_pending_clean_base_fn: Optional[Callable] = None,
         embed_fn: Optional[Callable] = None,
-    ) -> None:
+        finalize: bool = True,
+    ) -> str:
         """Execute consolidation, judgement/re-answer, and optionally branch.
 
-        Blocking — designed to be dispatched via asyncio run_in_executor.
+        Blocking — designed to be dispatched via asyncio run_in_executor. Returns the
+        run's outcome — ``"completed"`` / ``"stopped"`` / ``"failed"``.
+
+        *finalize*: when True (the default — dry runs, the headless CLI, the background
+            per-chat pass) the runner owns the run's terminal status and writes it to the
+            store. When False the runner is ONE STAGE of a longer lifecycle whose owner
+            (`reflection_service`) still has to merge memory, commit sidecars, mint the
+            persona and hand off training: the runner then leaves the run *running*
+            (phase ``downstream``, summary attached via ``update_status``) and returns
+            the outcome for the owner to finalize. A run that reported ``completed``
+            before those stages ran let the client stop polling and the stop request be
+            refused while the commit could still fail (2026-09-21). A failure is
+            terminal wherever it happens, so ``failed`` is always written here.
+
+        *ack_pending_clean_base_fn*: fn(filename) called for a background-reflected
+            (``chat_reflected``) chat once this run has actually carried its persisted
+            clean-base jobs through the clean-base phase — the consume-once DELETE of the
+            pending payload, separated from the load (*consume_pending_clean_base_fn*)
+            so a run stopped before that phase leaves the payload for the next run
+            instead of freezing the chat with its remaining work lost.
 
         *consolidation_only*: run only the consolidation (first) phase and skip
             judgement/re-answer + branch entirely. Used by the "short reflection summary"
@@ -723,6 +745,8 @@ class ReflectionRunner:
         # adapter swap per run via clean_base_ctx) — see _run_clean_base_judge.
         persona_digest = self._load_persona_digest() if branching_enabled else None
         judge_jobs: list = []
+        # chat_reflected chats whose freeze/ack waits on the clean-base phase (step 4b).
+        deferred_finalize: list = []
         # Candidate host exchanges the fact-placement judge picks from (one per revised,
         # trainable exchange). Independent of branching/digest — a fact needs a home CoT,
         # not a persona standard — so it is always collected when the runner is revising.
@@ -839,17 +863,16 @@ class ReflectionRunner:
                                 n_f += 1
                         except Exception:
                             pass
-                    if not store.is_stop_requested(run_id):
-                        self._mark_session_reflected(filename)
-                        if on_session_committed is not None:
-                            try:
-                                on_session_committed(filename)
-                            except Exception:
-                                pass
-                    self._emit(store, send_event_fn, run_id, "session_finalized",
+                    # The freeze (`reflected_at`), the crash checkpoint and the ack that
+                    # deletes the pending payload all wait until the clean-base phase has
+                    # RUN over these jobs (see step 4b below). Freezing here meant a run
+                    # stopped before that phase left the chat frozen forever with its
+                    # judge/fact work lost — the payload was already deleted at load.
+                    deferred_finalize.append(filename)
+                    self._emit(store, send_event_fn, run_id, "session_queued",
                                session=filename,
-                               message=(f"Background-reflected chat finalized "
-                                        f"({n_j} judge + {n_f} fact job(s) queued for clean base)."))
+                               message=(f"Background-reflected chat: {n_j} judge + {n_f} fact "
+                                        f"job(s) queued for clean base — finalized after it."))
                     continue
 
                 # 1. Consolidation phase for this session
@@ -1180,9 +1203,14 @@ class ReflectionRunner:
             #     task that can carry the batch on its own: a run that judged nothing and
             #     clustered nothing should still tidy the store it just wrote to.
             run_fact_dedup = getattr(config.overrides, "fact_dedup", None) is not False
+            # (e) prompt patterns — fold the locator's logged deltas into the rewrite
+            #     budget (PROMPT_REWRITE.md §3). Same grouping question as (c)/(d) asked
+            #     of a third store; like dedup it depends on nothing this run produced
+            #     beyond the deltas it just logged, and runs after them so those count.
+            run_prompt_patterns = getattr(config.overrides, "prompt_patterns", None) is not False
             if (clean_base_ctx is not None
                     and (run_branch_judge or run_fact_placement or run_digest_cluster
-                         or user_plans or self_plan or run_fact_dedup)
+                         or user_plans or self_plan or run_fact_dedup or run_prompt_patterns)
                     and not store.is_stop_requested(run_id)):
                 def _clean_base_batch():
                     nonlocal digest_evidence, user_evidence, self_evidence
@@ -1218,6 +1246,10 @@ class ReflectionRunner:
                             run_id, config=config, generate_fn=generate_fn,
                             store=store, send_event_fn=send_event_fn,
                             embed_fn=embed_fn)
+                    if run_prompt_patterns and not store.is_stop_requested(run_id):
+                        self._run_clean_base_prompt_patterns(
+                            run_id, config=config, generate_fn=generate_fn,
+                            store=store, send_event_fn=send_event_fn)
                     return overrides
                 try:
                     judge_overrides = clean_base_ctx(_clean_base_batch) or 0
@@ -1225,6 +1257,36 @@ class ReflectionRunner:
                     self._emit(store, send_event_fn, run_id, "phase_error",
                                phase="branch_judge",
                                message=f"Clean-base batch error (skipped): {e}")
+
+            # 4b. Two-stage freeze — stage two lands HERE, after the clean-base phase has
+            #     run over the jobs loaded above: freeze `reflected_at`, checkpoint, and
+            #     ack (delete) the pending payload. Not on a stop: the chat then stays
+            #     `chat_reflected` with its payload intact and the next run redoes exactly
+            #     this. Mirrors a normal chat, whose clean-base work is also dropped when
+            #     the batch is skipped (no clean_base_ctx — the headless CLI).
+            if deferred_finalize and not dry_run:
+                if store.is_stop_requested(run_id):
+                    self._emit(store, send_event_fn, run_id, "phase_done", phase="clean_base",
+                               message=(f"Stop requested before clean base — "
+                                        f"{len(deferred_finalize)} background-reflected "
+                                        f"chat(s) left for the next run."))
+                else:
+                    for filename in deferred_finalize:
+                        self._mark_session_reflected(filename)
+                        if on_session_committed is not None:
+                            try:
+                                on_session_committed(filename)
+                            except Exception:
+                                pass
+                        if ack_pending_clean_base_fn is not None:
+                            try:
+                                ack_pending_clean_base_fn(filename)
+                            except Exception:
+                                pass
+                        self._emit(store, send_event_fn, run_id, "session_finalized",
+                                   session=filename,
+                                   message="Background-reflected chat finalized "
+                                           "(clean base done, frozen reflected_at).")
 
             # 5. Persona digest, part two: synthesize the self-portrait on the ADAPTER —
             #    authorship is Ava's, unlike the clustering that fed it. When no clean-base
@@ -1297,14 +1359,14 @@ class ReflectionRunner:
                 "elapsed_seconds": round(time.monotonic() - run_t0, 1),
                 "stats": stats.to_status() if stats is not None else None,
             })
-            return
+            return "failed"
 
         elapsed_seconds = round(time.monotonic() - run_t0, 1)
         stopped = store.is_stop_requested(run_id)
         final_status = "stopped" if stopped else "completed"
         report = stats.build_report()
         store.persist_report(run_id, report)
-        store.finalize_run(run_id, final_status, {
+        summary = {
             # A dry run never writes artifacts, so it never mutates anything.
             "mutations_applied": (not stopped) and not dry_run,
             "dry_run": dry_run,
@@ -1327,12 +1389,21 @@ class ReflectionRunner:
             # (also persisted to <run_id>.report.json and the reflection archive).
             "stats": stats.to_status(),
             "detailed_report": report,
-        })
+        }
+        if finalize:
+            store.finalize_run(run_id, final_status, summary)
+        else:
+            # The owner finalizes once its downstream stages are done (or a stop is
+            # honoured); the summary rides the run record so it is not lost meanwhile.
+            store.update_status(run_id, phase="downstream", summary=summary)
         event_type = "run_stopped" if stopped else "run_completed"
         base_msg = "Run stopped (user request)" if stopped else "All passes done"
         msg = f"{base_msg} — took {_fmt_duration(elapsed_seconds)}"
+        if not finalize and not stopped:
+            msg += " — committing downstream stages..."
         self._emit(store, send_event_fn, run_id, event_type, message=msg,
                    elapsed_seconds=elapsed_seconds)
+        return final_status
 
     # ── consolidation phase ────────────────────────────────────────────── #
 
@@ -3478,6 +3549,16 @@ class ReflectionRunner:
                     exchange_index=job["index"],
                     run_id=run_id,
                     fallback_chats_dir=self._fallback_chats_dir,
+                    # For the revisions ledger only: the judgement's WHY, how the pass
+                    # ended, and its raw text — none of which the sidecar keeps.
+                    why=(why or ""),
+                    pass_info={
+                        "truncated": getattr(generate_fn, "last_truncated", None),
+                        "looped": getattr(generate_fn, "last_loop", None),
+                        "retried": bool(unparseable),
+                    },
+                    run_kind=("revisit" if config.revisit else "reflection"),
+                    judgement_raw=(response or ""),
                 )
                 register_revision_anchor(
                     self._consolidation_dir, summary, filename
@@ -3562,15 +3643,22 @@ class ReflectionRunner:
                        text=response, report=rev_report,
                        message="Revision pass done")
 
-            # Prompt-mutation pass (LOGGED-ONLY) — only on a drift exchange (verdict
-            # revise), where "would a different standing prompt have prevented this?"
-            # is meaningful. Measures the drift against the persona digest ("better me"),
-            # logs any proposed standing-prompt delta to its own op-log, and mutates
-            # nothing. Best-effort: a failure never touches the revision result. Skipped
-            # for a revisit run — it is prompt-modification code, and an obsolete chat
-            # must not steer the standing prompt (even a logged proposal).
+            # Prompt-mutation pass (LOGGED-ONLY) — the prompt-rewrite LOCATOR
+            # (PROMPT_REWRITE.md §2). Two cells of the verdict × tension square send an
+            # exchange here: a drift (verdict revise), where "would a different standing
+            # prompt have prevented this?" is meaningful; and — since 2026-09-18 — a KEPT
+            # reply whose CoT tension ranks above `prompt_rewrite.tension_percentile`
+            # against the corpus baseline (core.tension_baseline): she stood by it but was
+            # unusually torn getting there, the one cell a standing line can settle by
+            # taking a side. Measures against the persona digest ("better me"), logs any
+            # proposed delta to its own op-log, and mutates nothing. Best-effort: a failure
+            # never touches the revision result. Skipped for a revisit run — it is
+            # prompt-modification code, and an obsolete chat must not steer the standing
+            # prompt (even a logged proposal) — and on an `interlocutor: "ai"` transcript,
+            # since a peer model's conversation does not shape her standing prompt.
+            locator, tension_rank = self._prompt_mutation_locator(job, session, verdict)
             if (target_source != "revised_missing_ideal"
-                    and verdict == "revise" and not config.revisit
+                    and locator is not None and not config.revisit
                     and getattr(config.overrides, "log_prompt_mutation", True)):
                 try:
                     self._run_prompt_mutation_for_exchange(
@@ -3583,6 +3671,7 @@ class ReflectionRunner:
                         exchange_label=ex_idx, exchange_total=exchange_total,
                         store=store, send_event_fn=send_event_fn,
                         tokenizer=tokenizer, stats=stats,
+                        locator=locator, tension_rank=tension_rank,
                     )
                 except Exception as e:
                     self._emit(store, send_event_fn, run_id, "pass_warning",
@@ -4300,6 +4389,73 @@ class ReflectionRunner:
 
     # ── prompt-mutation phase (LOGGED-ONLY) ───────────────────────────────── #
 
+    # ── prompt-rewrite locator (PROMPT_REWRITE.md §2) ─────────────────── #
+
+    _tension_baseline = None          # built lazily, once per runner (i.e. per run)
+    _tension_percentile: Optional[float] = None
+
+    def _prompt_rewrite_settings(self) -> dict:
+        """``prompt_rewrite.*`` from server_config.json, read once per runner. Defaults
+        match config_schema.py's (`keep_locator` True, `tension_percentile` 0.8)."""
+        from training.reflections_path import load_server_config
+        cfg = (load_server_config() or {}).get("prompt_rewrite") or {}
+        try:
+            pct = float(cfg.get("tension_percentile", 0.8))
+        except (TypeError, ValueError):
+            pct = 0.8
+        try:
+            maturity = float(cfg.get("maturity", 1.9))
+        except (TypeError, ValueError):
+            maturity = 1.9
+        try:
+            min_chats = int(cfg.get("min_chats", 2))
+        except (TypeError, ValueError):
+            min_chats = 2
+        return {"keep_locator": bool(cfg.get("keep_locator", True)),
+                "tension_percentile": min(max(pct, 0.0), 1.0),
+                "maturity": max(0.0, maturity), "min_chats": max(1, min_chats)}
+
+    def _prompt_mutation_locator(self, job: dict, session: dict,
+                                 verdict: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
+        """Which cell of the verdict × tension square sends this exchange to the
+        prompt-mutation pass — ``(locator, tension_rank)``, or ``(None, None)``.
+
+        ``revise`` ⇒ the drift cell, as always (its rank is still computed and stamped on
+        the record, for the pattern fold's vote weight). ``keep`` ⇒ only when the exchange's CoT
+        tension ranks at or above ``prompt_rewrite.tension_percentile`` against the corpus
+        baseline (:mod:`core.tension_baseline`; built lazily from the chats dirs the runner
+        reads, cached under ``data/hot/prompt/``). No baseline ⇒ the keep cell is closed
+        and the pass behaves exactly as before 2026-09-18. An ``interlocutor: "ai"``
+        transcript never qualifies, in either cell."""
+        from core import prompt_mutation, tension_baseline
+        if not tension_baseline.is_user_chat(session):
+            return None, None
+        if verdict not in ("revise", "keep"):
+            return None, None
+        settings = self._prompt_rewrite_settings()
+        if verdict == "keep" and not settings["keep_locator"]:
+            return None, None
+        # The rank is computed for BOTH cells: the revise cell is gated by the verdict
+        # alone, but its record carries the rank too — stage 2's vote weight
+        # (PROMPT_REWRITE.md §3, `0.5 + tension_rank`) reads it off every delta.
+        if self._tension_baseline is None:
+            try:
+                from training.reflections_path import prompt_dir
+                dirs = [self._chats_dir]
+                if self._fallback_chats_dir is not None:
+                    dirs.append(self._fallback_chats_dir)
+                self._tension_baseline = tension_baseline.build(
+                    [Path(d) for d in dirs], prompt_dir() / "tension_baseline_cache.json")
+            except Exception:
+                traceback.print_exc()
+                self._tension_baseline = tension_baseline.Baseline()   # empty ⇒ no ranks
+        rank = self._tension_baseline.rank_exchange(job.get("exchange") or {}, session)
+        if verdict == "revise":
+            return prompt_mutation.LOCATOR_REVISE, rank
+        if rank is None or rank["rank"] < settings["tension_percentile"]:
+            return None, None
+        return prompt_mutation.LOCATOR_KEEP_TENSION, rank
+
     def _run_prompt_mutation_for_exchange(
         self,
         run_id: str,
@@ -4323,14 +4479,19 @@ class ReflectionRunner:
         send_event_fn: Optional[Callable],
         tokenizer=None,
         stats: Optional[RunStats] = None,
+        locator: str = "revise",
+        tension_rank: Optional[dict] = None,
     ) -> None:
-        """Counterfactual on the standing prompt for one drifted exchange — logged only.
+        """Counterfactual on the standing prompt for one exchange — logged only.
 
         Asks Ava whether a *different standing prompt* would have produced the better
-        reply on its own, and if so what line it would need. Measures the drift against
-        the persona digest (the "better me"); appends any concrete delta to
+        reply on its own, and if so what line it would need. On a drift (``locator``
+        ``revise``) the pass measures the drift against the persona digest (the "better
+        me") and the reply the revision stands behind; on a kept-but-torn exchange
+        (``keep_tension``, with its ``tension_rank``) it asks whether the conflict behind
+        a reply she stood by is a standing one. Appends any concrete delta to
         ``data/hot/prompt/prompt_deltas.jsonl`` and emits a ``prompt_delta_proposed``
-        event. Mutates no prompt — the live ``chat_prompt.txt`` is read, never written.
+        event. Mutates no prompt — reads the active experiment, falling back to the seed.
         """
         from core import prompt_mutation, reflection_digest
         from core.reflection_source import build_revision_content
@@ -4349,19 +4510,27 @@ class ReflectionRunner:
             persona_block = ("(No settled self-portrait yet — weigh the drift against "
                              "the better reply below and your own sense of who you are.)")
         current_prompt = prompt_mutation.load_current_chat_prompt() or "(unavailable)"
-        system_prompt = (template
-                         .replace("{current_prompt}", current_prompt)
-                         .replace("{persona}", persona_block))
+        system_prompt = prompt_mutation.compose_prompt(
+            template, current_prompt=current_prompt, persona=persona_block,
+            locator=locator, tension=tension_rank)
 
-        # Show the same exchange the revision pass judged, plus the reply it stands
-        # behind — so the counterfactual reasons about the gap, not from scratch.
+        # Show the same exchange the revision pass judged. On a drift, add the reply the
+        # revision stands behind — so the counterfactual reasons about the gap, not from
+        # scratch. On a kept exchange there is no better reply to show (the target IS the
+        # original), so the tail carries the revision's own reason for keeping it.
         content = build_revision_content(job, session, context_length)
-        better = (ideal or target or "").strip()
-        tail = ["", "--- WHAT MY REVISION STANDS BEHIND INSTEAD ---"]
-        if (why or "").strip():
-            tail.append(f"Why the original fell short: {why.strip()}")
-        if better:
-            tail.append("The reply I stand behind now:\n" + better)
+        if locator == prompt_mutation.LOCATOR_KEEP_TENSION:
+            better = ""
+            tail = ["", "--- MY REVISION KEPT THIS REPLY ---"]
+            if (why or "").strip():
+                tail.append(f"Why it was mine: {why.strip()}")
+        else:
+            better = (ideal or target or "").strip()
+            tail = ["", "--- WHAT MY REVISION STANDS BEHIND INSTEAD ---"]
+            if (why or "").strip():
+                tail.append(f"Why the original fell short: {why.strip()}")
+            if better:
+                tail.append("The reply I stand behind now:\n" + better)
         content = content + "\n" + "\n".join(tail)
 
         # Own phase boundary so this pass no longer hides in the gap between a
@@ -4370,7 +4539,12 @@ class ReflectionRunner:
         self._emit(store, send_event_fn, run_id, "phase_started",
                    phase="prompt_mutation", session=filename,
                    exchange_index=exchange_label, exchange_total=exchange_total,
-                   message="Prompt-mutation pass (standing-prompt drift counterfactual)")
+                   locator=locator,
+                   tension_rank=(tension_rank or {}).get("rank"),
+                   message=("Prompt-mutation pass (standing-prompt drift counterfactual)"
+                            if locator != prompt_mutation.LOCATOR_KEEP_TENSION else
+                            f"Prompt-mutation pass (kept reply, CoT tension at the "
+                            f"{(tension_rank or {}).get('rank', 0):.0%} percentile)"))
 
         def _on_chunk(delta: str, _sess=filename, _ex=exchange_label,
                       _total=exchange_total) -> None:
@@ -4429,6 +4603,12 @@ class ReflectionRunner:
             "delta": parsed["delta"],
             "revision_verdict": verdict,
             "revision_why": why or "",
+            # PROMPT_REWRITE.md §2/§3: which cell sent it here, and the source exchange's
+            # baseline-normalized CoT tension (null ⇒ no baseline / the revise cell) —
+            # the vote weight the pattern fold reads.
+            "locator": locator,
+            "tension_rank": (tension_rank or {}).get("rank"),
+            "tension_key": (tension_rank or {}).get("key"),
             "digest_version": (persona_digest or {}).get("version"),
             "user_prompt": (ex.get("user_prompt") or ""),
             "original_response": (ex.get("assistant_response") or ""),
@@ -4449,8 +4629,11 @@ class ReflectionRunner:
             exchange_total=exchange_total, scope=parsed["scope"],
             delta=_clip(parsed["delta"], 1000), drift=_clip(parsed["drift"], 1000),
             missing=_clip(parsed["missing"], 1000),
+            locator=locator, tension_rank=(tension_rank or {}).get("rank"),
             digest_version=(persona_digest or {}).get("version"),
-            message=(f"Prompt-gap [{parsed['scope'] or '?'}]: {_clip(parsed['delta'], 200)}"),
+            message=(f"Prompt-gap [{parsed['scope'] or '?'}"
+                     f"{', kept+torn' if locator == prompt_mutation.LOCATOR_KEEP_TENSION else ''}]: "
+                     f"{_clip(parsed['delta'], 200)}"),
         )
 
     @staticmethod
@@ -4695,7 +4878,10 @@ class ReflectionRunner:
             write_revision_sidecar(
                 self._chats_dir, summary,
                 source_session=job["session"], exchange_index=job["exchange_index"],
-                run_id=run_id, fallback_chats_dir=self._fallback_chats_dir)
+                run_id=run_id, fallback_chats_dir=self._fallback_chats_dir,
+                run_kind="branch_judge",
+                pass_info={"pick_kind": judge.get("pick_kind"), "pick_index": pick,
+                           "blind_choice": job.get("chosen")})
         except Exception:
             return False
         # Special-interest cell: the judge flipped the trainable target to a *branch*.
@@ -4920,6 +5106,71 @@ class ReflectionRunner:
                 for r in report),
         )
         return counts.get("purged", 0)
+
+    def _run_clean_base_prompt_patterns(self, run_id, *, config, generate_fn, store,
+                                        send_event_fn):
+        """Fold the logged prompt deltas into patterns — the prompt-rewrite BUDGET
+        (PROMPT_REWRITE.md §3) — on the CLEAN base, in the same swap as the passes above.
+
+        The locator (``_run_prompt_mutation_for_exchange``) logs one delta per exchange
+        it finds a gap on; a delta is one conversation's vote on what the standing prompt
+        fails to say, and the prompt is global. This groups same-change deltas across
+        chats (``core.prompt_patterns`` over ``persona_cluster.map_reduce_groups`` — an
+        evaluation, so the clean base, like persona clustering and fact dedup), weights
+        each chat's vote by its exchange's tension rank, and writes
+        ``data/hot/prompt/patterns.json`` — the file the deliberation executive reads to
+        show her (stage 2) and, from stage 3, to offer the rewrite. Derived and
+        disposable; rebuilt every normal run; a run with zero deltas still writes it so
+        the budget reads an honest zero. Nothing is spent here. Best-effort. Opt out
+        with ``overrides.prompt_patterns=False``.
+        """
+        if getattr(config.overrides, "prompt_patterns", None) is False:
+            return 0
+        from core import prompt_patterns
+        from training.reflections_path import default_prompts_dir, prompt_dir
+        settings = self._prompt_rewrite_settings()
+        try:
+            n_pending = len(prompt_patterns.unconsumed(prompt_dir()))
+        except Exception as e:
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="prompt_patterns",
+                       message=f"Prompt patterns skipped (delta log unreadable): {e}")
+            return 0
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="prompt_patterns",
+                   message=(f"Prompt patterns (clean base) — {n_pending} unconsumed "
+                            f"delta(s) to fold…"))
+        try:
+            doc = prompt_patterns.rebuild(
+                prompt_dir(), generate_fn, prompts_dir=default_prompts_dir(),
+                run_id=run_id, maturity=settings["maturity"],
+                min_chats=settings["min_chats"],
+                # Its own event, not phase_progress (which would suppress the phase_done
+                # body — the pattern list, the part worth reading).
+                on_stage=lambda info: self._emit(
+                    store, send_event_fn, run_id, "prompt_patterns_progress", **info),
+            )
+        except Exception as e:
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="prompt_patterns",
+                       message=f"Prompt patterns fold failed (skipped): {e}")
+            return 0
+        pats = doc.get("patterns") or []
+        lines = []
+        for p_ in pats[:12]:
+            tag = "MATURE" if p_.get("mature") else "forming"
+            lines.append(f"[{p_.get('scope') or '?'}] {tag} w={p_.get('weighted_recurrence')} "
+                         f"chats={p_.get('recurrences')} tension={p_.get('tension_mean')}: "
+                         f"{(p_.get('delta') or '')[:160]}")
+        self._emit(
+            store, send_event_fn, run_id, "phase_done", phase="prompt_patterns",
+            message=(f"Prompt patterns — {doc.get('n_patterns', 0)} pattern(s) from "
+                     f"{doc.get('n_deltas', 0)} delta(s), {doc.get('n_mature', 0)} mature "
+                     f"(≥{settings['maturity']} over ≥{settings['min_chats']} chats); "
+                     f"{doc.get('deltas_since_last_attempt', 0)} since the last rewrite attempt."),
+            report={"prompt_patterns": {k: doc.get(k) for k in
+                                        ("n_deltas", "n_patterns", "n_mature",
+                                         "deltas_since_last_attempt", "stats")}},
+            text="\n".join(lines) if lines else "(no unconsumed deltas)",
+        )
+        return doc.get("n_mature", 0)
 
     def _run_clean_base_fact_dedup(self, run_id, *, config, generate_fn, store,
                                    send_event_fn, embed_fn=None):

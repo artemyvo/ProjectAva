@@ -5,17 +5,11 @@ carries information forward in time, how each one decays, and where the channels
 coupled. It exists because the memory model grew organically across many changes and the
 mechanisms became hard to see as one system. Use it as the baseline for future memory work.
 
-Last code check: 2026-07-25. Files consulted: `server/training/decay.py`,
-`server/inference/core/rag_policy.py`, `server/inference/core/rag_engine.py`,
-`server/inference/core/reflection_memory.py`, `server/inference/core/reflection_writer.py`,
-`server/inference/core/reflection_digest.py`, `server/inference/core/reflection_source.py`,
-`server/inference/core/reflection_runner.py`, `server/inference/core/reflection_service.py`,
-`server/inference/core/fact_contradict.py`, `server/server_config.json`,
-`server/settings.py`, `server/training/build_dataset.py`, `server/training/ledger.py`.
+Last code check: 2026-09-18, against `9ecb488`: memory/portrait, training, and associative state paths. Implemented paths have been exercised on the GPU box and are operationally sane (operator confirmation); comparative effectiveness and long-history calibration are separate questions.
 
 Precedence, as everywhere in this set: **code > `AVA_STATUS.md` > this document**. Where a
 number here is a default, the live value is whatever `server_config.json` says; the config
-in effect at the last code check is quoted inline.
+on a particular box can differ from the defaults quoted here.
 
 ---
 
@@ -24,10 +18,7 @@ in effect at the last code check is quoted inline.
 Ava has two homes for information, and everything below is about how material moves between
 them and fades within them:
 
-- **RAG (recall scaffold)** — fast, editable, *temporary*. Several independent channels,
-  each cosine-retrieved and each with its own decay curve. RAG is explicitly *not* the
-  desired final home of consolidated material; it is where memory lives until weights or a
-  distilled anchor can carry it.
+- **Retrieval and standing context** — fast and editable. Verbatim chat fades, while summaries, facts, portraits, and associative protocols can persist. RagEngine cosine channels coexist with the associative library’s source-backed fact retrieval and access history; not every channel shares one decay rule.
 - **Weights (the adapter)** — slow, durable, expensive. A from-scratch LoRA refit each
   build over the frozen bundles, each row weighted by wall-clock age. This is the intended
   long-term home.
@@ -38,7 +29,7 @@ survive reflection — eventually through the weights and through standalone fac
 anchors. Forgetting is (currently) almost entirely a RAG phenomenon; see the open issues for
 why weights do not yet forget.
 
-**One retrieval rule underpins every RAG channel** (`rag_policy.rank_score`): relevance is
+**RagEngine cosine channels share a retrieval rule** (`rag_policy.rank_score`): relevance is
 gated on the **raw cosine** (`cosine ≥ minimum`), and the decay modifier is applied *only as
 a ranking prior* (`score = cosine × modifier`) to order what already passed. This replaced an
 older `cosine × modifier ≥ minimum` gate that silently raised the semantic bar as an item
@@ -57,14 +48,19 @@ non-zero floor rather than to 0.
 | 2 | Gist / consolidation summary | RAG | wall-clock, source-chat age | floor `0.2` @ 192h (crossfades ↑ vs #1) | (long-horizon recall) |
 | 3 | Persona records `[persona]` | RAG | wall-clock, source-bundle age | floor `0.2` @ 96h | weights (implicitly) |
 | 4 | Facts `[fact]` | RAG + CoT | **does not fade** | constant `1.0` (timeless truth) | weights (host-CoT injection) — hearsay is RAG-only |
-| 5 | Open questions `[ask]` | RAG / agenda | surface-count retirement | evicted on resolve | — (drives outreach) |
-| 6 | Wander (self-reading) | RAG + weights | wall-clock step fade | `0` past 96h | weights (fixed LR mult) |
+| 5 | Open questions `[ask]` | agenda; direct chat injection off | surface-count retirement | evicted on resolve | — (drives outreach) |
+| 6 | Wander (self-reading) | weights; direct RAG injection off | wall-clock step fade | `0` past 96h | weights (fixed LR mult) |
 | 7 | Persona digest | prompt injection | regenerated, not retrieved | versioned, rollback-able | prompt |
 | 8 | Impressions `[impression]` | RAG | **does not fade** | constant `1.0` (superseded by a later reading, not by time) | prompt (via #9) — never weights |
 | 9 | User portrait (per person) | prompt injection | regenerated, not retrieved | one file per person, overwritten | prompt |
-| 10 | Weights (adapter) | training | wall-clock LR ramp | **does not forget** (open) | — |
+| 10 | Weights (adapter) | training | wall-clock LR ramp | no automatic age retirement | — |
+| 11 | Per-exchange anchors and fetched-source nominations | retrieval | channel-specific | can recall source context after verbatim expires | retrieval |
+| 12 | Recollections `[recollection]` | RAG | creation age plus source age | separate decay/freshness policy | RAG |
+| 13 | Outside-view self-portrait | prompt injection | regenerated from `[self_impression]` evidence | retained artifact; injection configurable | prompt |
+| 14 | Associative facts, protocols, and activation | retrieval | persistent access history; library decay | channel-specific, not the 96h chat cutoff | `server/data/assoc/` |
+| 15 | Autobiographical worklog | executive context | durable episode history | retained; recent window plus open threads read | worklog |
 
-All decay curves and knobs live in `server/training/decay.py` (`WallClockConfig` + the pure
+The RagEngine wall-clock curves and training-age knobs live in `server/training/decay.py` (`WallClockConfig` + the pure
 `*_hours` helpers), parsed from the `consolidation.wall_clock` block of `server_config.json`.
 
 ---
@@ -121,8 +117,7 @@ theme's `weighted_recurrence` without bound. User pushback supplies counter-evid
 the next-turn `COUNTER` classifier and reaction-to-persona-key bridge; distinct-session
 counters subtract at `_PERSUASION_GAIN = 0.5` and are not tenure-discounted. A theme below
 `_PROMPT_WEIGHT_FLOOR = 0.5` is omitted from the next portrait. These mechanisms affect
-`weighted_recurrence`; raw distinct-session `recurrences` still drive the digest maturity
-gate.
+`weighted_recurrence`, which also gates judge authority: at least two themes must reach 1.9. Raw distinct-session counts remain provenance, not the authority threshold.
 
 > There is **no count-based (200/200) persona window** in code today — persona decay is
 > time-based, while repeated affirmation is bounded by tenure discount and counter-evidence
@@ -206,37 +201,21 @@ clean-base pass over all live facts, and a best-effort automatic pass after
 corrections; uncontradicted falsehoods, missed clusters, and long-term accumulation remain
 open (see Open Issue F).
 
-### 3.5 Open questions `[ask]` (`reflection_memory.open_questions` / `surfaceable_questions`)
+### 3.5 Open questions (`reflection_memory.open_questions` / `surfaceable_questions`)
 
-Unresolved questions Ava raised in reflection. **A distinct bucket** — not a memory-decay
-channel but an *agenda*. They are re-posed to each Sleep run so they can eventually be
-resolved (an answer writes an `evict`/`resolved` op that removes them). `meta`/`user` asks
-are additionally *surfaced* into live chat and drive the autonomous reach-out jobs
-(outreach / synthesis / check-in). Lifecycle is **surface-count retirement**, not time:
-`user` asks retire past a ceiling; `meta` is exempt. See Open Issue D — they surface too
-rarely.
+Open asks remain durable agenda items, resolved/retired through the ask lifecycle. Search asks can trigger lookup; user/meta asks supply outreach and associative needs. User asks have a surface-count ceiling; meta asks are exempt. Direct passive chat surfacing and ask RAG injection are currently off (`generation._INJECT_OPEN_ASKS=False`), while active outreach remains implemented. See Open Issue D for executive selection and pacing.
 
 ### 3.6 Wander (`wander_rag_weight_hours`)
 
-Things Ava read on her own (Wikipedia current-events, self-directed lookups), captured to
-`server/data/til/wander.jsonl`. A **distinct channel** with its own **step** fade
-(`wander_rag_weights` `0.4/0.3/0.2/0.1` per 24h, then **out of RAG past 96h** — a genuine
-zero, unlike the floored chat channels), deliberately capped below the relational corpus's
-`1.0`. It is also trained from-scratch every build at a fixed `WANDER_LR_MULT` and is never
-cleared. Injected at chat time as soft "something you read on your own" background so its
-phrasing can bleed. Left as-is by design decision (2026-07-23); documented here for
-completeness.
+The durable `server/data/til/wander.jsonl` corpus is retained and trained from scratch every build at `WANDER_LR_MULT=1`, excluding banned entries. Its RagEngine channel retains the step-decay implementation (`0.4/0.3/0.2/0.1` per 24 hours, then zero), but direct live chat/encounter/gossip injection is off (`generation._INJECT_WANDER=False`). TIL source texts/protocols also feed the facts tree and associative library. Retention in weights and source-backed recall must not be confused with the disabled direct wander block.
 
 ### 3.7 Persona digest (`reflection_digest`)
 
-Not a retrieved channel — the **generated persona**: a versioned self-portrait
-(VOICE / STANCES / DISPOSITIONS / LINES) synthesized from the committed `[persona]` anchors,
-snapshotted to `data/hot/persona/` with a `current` pointer (rollback-able like the adapter).
-Evidence is **clustered** (LLM-first, MiniLM/exact-key fallback) so a theme's recurrence is
-the count of *distinct sessions* across its paraphrases. It is injected into prompts (judge,
-introduction, gossip) rather than cosine-retrieved, and gates the branch-judge criterion flip
-behind a maturity threshold (`≥2 themes at recurrence ≥3`). Regeneration is gated on the raw
-pre-cluster evidence fingerprint, so an unchanged run is a no-op.
+A generated self-portrait (VOICE / STANCES / DISPOSITIONS / LINES), not a cosine-retrieved item. The active persona pointer resolves `server/data/persona/<run_id>/digest.json`; legacy digest storage remains a fallback for older layouts. The runner plans evidence, clusters it in the clean-base batch when available, and synthesizes the new portrait after restoring the adapter.
+
+Map-reduce clustering is the normal scalable path, with older clustering/fallbacks retained. Recency, tenure discount, and counter-evidence produce weighted recurrence. Two themes at `weighted_recurrence >= 1.9` authorize the branch judge’s target override; a theme without that field is immature. Regeneration uses the pre-cluster evidence fingerprint including quantized recency/counter information, avoiding a fresh nondeterministic grouping on every unchanged run.
+
+Live chat injects established voice/dispositions/lines as standing context, deliberately excluding STANCES to avoid recitation. Thin/absent portraits leave persona RAG enabled. Judge, introduction, and deliberation renderings serve their separate purposes. The polarity screen splits opposing members of a merged theme, records counter plans, and exposes detected opposition during synthesis; it does not discover arbitrary opposition between already-separate themes.
 
 ### 3.8 Impressions `[impression]` and the user portrait (`user_digest`)
 
@@ -288,6 +267,16 @@ one op-log, attributed, and recallable in anyone's conversation.
 
 ---
 
+### 3.9 Associative and source-backed recall
+
+`assoc.enabled` defaults on. The live fact-fetch stage uses the library when a build is available, otherwise falling back to the facts tree. RagEngine's MiniLM cosine channels still run alongside it. The library defaults to BGE-M3 and tier 2, using source protocols, lexical/dense candidates, model selection, and activation touches after injection. Per-exchange anchors, gist, and fetched-source nominations also preserve recall routes beyond the raw-chat cutoff; loss of verbatim retrieval is not loss of every representation of a conversation.
+
+The library re-witnesses chats with its own model-generated protocols and records relations and access history under `server/data/assoc/`. These are historical inputs to later retrieval, not all reconstructible by rebuilding from source text. Current runnable snapshots omit this root and graph aliases; see `AVA_OPEN_PROBLEMS.md` → Snapshot State Coverage.
+
+### 3.10 Worklog and outside-view self-portrait
+
+The durable first-person worklog records meaningful episodes and open/closed threads. Deliberation reads its recent window and open threads to choose an activity; it is no longer logged-only. The outside-view self-portrait is synthesized from `[self_impression]` evidence and lives beside user portraits under `hot/users/_self.json`; its standing-context injection is configurable and off by default. These are separate from the adapter-authored persona digest.
+
 ## 4. Weights (the training channel)
 
 The adapter is a **from-scratch LoRA on the frozen base every build** — never resumed. Each
@@ -299,10 +288,10 @@ multiplier (`lr_multiplier_hours`):
 | --- | --- | --- |
 | `< rag_only_window_h` (24h) | `0.0` | RAG-only window — no trainable row yet |
 | 24h → 72h | ramp `1 → 2 → 4` (`lr_ramp`, linearly interpolated) | growing consolidation pressure |
-| `≥ lora_cap_age_h` (72h) | `4.0` (cap) | assumed "reached the weights" |
+| `≥ lora_cap_age_h` (72h) | `4.0` (cap) | maximum scheduled dose; not proof of retention |
 
-Peak SFT LR is `train_lr` (`8e-6` at last check); the per-row multiplier and the global
-LR-schedule shape scale on top of it. A cap-age exchange also emits a **user-contamination**
+Base SFT LR is `train_lr` (code default `8e-6`); the per-row multiplier and the global
+LR-schedule shape scale on top of it. Default `age_ramp` honors the requested epochs; optional `triangular` forces warmup + configured plateau + decay epochs. A cap-age exchange also emits a **user-contamination**
 signal (masked response at the cap + a dosed unmask of the user turn so voice entrains).
 
 **Two facts that shape the whole memory model:**
@@ -310,9 +299,7 @@ signal (masked response at the cap + a dosed unmask of the user turn so voice en
 1. Because the ramp *climbs* to a cap and never descends, and because the corpus is refit
    from scratch, an old chat trains at max LR **forever** — "reached the weights fully" is
    permanent max weight, **not** decay.
-2. Nothing drops a bundle from the training corpus by age. So all graceful forgetting lives
-   in RAG; weights only forget by *dropping a row* (a hard cliff) or by *not being
-   from-scratch*. See Open Issue B.
+2. Nothing drops a bundle from the training corpus by age. The current implementation has no automatic age-based down-weighting of old training rows. Manual correction, exclusion, or changed targets can alter the next fresh adapter; a softer training-decay policy is not implemented. See Open Issue B.
 
 The LR ramp is realized **across successive nightly rebuilds**, each re-weighting every chat
 by its *present* age — not accumulated inside one adapter. A chat at 30h contributes ~×1 in
@@ -370,8 +357,7 @@ Problem: the persona channel is still an autoregressive loop (§5): a `[persona]
 recalled into the prompt → restated → re-derived → re-inserted. The digest no longer
 amplifies that loop without bound, but it still cannot distinguish an independently
 re-earned stance from a restatement caused by recall. Echoes can therefore mint additional
-raw anchors and raw recurrence, affect the maturity gate, and consume RAG/training volume
-even when their contribution to `weighted_recurrence` is bounded.
+raw anchors and shape future dialogue targets even when their weighted contribution is bounded. Raw recurrence alone no longer opens the judge gate, and explicit persona training rows are not produced.
 
 What exists:
 
@@ -385,7 +371,10 @@ What exists:
   genuine pushback with `COUNTER`, maps it to up to two relevant live persona keys, and
   records `counter` ledger ops. Recency-weighted counters subtract at
   `_PERSUASION_GAIN = 0.5` and can fade a sustained contested trait from the portrait.
-- Hard `evict` tombstones allow manual removal.
+- The revision judgement fences out persona RAG (`rag_include_persona=False`), reducing direct self-copying where persona evidence is minted. IDEAL generation retains deliberate persona-only conditioning.
+- The polarity screen separates opposition inside merged themes; its counter plan and the next-turn reaction feed both reduce weighted evidence. Detected opposition and contested status reach synthesis.
+- Judge authority uses two themes at weighted recurrence ≥1.9, so tenure discount and counters affect the gate too.
+- A standing portrait replaces individual persona RAG entries in mature live chat. Hard `evict` tombstones allow manual removal.
 
 What remains open:
 
@@ -399,16 +388,9 @@ What remains open:
   contested. Top-2, a relevance floor, the `COUNTER` gate, and distinct-session accumulation
   limit one-off damage, but `_TENURE_DECAY` and `_PERSUASION_GAIN` still need corpus-level
   calibration.
-- **The maturity gate still uses raw recurrence.** Tenure discount and counters shape the
-  portrait's weighted evidence, but not the clean-base judge's authority threshold; echoed
-  raw sessions can still mature that gate.
-- **No saturating recall weight.** Echo chamber is also about *volume* — a well-worn persona
-  can occupy multiple live RAG/training anchors even while the digest score is bounded.
-  Retrieval needs a cross-anchor saturation or collapse rule based on independent evidence.
-- **No contradiction-eviction / novelty weighting** (deferred): letting a new persona evict a
-  conflicting old one, or up-weighting persona that extends/contradicts the digest, would make
-  identity *plastic*; the current decay/counter path softens a theme but does not represent
-  two opposing persona poles explicitly.
+- **Residual dependence on self-generated evidence.** The judgement fence removes direct persona retrieval, but the original chat or re-answer may already have been persona-conditioned. There is no complete independent-evidence attribution rule.
+- **Cross-theme opposition remains partial.** The implemented polarity screen catches opposition inside a proposed merge. Already-separated opposing themes are not exhaustively cross-linked. Classification and counter attachment remain approximate, despite working end to end.
+- **Recall volume and evidence independence are separate from score saturation.** Mature chat uses a standing portrait, while fallback retrieval and the stored evidence set can still contain multiple restatements. Further changes should be justified by observed behavior rather than assuming that every duplicate causes harmful amplification.
 
 ### B. Weights do not forget; corpus is unbounded
 
@@ -418,14 +400,13 @@ build time grow without bound, and there is no graceful forgetting in weights.
 
 What exists:
 
-- Per-row wall-clock multipliers + trapezoid schedule equalize each row's *average* exposure.
+- Per-row wall-clock multipliers and configurable global schedule; the optional trapezoid equalizes summed schedule fractions across row positions, not total exposure across corpus sizes.
 - Manual `train_lr` reductions have compensated for corpus growth by hand.
 
 What remains open:
 
 - Deferred by decision (2026-07-23): a full weights-decay design is out of scope until the
-  corpus outgrows the model's capacity/budget. The only forgetting levers under from-scratch
-  are drop-from-corpus (a hard cliff) or abandoning from-scratch. Tracked in more depth in
+  corpus outgrows the model's capacity/budget. Current levers include corpus edits/bans and dose/config changes. No automatic graceful age decay or corpus-size normalization is built; from-scratch training itself does not preclude such a future policy. Tracked in more depth in
   `AVA_OPEN_PROBLEMS.md` → *Per-Build Gradient Budget*; this document defers to it.
 
 ### C. RAG fade is decoupled from whether training actually happened
@@ -447,25 +428,11 @@ What remains open:
   training lagged. A chat without a committed gist can therefore lose its chat-RAG
   representation at the cap; a training-aware handoff remains the principled version.
 
-### D. Open questions surface too rarely
+### D. Open-question selection and pacing
 
-Problem: `[ask]` items are meant to give Ava a standing agenda she raises on her own, but in
-practice they surface far below the rate that would make them feel alive.
+Historical observations of rare ask surfacing predate the sole executive. Current default `deliberation.mode=sole` lets Ava choose outreach, synthesis, check-in, wander, aha, or pivot; those drives no longer compete as independent hourly timers. Direct passive chat surfacing is disabled. The shared reach-out gate, unanswered-opener guards, ask resolution/retirement still constrain what reaches a person.
 
-What exists:
-
-- Passive surfacing at the start of a user-opened session, plus three autonomous reach-out
-  jobs (outreach / synthesis / check-in).
-
-What remains open:
-
-- Three compounding throttles starve the channel: (1) the shared `reachout_gate` allows **one
-  unprompted message per hour across all three jobs combined**, so an ask competes with two
-  siblings for a single hourly slot; (2) the surface-count ceiling **retires** `user` asks,
-  so an ask can expire before it is ever raised; (3) passive surfacing only fires when the
-  *user* opens a session. The net effect is that most asks never reach the person. A rethink
-  of the rate limit (per-channel budgets rather than one shared hourly slot) and of the
-  retirement ceiling is needed.
+What remains open is the quality of that choice and pacing over a sustained history. Old timer-era counts do not establish current starvation, and relaxing the gate is not an automatic remedy. The Activity journal records the executive’s choice and outcome; worklog episodes feed its next decision.
 
 ### E. Cross-channel dedup during the crossfade
 

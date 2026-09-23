@@ -1100,8 +1100,10 @@ def _decide_for_user(
         # message. Nothing is lost: the silence persists, so the next window re-decides.
         # See synthesis / outreach for the same guard.
         if getattr(generate, "last_truncated", None):
-            print("[checkin] discarding opener: generation hit the token cap mid-message "
-                  "— refusing to send a partial message", flush=True)
+            looped = bool(getattr(generate, "last_loop", None))   # halt vs cap — see outreach
+            print("[checkin] discarding opener: generation "
+                  + ("was halted by the loop guard" if looped else "hit the token cap")
+                  + " mid-message — refusing to send a partial message", flush=True)
             return {"skipped": "truncated", "decision": True, "opener": "",
                     "silence_hours": hours, "simulated": simulated,
                     "standing": len(standing), "user": human}

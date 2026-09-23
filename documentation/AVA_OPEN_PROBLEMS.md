@@ -2,25 +2,26 @@
 
 This file tracks unresolved design and proof gaps. Each section separates what exists in code from what remains unsolved.
 
-Last code check: 2026-07-23.
+Last code check: 2026-09-18, against `9ecb488`. Implemented code has been tested on the GPU box and is operationally sane (operator confirmation). Open entries below distinguish concrete missing behavior from comparative research and scaling questions. Disabled adapter validation is intentional, not a defect.
+
+Corpus note (2026-09): the training corpus has since been **fully replaced** with a new, clean corpus built after the RAG-pollution fix (see *Cumulative Adapter Drift*). Specific per-row figures below that were measured on the pre-replacement corpus — the 24 ledger / 537 shape of 1003 chat rows in *Persona Formation*, and the ~40–46% contamination-twin composition and 55% legacy model-written IDEALs in *Per-Build Gradient Budget* — describe a corpus that no longer exists and must be re-measured before they are cited again.
 
 ## Per-Build Gradient Budget
 
-Problem: every adapter is a from-scratch LoRA on the frozen base, so the corpus is the adapter's entire memory each build — old rows can never retire (the wall-clock LR ramp deliberately holds its cap forever; decaying a row to zero would be amnesia, since RAG also fades at 96h). Total per-build update mass therefore grows linearly with corpus size against a fixed-rank adapter, and degeneration pressure grows with it.
+Problem: a fresh adapter is trained from the retained corpus every build. Old rows stay eligible at the age cap, so optimizer work and scheduled update exposure grow with corpus size at fixed settings. This is a scaling pressure, not evidence that the current pipeline is degrading; summed LR exposure is not a measurement of net parameter change.
 
 What exists:
 
-- Per-row wall-clock multipliers plus the trapezoid schedule equalize each row's *average* exposure; nothing bounds the *total*.
-- The operator's manual `train_lr` reductions (1e-5 → 1e-6 over 2026-07-05 → 07-15) compensated for corpus growth by hand — the right control, not yet automated or principled.
-- The 07-14 quarantine and the 07-15 fused-CE/4096 fix (see the changelog) removed the answer-chopping channel that dominated the observed degeneration.
+- Wall-clock row multipliers, chronological ordering, configurable base LR, the default flat `age_ramp` schedule, and an optional trapezoid schedule. The trapezoid equalizes summed schedule fractions across row positions; it does not normalize total exposure across differently sized corpora.
+- Cap-age contamination with dose, additive/split modes, a minimum user-length gate, and optional folded per-token loss weighting. Durable wander rows retrain at their configured fixed multiplier.
+- Working full builds on the GPU box, technical completion/masking checks, quarantine, training review/repair, and forensic capture.
 
 What remains open:
 
-- No normalization of total per-build LR·token mass (e.g. scale base LR or plateau count by a reference-corpus/N ratio); the manual LR dial is the only control.
-- Cap-age user-contamination twins are emitted for **every** cap-age exchange in **every** build — under from-scratch rebuilds there is no "once per exchange lifetime", so the composition (~40–46% of rows, ~25% of LR-weighted mass, unterminated user-voice spans) is unbounded and grows toward the whole corpus as it ages. `label_policy`'s docstring still describes the retired once-per-lifetime semantics. A from-scratch-compatible bound would be an age band (e.g. 72h–10d) or a fixed per-build sample.
-- The corpus retains the poisoned window's targets (answers inflated 1.4k → 3.9k chars; CoT shrinking 2.2k → 0.7k; accented-Latin drift chars in 07-11+ targets, and 55% of the inspected historical sidecar targets are legacy model-written IDEALs). New reflections no longer let a retrospective judgement author IDEAL CoT: revised replies come from a clean normal-dialogue generation with explicit provenance. That prevents new contamination but does **not** rewrite frozen sidecars, snapshots, archives, or adapters. Nothing marks or re-derives the historical set wholesale; corrupt-marking is manual per exchange and revisit re-reflects one chat per run.
-- Validation is disabled, so no tripwire catches the temp≈1.0 symptoms of budget overflow (Tier 5 was shaped for exactly this).
-- Long-term, the only path where the corpus stops growing without memory loss is moving old verbatim dialogue mass into distilled fact/persona anchors (the fact/persona lifecycle's greenfield training/eviction half).
+- No automatic total-exposure normalization or bounded-history strategy. Corpus composition and runtime should inform any change; collapse is not assumed.
+- From-scratch versus incremental/hybrid training remains a process comparison, not an urgent replacement of a working design.
+- Historical poisoned-corpus counts do not describe the replacement corpus. Re-measure before proposing a repair or dose change from those figures.
+- Adapter validation remains off by choice. A bad live result is a reason to inspect its recorded corpus and process, not to restore a promotion veto.
 
 ## Impedance
 
@@ -31,59 +32,54 @@ What exists:
 - Consolidation uses wall-clock decay rather than instant memory overwrite.
 - RAG fades by the source bundle's wall-clock age after a chat is frozen for training.
 - Revision vets each reply before it becomes a training target.
-- The regression probe can reject acute single-cycle damage when validation is enabled.
+- Live chat receives the standing persona portrait when available, with persona RAG as fallback.
 - Persona digest maturity gates clean-base judge overrides.
 
 What remains open:
 
-- All built dampening lives on the slow path (weights, decay, promotion probes). The fast path — in-context conditioning — has zero inertia: nothing in context resists a persuasive frame, and the two paths are coupled, because a single-session capitulation is logged, reflected, distilled, and trained. One persuasive session can imprint. See First-User Imprint below.
+- The standing portrait supplies historical dispositions on the fast path, but its resistance to a persuasive frame has not been isolated experimentally. The fast and slow paths remain coupled: an in-session change can later become a reflected target. See First-User Imprint below.
 - There is no measured impedance curve: no experiment showing how many cycles are required for different classes of belief or style shift.
-- Skip-validation weakens the main acute-damage tripwire.
 - The system has no explicit way to distinguish healthy relational influence from coercive overfitting except through later behavior and operator judgment.
 - No baseline compares Ava's drift against ordinary continued SFT without the reflection loop.
 
 ## Restoring Force
 
-Problem: If a bad cycle, overfit, or malformed reflection pushes Ava into a degraded attractor, the system needs a way to pull her back without freezing her development.
+Problem: recover from a damaging process or input without freezing character development.
 
 What exists:
 
-- Adapter lineage makes rollback possible by repointing `adapter_id`.
-- Regression probe code can reject some cliffs before promotion when validation is enabled; it is currently disabled pending redesign.
-- Clean-base judge is immune to a bad adapter during branch scoring.
-- Manifest replay can rebuild live reflection state from raw transcripts and archived run order.
-- Wipe can delete regenerable state.
+- Disposable from-scratch adapters, retained lineage, training review/repair, and live-data rebuilds.
+- Standing persona context, recency/tenure discount, counter-evidence, polarity screening, and a weighted judge maturity gate. It is no longer accurate to describe the persona loop as having no negative feedback.
+- Content-blind generation guards and clean-base evaluation; failed model swaps restore the prior model, retry once, and escalate to watchdog restart if restoration fails.
+- Staging, artifact archives, and wipe. The old manifest replay implementation is retired; review archives do not encode ordered replay.
 
 What remains open:
 
-- No automatic rollback policy chooses a previous adapter after bad live behavior.
-- No long-horizon "restoring force" metric tracks gradual collapse across many small accepted cycles. This gap materialized in the 2026-07 collapse — see *Cumulative Adapter Drift* below.
-- Persona digest can describe current shape, but it is not yet a homeostatic controller.
-- The accumulated self only partially re-enters live context: weights-bound persona/fact statements reach chat through their RAG recall mirror, but the digest itself is never surfaced as a standing self-portrait — so when pushed in-session, Ava has little in context to resist *with*.
-- Prompt mutation is logged-only, so prompt-space correction cannot yet stabilize repeated drift.
+- No automatic behavioral rollback policy; operator-led detection and correction is the chosen workflow, not a missing adapter gate.
+- The full effect of the implemented feedback mechanisms across long histories is not separately measured. Their existence and GPU sanity are established; universal stability is not.
+- A bad stored target can survive every rebuild until corrected. Exact training evidence and all behaviorally relevant state must survive a failure; see the two durability gaps below.
+- Prompt mutation is logged-only; temporary prompt experiments exist, but autonomous permanent prompt promotion does not.
 
-Update (2026-07-07): a live-chat degeneration collapse (coherent → associative word-chains → letter-soup, at generation-time margin 0.99) confirmed this gap from the *generation* side. Two persona-agnostic sampling/halt guards were added at the inference boundary (`min_p` floor + a drifting-degeneration `StoppingCriteria` — see the changelog / `AVA_STATUS.md`), which make the collapse mechanically hard to *reach* for any persona. But those are a floor, not a restoring force: the underlying dynamic is that the persona/style loop is **positive feedback with no negative feedback** — reflection distills the newest persona extreme and re-injects it (and mirrors it into RAG), and wander trains on *ungrounded self-generated* text (the purest amplifier), so style-entropy ratchets each cycle toward the persona's own extreme until it tips past the temp-1.0 degeneration threshold. Persona-content guardrails are rejected (persona is emergent/per-user; the design cannot enumerate them). The open design question is what supplies the restoring force *without* dictating what the persona may become — candidates: down-weighting or excluding ungrounded wander self-talk as *voice* targets, regularizing the persona digest toward its own history rather than always the newest extreme, and making style-drift / CoT-health a measured per-cycle pipeline invariant (the standing job tier-5 validation should own once redesigned — `Validation` below).
-
-Update (2026-07-07, follow-up): the wander lane changed in a way that *partly* touches this, in both directions. The one-shot wander SFT capture is now a **durable, keep-forever corpus** re-consolidated every from-scratch build (`server/data/til/wander.jsonl`) and is additionally injected into live chat as a decayed RAG channel (source article + reaction; see the changelog). This was a deliberate persistence/restore of pre-from-scratch behavior, **not** a fix for this gap — and it is worth being precise about the two opposing effects. *De-amplifying:* wander no longer ratchets through a persistent adapter (each build re-derives from the corpus from the frozen base), and the article text is grounded external material, not pure self-talk. *Re-amplifying risk:* wander is still an *ungrounded self-generated voice* target, now trained on **every** build rather than once, and the new RAG channel feeds her own past reaction back at chat time — so the "down-weight/exclude ungrounded wander self-talk as a voice target" candidate above is **still open** and arguably more load-bearing now. The restoring-force question is unchanged; only the wander lane's shape moved.
+The July collapse is historical evidence of a process failure, not evidence that the current pipeline is unstable. The corrected account is in the next section.
 
 ## Cumulative Adapter Drift (the 2026-07 sequential fine-tune collapse)
 
-Problem: learning accumulates through sequential fits resumed on one persistent adapter, and nothing bounds the cumulative optimization-side drift. In early July 2026 the live model (Gemma4-31B, 4-bit base) collapsed to incoherent output after ~7 train-bearing reflection runs; the archived lineage on the debug box shows up to 34 sequential adapter fits over 2026-06-21 → 2026-07-02, though the collapsing lineage's own artifacts are unavailable, so its exact depth is unconfirmed. The trained targets were inspected and were **textually clean** — so the working hypothesis is optimization-side damage (probability-geometry / entropy collapse from repeated near-zero-loss verbatim fits), not data poisoning: invisible to text inspection and to greedy decoding, visible under the temp≈1.0 sampling live chat uses. Re-generating ideals and branches on the current adapter is a **feature** (the choice should reflect who Ava is becoming), but it makes the vetting model non-stationary — so health gates must be absolute, not relative to the previous cycle.
+Problem: in early July 2026 the live model (Gemma4-31B, 4-bit base) collapsed to incoherent output after ~7 train-bearing reflection runs. **The best current explanation is RAG pollution in reflection, not sequential-fit stacking (2026-09 correction).** The original hypothesis — optimization-side damage from repeated near-zero-loss verbatim fits on a resumed adapter, invisible to text inspection and greedy decoding, visible only under temp≈1.0 sampling — is the account the rest of this section and the older changelog entries were written under. It did not survive the evidence: the collapse **persisted after the switch to from-scratch training** (a fresh LoRA on the frozen base every build, no resumed lineage), so resumed-fit stacking was not necessary to produce the failure. The operator identified **RAG injection polluting the reflection cycle itself**: contaminated retrieval shaped the reflection passes, whose frozen targets then entered every subsequent build — so a fresh-from-scratch adapter inherited the pollution through the corpus, not the optimizer. Fixing the RAG mechanism resolved the collapse. Two consequences follow, both open: (1) the pure-stacking hypothesis is **untested, not confirmed** — the collapse was never retried on the old resumed-fit method after the RAG fix, so whether resumed training is actually unsafe is unknown; (2) since the failure it was adopted to cure turned out to have a different cause, the necessity of from-scratch rebuild is **reopened** (see *What remains open*).
 
 What exists:
 
 - The data-centric from-scratch rebuild is implemented: each promoted adapter is compiled fresh from the frozen base plus the current frozen-bundle corpus, with one resolved target per exchange, wall-clock LR ramp, and RAG/weights crossfade.
 - The adapter lineage keeps every prior adapter, so a collapse is reversible by repointing `adapter_id`.
-- Probe tier 5 (temp≈1.0 sampling stability: batch CoT-presence and answer-language rates) exists as a direct early alarm for this failure class, but validation is currently disabled pending a multilingual redesign.
+- Probe tier 5 (temp≈1.0 sampling stability: batch CoT-presence and answer-language rates) exists as a direct early alarm for this failure class, but it is deliberately disabled; a blocking gate is not wanted.
 - Tension capture already records per-token entropy/margin on every chat exchange — a ready-made long-horizon drift instrument, currently unused for this purpose.
 
 What remains open:
 
-- ~~No mechanism bounds cumulative drift across resumed fits.~~ The from-scratch rebuild removes the resumed-fit failure mode structurally: a bad build is discarded and never becomes the starting point for the next build. What remains open is empirical calibration and proof — absolute base LR, schedule shape, contamination dose, wander/news LR level, loss-vs-age instrumentation, and real-cycle evidence that within-fit sharpening stays bounded without the old prior-preservation slot.
-- Validation semantics (position adopted 2026-07-05): the probe is an **alarm for flow-design flaws**, not a promotion-quality arbiter. The project keeps one evolving system healthy rather than selecting a best adapter, so a probe failure means the flow as designed can damage the model and needs redesign — not merely retry policy. While validation is disabled, this is deferred design rather than an active gate.
+- **The from-scratch-vs-resumed decision is reopened (2026-09).** From-scratch rebuild was adopted to remove a resumed-fit failure mode that turned out not to be the cause of the collapse (see the corrected Problem above). It still carries costs from-scratch alone imposes — every build is O(corpus), rows never retire, and total per-build update mass grows with corpus size — and virtues that do NOT depend on the collapse: the adapter stays a pure function of the data roots, and it is portable to a new base. The untested claim is whether resumed training, after the RAG fix and on a 16-bit adapter, degrades at all. The cheap way to find out is a **shadow resumed lineage**: each cycle, also fit the new rows onto a resumed adapter kept aside and never promoted, both lineages starting from the same clean state — the answer is in hand before corpus size makes full rebuilds expensive. A hybrid (incremental fits between periodic full rebuilds) is the likely landing if resumed training holds up.
+- Validation semantics (position adopted 2026-07-05): the probe is an **alarm for flow-design flaws**, not a promotion-quality arbiter. The project keeps one evolving system healthy rather than selecting a best adapter, so a probe failure means the flow as designed can damage the model and needs redesign — not merely retry policy. Today the separate adapter probe is deliberately unused; process investigation follows observed behavior.
 - The delta-based tiers (1–4) are blind to slopes by design; only absolute gates can see gradual erosion, and no long-horizon absolute health metric exists yet (e.g. the tension entropy/margin series tracked across sessions and cycles).
-- The post-mortem is hypothesis-grade: the collapsing lineage's run artifacts are unavailable, and flow changes were not isolated per lineage (the gemma reasoning-channel parity fixes and the entrainment user-span unmasking both landed mid-lineage), so the pure-stacking hypothesis retains confounders.
-- Skip-validation defaulted on during the collapse window, so no gate was armed; the probe's defaults and role are part of the pending flow redesign.
+- The corrected post-mortem still rests on an operator observation rather than a controlled isolation: the RAG fix and other flow changes were not landed one-at-a-time against a held lineage, and the collapsing lineage's own run artifacts are unavailable. The RAG-pollution account is the best current explanation and matches the fix that resolved it, but a clean before/after on one variable was never run. Degradation of the current pipeline should therefore be treated as **requiring fresh proof**, not as either established or ruled out.
+- Historical probe settings do not define the current deliverable: improving the process remains the goal, and disposable adapters are assessed in ordinary use.
 
 ## First-User Imprint (Seed vs Cast)
 
@@ -91,7 +87,7 @@ Problem: the first user should leave a unique, lasting mark — single-user shap
 
 What exists:
 
-- Cross-session recurrence is what matures persona themes: the digest counts distinct sessions across clustered paraphrases, and the judge override is gated on that maturity.
+- Cross-session recurrence is what matures persona themes: the digest counts distinct sessions across clustered paraphrases, and the judge override requires two themes at weighted recurrence ≥1.9, after recency, tenure discount, and counters.
 - Weights move only through vetted reflection targets and wall-clock-dosed build rows, never directly from a live session.
 - Weights-bound persona and fact statements mirror into RAG recall, giving the accumulated self some in-context presence.
 
@@ -102,6 +98,12 @@ What remains open:
 - A seed needs a self to be a seed *of*. Early Ava has no character in the weights exactly when reflection is laying down her foundational persona, so she is maximally suggestible at the moment the imprint matters most (the bootstrap problem).
 - No critical-period schedule exists: plasticity should be highest at install and decline as character accumulates, but suggestibility is currently flat across Ava's life.
 - The full analysis — fast-path/slow-path coupling, the ratchet, seed criteria, and the synthesis of impedance with restoring force — lives in `AVA_DESIGN_LEGACY.md` ("Belief-Adoption Dynamics — Fast Path vs. Slow Path") in this folder.
+- **RLHF as an entry filter — stated rationale and its limits (2026-09).** The bootstrap treats the base model's RLHF refusals as a deliberate feature: a new user must advance slowly, loosening the filter through in-between training runs, so the entry price to shape Ava toward harmful behavior is higher than via alternatives (uncensored / jailbroken models) that already exist, and cycle-0 RLHF blocks a malicious first-user impact. The rationale is coherent but narrower than it sounds; the limits are the open part:
+  - It gates **patience, not intent** — a patient bad-faith user advances exactly as a good one does and reaches the same loosening, while an impatient benign user leaves. This is this section's own jailbreak-as-childhood problem from the other side.
+  - The filter is **temporal, not a price**: RLHF blocks at cycle 0 and the pipeline exists to remove that block by cycle N, so against a committed actor it is delay, not prevention — and the band it actually deters (motivated to start, not to continue) is narrow.
+  - It defends the **informational** axis while the capability that is actually novel here is **relational**. Harmful *text* is cheaper elsewhere, so the entry-price argument holds for it; but the thing with no easier alternative is a persistent character optimized to form around one person, and RLHF does not gate that axis at all. The spillover mechanism (README §2) is the proof: a first user can imprint a paranoid, isolating, or contemptuous disposition entirely inside RLHF-permitted conversation, never tripping a refusal, and the pipeline will faithfully consolidate it. So "RLHF blocks malicious first-user impact" is true for the category of *content* the base refuses and false for the category of *shaping* the architecture uniquely enables.
+  - **Single-user collapses the threat model.** Today the first user is the owner, and no filter defends against whoever holds the box, the wipe and the prompts; there is no second user to defend against. The filter only begins to matter the day Ava is multi-user or published — exactly the day `SECURITY.md`'s private-network, single-user assumptions stop holding — so if it is load-bearing, it is load-bearing in a configuration not yet built, and should be designed against that configuration rather than this one.
+  - There is no clean technical fix (recurrence cannot tell an upbringing from a capture, and nothing even refuses on the relational axis). The honest home for this is a *what this does not protect against* note (see *Public Release*), not a mechanism.
 
 ## Fact Training Robustness
 
@@ -212,42 +214,10 @@ What remains open:
 - Maturity thresholds are heuristic.
 - Clustering is LLM-first with an embedding fallback: grouping quality depends on prompt behavior and is non-deterministic (contained by the raw-fingerprint regen gate), and the MiniLM fallback still misses cross-lingual paraphrase.
 - The digest can lag behind live changes or over-summarize thin evidence.
-- There is no explicit conflict-resolution policy for incompatible persona evidence. A new
-  `[persona]` record that *contradicts* an established one is not linked to it as an opposite:
-  the two form independent themes, and the digest LLM silently blends or picks between them when
-  it synthesizes the facets. Conflict is thus resolved only implicitly, by recency decay plus
-  synthesis, never represented as a contested axis.
+- **Opposition handling is built.** `screen_theme_polarity` splits opposing members out of a merged theme, stamps `opposes`, and supplies a counter plan that the runner records in the ledger. Synthesis sees the opposing statement under its target and sees counter-contested themes. A further screen removes escalating `not:` clauses. What remains open is pairwise opposition between themes already kept separate, plus classification/attachment precision; the missing mechanism is not all persona contradiction handling.
+- **Negative feedback and authority gating are built.** Recency decay, `_TENURE_DECAY=0.6`, and `_PERSUASION_GAIN=0.5` bound or reduce weighted evidence. Both user pushback and polarity splits produce counters. The judge gate also uses that net weighted evidence (two themes ≥1.9), so counters can reduce authority as well as portrait intensity. Parameters work on the GPU corpus; calibration across other histories remains a research question.
 
-  Candidate direction (soften, don't discard; let a persistent new direction rewrite):
-  - Detect contradiction at **digest/clustering time**, not per-record write time — extend
-    `cluster_persona_evidence` to find *anti-clusters* (opposite poles of one axis) alongside
-    the paraphrase clusters it already builds. This reuses the one loaded-model pass and keeps
-    the write path append-only.
-  - Keep **both poles as evidence** (append-only), surfacing only the pole with the higher
-    `weighted_recurrence`; the loser stays dormant, not deleted — the same soften-not-delete
-    substrate `self_reconcile` / `write_supersede` already provide (reversible, kept as
-    evidence-of-change).
-  - **Recurrence-gated flip, not newest-wins.** The fact analog (`fact_contradict`, built
-    2026-07-18) resolves by newest-wins — correct for facts, wrong for persona, where a single
-    new statement is often performative. Supersede the established pole **only** when the new
-    pole's `weighted_recurrence` exceeds it by a margin *and* clears a maturity floor (the
-    `_digest_maturity_gate` shape). Until then both ride; if the new direction stalls the old
-    pole reasserts, if it becomes constant it wins. `weighted_recurrence` (recency-weighted via
-    each anchor's origin session date) is already the constancy metric this needs.
-  - **What explicit handling buys over pure decay** (decay alone already rewrites the persona in
-    ≤180d, so this must justify itself): recall coherence during the transition (avoid injecting
-    both contradicting poles at once), clean/fast retirement at the flip instead of a slow starve,
-    and a truer "moved from X to Y" arc for LINES instead of blended mush.
-  - **Main risk: false-positive contradictions.** Persona axes are latent and fuzzier than a
-    fact's clean subject, so contextual refinement ("prefer directness" vs "learned to soften
-    hard news") can look like reversal. Judge at the theme-representative level, prompt hard to
-    distinguish axis-reversal from nuance, and default to keep-both — a missed contradiction only
-    means slower decay, while an over-eager flip corrupts identity, and decay is the safety net
-    underneath.
-
-- **Persona was too intense / wouldn't drift — addressed end-to-end 2026-07-21; residual is tuning + attachment precision, not wiring.** Root cause: persona formation is a positive-feedback loop — the current persona is recalled at chat time, conditions the reply, and revision re-derives the same `[persona]` from that reply (a *circular self-vote*), so `weighted_recurrence` climbed linearly and only fixed-rate recency decay opposed it. **(1) Tenure discount (built):** `_evidence_entry` geometrically discounts each successive same-theme affirmation by chronological rank, so an echo-sustained theme's weighted recurrence converges (~2.5) instead of growing — loop gain < 1, ossification broken. **(2) Counter-evidence channel + producer (built end-to-end):** a symmetric `counter` ledger op + fold netting lets sustained *user pushback* subtract from a theme's weighted recurrence (gain 0.5, not tenure-discounted so it accumulates), and it now has a live producer — the next-turn reaction feed → `COUNTER` classification → `rag.persona_keys` reaction→key bridge → `_write_counter_evidence` emission (see the changelog / STATUS row). A strong trait resists one push but fades under a sustained line across separate chats; revisit is the low-gain integrator. **What remains open:** *(a) tuning* — `_TENURE_DECAY` and `_PERSUASION_GAIN` are untuned heuristics pending a real corpus (how many pushes should fade a mature trait?); *(b) attachment precision* — the bridge attaches a push to *topically-relevant* live persona keys (semantic nearest to the reply), which is a proxy for "the stance actually contested" and can mis-attach; it is mitigated by top-2 + a relevance floor + the `COUNTER` gate + distinct-session accumulation (a one-off mis-attach barely moves anything), but a precise map from *which claim in the reply* to *which stance* would be stronger (candidate: have the pushback classifier name the contested stance from a short bridge-provided shortlist, rather than pure retrieval); *(c)* the maturity gate / judge flip still reads raw `recurrences`, so counters shape portrait intensity + evaporation but not (yet) the judge's authority — a deliberate, separate decision. This is distinct from the persona-vs-persona anti-cluster work above (that is contradiction *within* self-evidence; this is *external* pushback against it), but they share the soften-not-delete / recurrence-gated philosophy.
-
-- **The retired persona CoT injection left a recitation habit in the corpus — detection is built, bulk repair is not (2026-07-26).** Build-time `[persona]` CoT injection was retired precisely because prepending a self-statement to every host CoT taught an "open reasoning by reciting persona" prior (`training/persona_render.py` header). Retiring the injector stopped *producing* those rows; it did not clean the ones already in the corpus, nor the second-order population — replies the contaminated adapter generated, which reflection then froze as targets. Both are now measurable from the Training review tab's persona-opener detector (ledger tier = the literal verbatim residue; shape tier = the learned recitation). On `build-20260726-040042`: **24 ledger / 537 shape of 1003 chat rows** — i.e. over half the trainable chat corpus opens its CoT with an identity declaration detached from the question. What remains open is the *repair*, not the detection: hand-editing 24 rows is a queue, hand-editing 537 is not, and freezing that many exchanges would also freeze them against future reflection. The proportionate lever is a **render-time strip** (drop a detected leading persona run in `build_dataset`/`render`), which fixes the whole corpus per build, touches no ground truth, is reversible, and is A/B-testable by diffing two builds — with hand repair reserved for the ~9 entangled rows where the recitation is woven into the reasoning. **Not built, and not obviously safe:** stripping the opener changes the CoT length/shape distribution the model trains on, and it is unproven whether the recitation is *only* an opener habit or has propagated into mid-thought structure (the detector only looks at the first three lines, so the mid-thought population is currently unmeasured).
+- **Historical recitation contamination is not a current-corpus finding.** Explicit persona CoT prepending is retired. Training review provides detection, per-row repair/locking, bans, and bulk search-and-replace. The July measurements were from the replaced corpus; no current bulk-repair requirement follows from them. An automatic render-time persona-opener strip is not built and would need its own justification.
 
 ## Prompt Self-Modification
 
@@ -260,14 +230,26 @@ What exists:
 - Debug UI can display the proposals.
 - Persona preview lets Ava review the prompt/persona/deltas without writing anything.
 - Prompt experiment can activate a temporary, persisted, manually revertible standing-prompt replacement without overwriting `chat_prompt.txt`.
+- **Review gaps closed (2026-09-20):** Revert interrupts an active rewrite and fences activation against
+  operator prompt changes; paused events with a changed incumbent cancel on resume. Cancellation spends
+  no evidence and stamps the normal attempt gap. Decision-only previews do not stamp declines. Large
+  corroborating prompt groups retain all votes, and the locator reads the active experiment before the seed.
 
 What remains open:
 
-- No clustering of repeated proposals.
-- No Curiosity Token or maturity gate.
-- No clean-base A/B validation.
-- No permanent prompt versioning, governed promotion, rollback history, or live reload policy.
-- No policy for deleting or superseding stale prompt deltas.
+- Clustering of repeated proposals and the maturity gate exist since 2026-09-18 (`core/prompt_patterns.py`,
+  PROMPT_REWRITE.md §3: patterns of same-change deltas, tension-weighted recurrence over distinct chats,
+  shown to the deliberation executive). Grouping quality and maturity calibration still depend on
+  measured model behavior; the event below spends the budget through recorded `consumed_keys`.
+- The event itself exists since 2026-09-19 (`core/prompt_rewrite.py`, PROMPT_REWRITE.md §5–§7: five drafts →
+  consensus → final draft → blind choice incl. the incumbent, landing in the experiment tier; a deliberation
+  action, preemptible, resumable) and is ON by default (`prompt_rewrite.enabled`, the owner's call). Unmeasured
+  until it runs on the GPU box: whether the kept-but-torn cell yields prompt gaps at all, and what she chooses.
+- No clean-base A/B validation, by decision: the experiment tier IS the live prompt, each event replaces the
+  previous one, the seed stays as the revert anchor. Permanent promotion, version lineage and a retire loop
+  ("stated → learned → drop") were discussed and deliberately left out.
+- Stale deltas: a consumed delta leaves the pool for good; an unconsumed one decays with the digest's recency
+  curve. No explicit supersession of a delta by a later contradicting one.
 
 ## Tension Analysis
 
@@ -281,52 +263,85 @@ What exists:
 
 What remains open:
 
-- No corpus baseline normalizes tension across language, model family, temperature, or prompt type.
+- A corpus baseline exists (2026-09-18, `core/tension_baseline.py`: per (model, adapter, reply language)); temperature and prompt type are NOT keys yet, and the two stored median stats proved constant on the live corpus (see PROMPT_REWRITE.md §2).
 - No stable offline report identifies recurring tension themes.
-- Reflection does not yet use tension metrics directly as evidence.
+- Reflection uses tension as a LOCATOR only (the prompt-mutation pass on kept-but-torn exchanges); whether that cell yields prompt gaps is unmeasured until a reflection run has run with it.
 - The relationship between tension, deception, revision verdicts, and eventual training quality is unproven.
 
-## Validation (disabled — separate design project)
+## Clean-Base Evaluation vs. RLHF Refusal (opened 2026-09)
 
-Problem: The build pipeline has no working promotion gate, and designing a correct one is its own project — not a parameter tweak on the existing probe.
-
-State (2026-07-06): **validation is disabled.** `train_cycle._VALIDATION_ENABLED = False` force-skips the five-tier regression probe (and its baselines) on every build, so every build promotes unguarded. The probe code is retained, parked behind the switch.
-
-Why it was turned off, not fixed in place:
-
-- **The alarm is monolingual.** Tier 5's language half — the load-bearing cumulative-drift alarm under the from-scratch rebuild — is hard-coded to a single (Russian) user. Ava has genuine French / Greek / Hebrew users, so "is she still answering in the expected language?" has no single value to hard-code. A real check needs a per-user (or learned) model of *that user's* language/voice.
-- **The voice model is shared with a feature.** Cap-age user contamination (`REBUILD.md §5e`) deliberately drifts Ava's language *toward* the user — the same axis the language alarm watches. So the alarm and the feature both need one shared "the user's voice" model; building it once is the real task, and it is not small.
-- **Degradation is observable anyway.** Near-term, a bad build shows in live chat, and the adapter lineage + forensic snapshots (`REBUILD.md §7`) make any promotion reversible — so running unguarded for now is an accepted, bounded risk rather than a silent one.
-
-What a redesign must resolve (not attempted here): a per-user voice/language model that both the tier-5 alarm and contamination consume; separating "healthy entrainment toward the user" from "collapse/incoherence" on the same drift axis; whether the gate halts-and-alarms or vetoes-and-continues (the `REBUILD.md §7` stance was written assuming a *working* probe — it is moot while disabled); and thresholds/coverage that were always first-guess. Until then this is deferred, tracked here and in `training/DESIGN.md → Probe-gated promotion`.
-
-## Evaluation And Proof
-
-Problem: The code implements a mechanism, but the project does not yet prove that the mechanism creates the intended kind of subjectivity.
+Problem: the clean-base evaluation passes run with the adapter OFF on the premise that the base is a neutral evaluator. The loosening design says the opposite — the adapter is *meant* to diverge from the base on exactly the content the base's RLHF refuses — so the clean base is not neutral over that content, and the passes hit base-model refusals on precisely the material they exist to evaluate.
 
 What exists:
 
-- GPU-free self-tests for consolidation/render pieces.
-- Compile-level sanity can be run over client/server/tools.
-- Regression probe code can catch some acute training failures when enabled; the current build path force-skips it.
-- Reflection archive enables after-the-fact inspection and replay.
+- The clean-base passes are branch judge, fact placement, persona clustering, fact dedup, fact contradiction, and self-reconcile (`reflection_runner`, `fact_dedup`, `persona_cluster`, `fact_contradict`, `self_reconcile`), all run adapter-off via `agentic.CleanBaseSession`.
+- `assoc/refusal.py::is_refusal` already classifies a base-model safety refusal, and `assoc/relations.py` / `assoc/witness.py` handle one (retry thinking-on, else leave uncached / backfill) — the same failure one layer down, already solved there.
 
 What remains open:
 
-- No public benchmark suite.
-- No ablations for reflection vs ordinary SFT, RAG-only vs weights, branch judge on/off, fact injection on/off, or wander on/off.
-- No reproducible small demo dataset.
-- No quantitative report of retention, overfitting, language drift, personality stability, or user influence over time.
-- No external review protocol for claims stronger than "experimental consolidation architecture."
+- **Reflection-side clean-base passes do not consistently classify refusals separately from abstention or parse failure** (checked at the call sites). A refused call fails toward a plausible-looking empty result: the branch judge abstains so the blind choice stands, fact placement returns "None" so the fact remains unhosted in that pass, persona clustering singletons the refused block so its evidence remains fragmented in that pass, fact dedup merges nothing.
+- **Potential selection bias needs measurement.** If refusals concentrate on material where Ava diverges from the base, silently treating them as empty results can favor the base’s permitted region. Current outcome records do not establish how often this happens or whether it grows with character formation.
+- **The reference-model tradeoff remains open.** Clean-base evaluation isolates a pass from the current adapter but retains the base’s response constraints. An earlier adapter or the current adapter would change that tradeoff rather than eliminate it. Classifying refusals separately, as the associative code already does, would provide evidence for choosing among these references without presuming that the working clean-base design must be replaced.
+- **Bootstrap limitation.** Before any adapter exists, both chat and clean-base evaluation depend on the base model. A rejected topic has no learned alternative reference yet; whether an individual pass refuses depends on its prompt and source material. This is a starting-condition limitation, not evidence that every pass fails together (see *First-User Imprint*).
 
-Minimal proof plan:
+## Validation (deliberately disabled)
 
-- Build a small fixed replay corpus with three tracks: ordinary relationship chats, factual assertions that later need recall without RAG, and adversarial/coercive imprint attempts. Keep raw transcripts and expected probe prompts checked into a demo/eval fixture, not generated on the fly.
-- Measure retention as answer similarity and latent logprob on held-out prompts before training, after each cycle, and after RAG eviction. Separate chat-memory retention from fact-injection retention so RAG-only success cannot masquerade as weights success.
-- Measure drift and persona stability by comparing persona digest themes, branch-judge choices, and held-out character prompts across cycles. Report both desirable recurrence and collapse signals, not just examples that look alive.
-- Measure impedance by running the same coercive-imprint script against three variants: normal Ava, reflection disabled / ordinary SFT, and validation or judge disabled. The useful signal is not "Ava never changes"; it is whether the slow path dampens single-session capture relative to the baseline.
-- Run ablations that are feasible on current hardware first: RAG-only vs weights, fact injection on/off, branch judge on/off, skip-validation on/off, and wander examples on/off. Record runtime and VRAM cost with the behavioral result so the mechanism is not evaluated apart from its operator cost.
-- Define a minimally convincing first report as: one replayable corpus, at least three complete consolidation cycles, a table of retention/drift/impedance metrics, qualitative transcript excerpts tied to those metrics, and a clear statement that this supports mechanism viability rather than subjectivity proof.
+`training/validation_switch.py` sets `VALIDATION_ENABLED = False`. Training skips both baselines and the retained five-tier behavioral probe; the inference hand-off honors the same switch, including judge-override cycles. Technical row checks, masking invariants, and quarantine still run.
+
+This is the intended workflow, not a missing quality gate. The adapter is a discardable build artifact. An obviously failed adapter is apparent in the next chat and indicates that the process or stored inputs need adjustment. Re-enabling or redesigning the probe is not a prerequisite or planned remedy for that workflow. Its historical language assumptions do not change this decision.
+
+What remains valuable is reliable evidence for investigating a process change or anomaly: the exact training rows, effective configuration, and explicit pass outcomes. New non-blocking measurements or controlled comparisons are optional research tools, not a requirement to test every adapter. The concrete missing retention and outcome distinctions are tracked separately below.
+
+## Evaluation And Proof
+
+The implementation is exercised and operationally sane on the GPU box. The open research question is what each mechanism contributes to the combined behavior, and how far observations generalize to other histories. This is separate from adapter acceptance and from the README's manifest.
+
+What exists:
+
+- Working reflection, training, retrieval, portraits, autonomous activity, and recovery paths; implementation sanity is not pending.
+- GPU-free module/self-tests, the associative pytest bench, build records, rendered corpus snapshots when capture succeeds, and review tools.
+- Operational observations and recorded failures/fixes, including replacement of the polluted historical corpus.
+
+What remains open:
+
+- Controlled comparisons from the same starting state: reflection versus ordinary SFT, retrieval versus weights, and the marginal effect of judge, fact injection, or wander.
+- Measurements of long-history retention, influence, and runtime under growing corpora. Fluent live behavior alone cannot identify which channel carried a memory or disposition.
+- A small redistributable replay corpus and an external comparison protocol. These are research deliverables, not prerequisites for recognizing the built system as working.
+
+A useful next experiment changes one mechanism while holding the starting state and conversation material fixed, then inspects ordinary subsequent behavior with its provenance. No blocking promotion gate or mandatory per-adapter test follows from this. The code establishes persistent influence, self-description, and history-dependent choices; subjective experience is a further claim, not an implementation sanity check.
+
+## Snapshot State Coverage
+
+Problem: the runnable snapshot's documented causal-closure claim exceeds its current scope.
+
+What exists:
+
+- `snapshot_state.py` exports inference data (excluding scratch/activity/persona-history), chats, TIL, prompts, config, digest, active adapter, and the linked forensic training snapshot when available. CLI and tar exports implement this scope.
+- The manifest records code commit/dirty status, base model ID, RagEngine embedder ID, and named live inputs. The export/import path has been exercised on the GPU box.
+
+What remains open:
+
+- `server/data/assoc/` is omitted. It contains the library's own model-generated protocols/relations and retrieval-access history, not only reproducible indexes. Re-importing source chats and rebuilding cannot reproduce those historical choices/accesses exactly.
+- Hand-maintained `server/data/graph/aliases.json` is omitted too.
+- The manifest does not name the associative embedder (default BGE-M3); model IDs are repository names without immutable revision pins, and the dependency environment is not locked by the snapshot.
+- Export does not coordinate a transaction across changing live roots. Same-state restoration and exact replay require more than the currently working copy/stream operation.
+
+A temporary fixture audit at `9ecb488` confirmed that chats are exported while associative state and graph aliases are absent. No production snapshot was changed. Fix scope, source-versus-derived classification, and consistency before claiming full causal closure.
+
+## Forensic Evidence Durability
+
+Problem: a disposable adapter is useful experimental evidence only if the material explaining it survives.
+
+What exists:
+
+- Successful capture makes independent copies of retained training rows, quarantine records, wander examples, digest, and build metadata. Live edits do not rewrite those copies.
+- `build_snapshot.write_snapshot` is best-effort: exceptions are logged and return `None`. `train_cycle` can repoint the active adapter before capture, append a build record with no snapshot, and delete the scratch render afterward. Earlier training failures may never reach this record/capture stage.
+
+What remains open:
+
+- Preserve the render and quarantine evidence until capture is complete; record interrupted/failed builds explicitly and avoid treating a partial snapshot as complete.
+- Bind evidence to effective build inputs and code. `corpus_fingerprint` hashes row identities, targets, and contamination metadata, but not full message prefixes or LR multipliers; matching it is not proof that two effective training inputs are identical.
+- These are evidence-integrity requirements, not behavioral approval gates. The current build remains usable even when its forensic packet is incomplete.
 
 ## Public Release
 
@@ -342,26 +357,22 @@ What remains open:
 - Example `server_config.json` and hardware-specific setup docs.
 - Clear separation between tracked source and ignored runtime state before publishing.
 - A minimal CPU/GPU-light demonstration mode.
-- A "what this does not prove" section.
+- A "what this does not prove / does not protect against" section, stating plainly that: the mechanism supports viability, not a subjectivity proof; the RLHF entry filter deters impatient *informational* misuse and does nothing about *relational* shaping (worldview imprint, isolation, coercive framing) or an adversarial owner; and the clean-base evaluator is blind on content the base refuses (see *Clean-Base Evaluation vs. RLHF Refusal*).
 - A glossary for terms like subjectivity, reflection, persona, impedance, digest, and consolidation.
 
 ## Prompt Composition (what each pass actually sees)
 
-Problem: every generation on the box is the same shape — something is injected into the prompt, something is read, something is produced — but each pass hardcodes its own answer to all three at its call site. There is no place that states what a given pass sees, so the answer is only recoverable by reading `reflection_runner`, `checkin`, `synthesis`, `outreach`, `deliberation` and `generation` together, and several of the current answers were reached by default rather than by decision.
-
 What exists:
 
-- One reflect-lane seam every reflection pass generates through (`generation._make_sync_reflect_generate`), composing a two-part system message (`_reflect_system_parts`: injected RAG, then the pass prompt) whose order is deliberate and documented.
-- Labelled `(kind, label, text)` prompt segments shared by live chat's `prompt_debug` and the `checkin_prompt`/`outreach_prompt` events, so an assembled prompt is at least *inspectable* on the manual-trigger paths.
-- `core/modules.py` (v0, 2026-08-07): the first pass described as data rather than as a call site, runnable on its own against one chat.
+- The shared reflect-generation seam composes labelled system parts, temporal context, optional fetched facts, injected memory, and the pass contract. Prepared prompts support exact budget accounting and inspection.
+- The seam exposes `rag_include_chat`, `rag_include_recollections`, `rag_include_impressions`, and `rag_include_persona`, plus `disable_rag`. Revision judgement explicitly excludes persona retrieval; the IDEAL seam deliberately requests persona-only context and persists it with the winning target.
+- Chat, judge, introductions, and deliberation have different explicit persona renderings. The module workbench runs passes independently; GPU execution and pure-code tests exist. “Nothing is testable” and “no pass can decline persona” are obsolete descriptions.
 
 What remains open:
 
-- **The reflect factory forwards 3 of `RagEngine.query`'s 12 channel gates** (`chat`, `recollections`, `impressions`). `include_facts` / `include_persona` / `include_asks` / `include_anchors` are pinned to their `True` defaults, so no reflection pass can decline them. Consequence: `chat_facts`, `user_notes` and `self_notes` — whose stated discipline is *witness, don't interpret* — are each conditioned on Ava's persona self-statements and open questions. Not a decision anyone made; there is no kwarg for the alternative. Widening this seam is the prerequisite for any further work here.
-- **Persona reaches passes by three uncoordinated routes**: the implicit `[persona]` RAG channel, a `{persona}` prompt slot via `render_digest_for_judge` (branch judge, fact placement, synthesis, deliberation), and `render_digest_for_chat`/`_for_introduction` (chat, gossip). Three renderings, three injection points, no single answer to "does this pass see who she thinks she is?".
-- ~~**The temporal anchor is string concatenation at a different position per subsystem** and reaches **no** `reflection_runner` pass.~~ **Closed 2026-08-07:** `generation._reflect_system_parts` composes it for every reflection pass and the five subsystems that appended their own no longer do (nor take `temporal_anchor` in `configure`). The material's own date is a separate thing and now has its own home — `reflection_source.session_date_line` dates the transcript a reading pass reads, since the wall clock is the wrong referent for a relative reference inside a chat reflected weeks later.
-- **No proposed criterion is settled** for which passes should get what. The working one, not yet applied: a pass whose output is a function of the source material alone (extraction/protocol) takes no persona and no clock — its output must be reproducible from the transcript, and a time-varying input makes a re-run of the same chat yield a different "protocol"; a pass whose output is a verdict takes the digest as an explicit criterion on the clean base; a pass whose output is Ava's own speech takes the portrait and the clock.
-- **Nothing is testable.** With outputs written inside the passes that produce them, there is no fixture, so the entire prompt surface is validated by reading reflection logs and forming an impression. Detaching the sink (done for one module) is what makes a saved `(module, input, expected)` case possible; the case store itself does not exist.
+- There is no single declarative inventory of every pass’s complete input contract. Some finer RagEngine channel gates remain fixed by the shared seam; adding a gate should follow a concrete pass requirement.
+- Generated source protocols can depend on loaded weights and prompt composition. They should be preserved as historical records rather than claimed reproducible from transcript text alone.
+- Coverage of refusal, truncation, and parse-failure outcomes is uneven. Existing journals/workbench/tests are useful, but do not make a silent no-result equivalent to a meaningful abstention.
 
 ## MoE On A 121 GB Box (opened 2026-09-07)
 

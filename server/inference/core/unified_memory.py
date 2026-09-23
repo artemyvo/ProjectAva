@@ -19,10 +19,15 @@ So on such a box every load pins ``device_map={"": 0}`` and skips accelerate's
 free-memory planning. Detected by the CUDA total being (within tolerance) the
 system's MemTotal — a discrete GPU reports its own VRAM, an order of magnitude
 below system RAM.
+
+Since 2026-09-17 a single-GPU DISCRETE box is pinned too (see ``load_kwargs``):
+the planner's conservative estimate refused a model that fit, and an offloaded
+load is a failed load on this project anyway.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional
 
 
@@ -52,10 +57,34 @@ def is_unified_memory(tolerance: float = 0.15) -> bool:
     return abs(total - sys_total) <= tolerance * sys_total
 
 
+def _single_cuda_device() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available() and torch.cuda.device_count() == 1
+    except Exception:
+        return False
+
+
 def load_kwargs() -> Dict[str, object]:
     """Extra ``from_pretrained`` kwargs for this box: pinned single-device placement
-    on unified memory, nothing elsewhere."""
+    (``device_map={"": 0}``) on unified memory AND on any single-GPU box; nothing on a
+    multi-GPU one. ``AVA_LOAD_PLACEMENT=planner`` restores the loader's own planning
+    on a discrete GPU.
+
+    Pinning was Spark-only until 2026-09-17. On a discrete card the planner (unsloth's
+    head-aware map over accelerate) sizes the model from its own estimate against a
+    fraction of free VRAM and, when short, offloads part of it to CPU/disk — which
+    ``UnslothBackend._assert_fully_materialized`` then refuses, so on this project an
+    offloaded load is a failed load either way. The estimate is conservative enough to
+    refuse a model that fits: the RTX 5090 box loaded gemma-4-31B (~23 GB resident)
+    with 28.1 GiB free at every clean-base swap for months, and one day the planner
+    put ``lm_head`` on meta at that same 28.1 GiB, taking the reflection run and then
+    the box down. Pinned, the load either fits or raises a real CUDA OOM at the point
+    of failure — the shape the swap's restore path is built for — and the guard stays
+    as the backstop."""
     if is_unified_memory():
+        return {"device_map": {"": 0}}
+    if _single_cuda_device() and os.environ.get("AVA_LOAD_PLACEMENT", "").lower() != "planner":
         return {"device_map": {"": 0}}
     return {}
 

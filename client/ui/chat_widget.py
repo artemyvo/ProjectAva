@@ -27,9 +27,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont, QKeyEvent, QTextCursor, QTextCharFormat, QColor
-
-import colorsys
+from PyQt6.QtGui import QFont, QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPalette
 
 from core.backend_client import BackendClient
 
@@ -566,10 +564,11 @@ class ChatWidget(QWidget):
         self.rag_history = True
         self.rag_facts = True
         self.rag_persona = True
-        # Brightest RGB channel (0-255) the red↔green tension tint may reach. In HSV
-        # the value component IS the max channel, so this caps it exactly; full-bright
-        # tints (~0xCC) wash out on a white background, hence the darker default.
-        self.tension_color_max = 0x7F
+        # How far a full-strength signal lifts its colour channel above the neutral grey
+        # of the black chat pane (AVA_REWARD_LOOP.md §7 item 1): colour = grey + gain·s
+        # per channel, so full tension is (255,127,127) at the default. A channel only
+        # ever adds light, which is why the pane is black — no mix can wash out.
+        self.channel_gain = 128
         self._server_model_id: str = ""
         self._server_adapter_id: str = ""
         self._server_base_quant: str = ""
@@ -747,18 +746,19 @@ class ChatWidget(QWidget):
         self.spn_temperature.valueChanged.connect(self._on_temperature_changed)
         params_layout.addWidget(self.spn_temperature)
 
-        params_layout.addWidget(QLabel("Tint max:"))
-        self.spn_tint_max = QSpinBox()
-        self.spn_tint_max.setRange(0x20, 0xFF)
-        self.spn_tint_max.setValue(self.tension_color_max)
-        self.spn_tint_max.setMaximumWidth(70)
-        self.spn_tint_max.setToolTip(
-            "Brightness cap (0-255) for the green/red per-token tension colors. "
-            "Lower = darker, easier to read on a white background; 127 (0x7F) is "
-            "a good default. Applies to newly rendered replies."
+        params_layout.addWidget(QLabel("Gain:"))
+        self.spn_gain = QSpinBox()
+        self.spn_gain.setRange(0, 128)
+        self.spn_gain.setValue(self.channel_gain)
+        self.spn_gain.setMaximumWidth(70)
+        self.spn_gain.setToolTip(
+            "How far a full-strength signal lifts its colour channel above the grey "
+            "body text: red = tension (the model nearly said something else), green = "
+            "relief (its uncertainty just dropped), blue = pain (axis projection, once "
+            "captured). 128 = full range, 0 = plain grey. Applies to newly rendered replies."
         )
-        self.spn_tint_max.valueChanged.connect(self._on_tint_max_changed)
-        params_layout.addWidget(self.spn_tint_max)
+        self.spn_gain.valueChanged.connect(self._on_gain_changed)
+        params_layout.addWidget(self.spn_gain)
 
         self.chk_debug = QCheckBox("Debug")
         self.chk_debug.setToolTip(
@@ -869,6 +869,7 @@ class ChatWidget(QWidget):
         self.txt_chat_log.setReadOnly(True)
         self.txt_chat_log.setPlaceholderText("Chat log will appear here...")
         self.txt_chat_log.setFont(self.text_font)
+        self.paint_black_pane(self.txt_chat_log)
         v_splitter.addWidget(self.txt_chat_log)
 
         input_container = QWidget()
@@ -989,8 +990,8 @@ class ChatWidget(QWidget):
     def _on_temperature_changed(self, value: float) -> None:
         self.temperature = float(value)
 
-    def _on_tint_max_changed(self, value: int) -> None:
-        self.tension_color_max = int(value)
+    def _on_gain_changed(self, value: int) -> None:
+        self.channel_gain = int(value)
 
     def _on_notes_committed(self) -> None:
         if not self._client.is_connected():
@@ -1813,43 +1814,101 @@ class ChatWidget(QWidget):
             self._last_completed_turn_start_pos = self._streaming_turn_start_pos
 
     # ---------------------------------------------------------------- #
-    # Per-token tension coloring                                        #
+    # Three-channel token colouring (black pane)                        #
     # ---------------------------------------------------------------- #
+    #
+    # Body text is neutral grey on black; each per-token signal ADDS light to one RGB
+    # channel, up to `channel_gain` at full strength (AVA_REWARD_LOOP.md §7 item 1):
+    #     red   = tension  (1 − top1-top2 margin: the model nearly said something else)
+    #     green = relief   (causal z-score of the entropy drop, server-side
+    #                       `tension.relief_series` — a proxy until a relief axis exists)
+    #     blue  = pain     (pain-axis projection, z-scored; absent until an axis is
+    #                       captured — a missing channel is zero, never an error)
+    # colour = (grey + gain·s_r, grey + gain·s_g, grey + gain·s_b), each s in [0,1].
+    # Because a channel only ever adds, no mix can wash out: tension then relief on one
+    # token is yellow, tension under pain magenta, all three white — all legible on
+    # black. A calm, decisive token is grey, not green: every s is zero for the typical
+    # token, which is what the per-channel threshold + gamma below are for.
 
-    def _tinted_qcolor(self, hue: float, saturation: float) -> QColor:
-        """HSV → QColor with value capped by the UI's "Tint max" setting.
+    _BASE_GREY = 127
+    _MUTED_GREY = QColor(80, 80, 80)   # labels / rules: below the body grey, above black
 
-        HSV's value component is exactly the brightest RGB channel, so scaling the
-        0-255 cap into value guarantees no channel exceeds it — the knob that keeps
-        the red/green tension tints readable on a white background.
+    @classmethod
+    def paint_black_pane(cls, edit) -> None:
+        """Black background, neutral-grey body text, for any QTextEdit that renders the
+        three channels (the Chat tab's log, the Chat review tab's transcript).
+
+        The colouring only ever ADDS light to a channel (_channel_qcolor), so the
+        background has to be the one colour nothing can be lifted into. Both the
+        palette and a stylesheet: the stylesheet is what every platform style honours
+        for the viewport, the palette is what `palette().text()` returns for the
+        neutral formats used after a coloured block.
         """
-        v = self.tension_color_max / 255.0
-        r, g, b = colorsys.hsv_to_rgb(hue, saturation, v)
-        return QColor(int(r * 255), int(g * 255), int(b * 255))
+        grey = QColor(cls._BASE_GREY, cls._BASE_GREY, cls._BASE_GREY)
+        pal = edit.palette()
+        pal.setColor(QPalette.ColorRole.Base, QColor(0, 0, 0))
+        pal.setColor(QPalette.ColorRole.Text, grey)
+        pal.setColor(QPalette.ColorRole.PlaceholderText, cls._MUTED_GREY)
+        edit.setPalette(pal)
+        edit.setStyleSheet(
+            f"QTextEdit {{ background-color: #000000; color: {grey.name()}; }}"
+        )
 
-    def _confidence_to_qcolor(self, margin: float) -> QColor:
-        """Per-token text color: margin 1 (decisive) = green, 0 (near-tie) = red.
+    # Display mapping per channel: s = clamp((x − lo) / (hi − lo), 0, 1) ** gamma.
+    # Tension: x = 1 − margin in [0,1]; most tokens sit near 0, a near-tie near 1.
+    _TENSION_MAP = (0.15, 1.0, 1.5)
+    # Relief / pain: x is a z-score — first visible at 1σ, full at 3σ.
+    _RELIEF_MAP = (1.0, 3.0, 1.0)
+    _PAIN_MAP = (1.0, 3.0, 1.0)
 
-        Driven off the top1-top2 probability margin (already in [0,1], so no empirical
-        clip) — the inverse of friction, on the same hue axis as the tension chip so the
-        two read consistently. Most tokens sit near margin 1 (green); the near-ties pop
-        red against that field — exactly where the model nearly said something else.
-        """
-        f = 1.0 - max(0.0, min(1.0, float(margin)))   # friction = 1 - confidence
-        hue = (1.0 - f) * (120.0 / 360.0)             # decisive=green → contested=red
-        return self._tinted_qcolor(hue, 0.65)
+    @staticmethod
+    def _shape(x, lo: float, hi: float, gamma: float) -> float:
+        """Map a raw channel value to display strength in [0,1]; junk → 0."""
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return 0.0
+        if x != x:                      # NaN
+            return 0.0
+        s = (x - lo) / (hi - lo)
+        s = 0.0 if s < 0.0 else 1.0 if s > 1.0 else s
+        return s ** gamma
+
+    def _channel_qcolor(self, s_r: float, s_g: float, s_b: float) -> QColor:
+        """Neutral grey lifted per channel by strength × gain. (1,0,0) → (255,127,127)."""
+        gain = self.channel_gain
+
+        def lift(s: float) -> int:
+            return max(0, min(255, int(round(self._BASE_GREY + gain * s))))
+
+        return QColor(lift(s_r), lift(s_g), lift(s_b))
+
+    def _span_channels(self, entry) -> tuple:
+        """(s_r, s_g, s_b) for one ``[text, margin, relief, pain]`` span. Missing → 0."""
+        margin = entry[1] if len(entry) > 1 else None
+        relief = entry[2] if len(entry) > 2 else None
+        pain = entry[3] if len(entry) > 3 else None
+        s_r = 0.0
+        if margin is not None:
+            try:
+                s_r = self._shape(1.0 - float(margin), *self._TENSION_MAP)
+            except (TypeError, ValueError):
+                s_r = 0.0
+        s_g = self._shape(relief, *self._RELIEF_MAP) if relief is not None else 0.0
+        s_b = self._shape(pain, *self._PAIN_MAP) if pain is not None else 0.0
+        return s_r, s_g, s_b
 
     def _insert_colored_spans(self, cursor: QTextCursor, spans: list) -> None:
-        """Insert ``[text, margin]`` spans, each tinted by its generation confidence."""
+        """Insert ``[text, margin, relief, pain]`` spans, each lit by its three channels."""
         for entry in spans or []:
             try:
-                text, margin = entry[0], entry[1]
+                text = entry[0]
             except (TypeError, IndexError):
                 continue
             if not text:
                 continue
             fmt = QTextCharFormat()
-            fmt.setForeground(self._confidence_to_qcolor(margin))
+            fmt.setForeground(self._channel_qcolor(*self._span_channels(entry)))
             cursor.insertText(text, fmt)
 
     def _insert_think_prob_line(self, cursor: QTextCursor) -> None:
@@ -1858,25 +1917,24 @@ class ChatWidget(QWidget):
         The percentage is the probability the model put on opening a thinking block at
         its first generated token (gemma-4 `<|channel>`) — a low value means it barely
         wanted to reason, i.e. the missing-CoT problem is serious; a high value means it
-        usually thinks and a CoT-less reply was unlucky sampling. Green (wants to think)
-        → red (won't). Omitted for families whose opener isn't sampled (qwen3) or when
-        capture is off.
+        usually thinks and a CoT-less reply was unlucky sampling. Green lift (wants to
+        think) ↔ red lift (won't), on the same additive scheme as the tokens. Omitted for
+        families whose opener isn't sampled (qwen3) or when capture is off.
         """
         prob = self._client.last_status.get("think_open_prob")
         if prob is None:
             return
         fmt = QTextCharFormat()
-        # prob=1 → green (hue 120°), prob=0 → red (hue 0°): high = wants to think.
-        hue = max(0.0, min(1.0, float(prob))) * (120.0 / 360.0)
-        fmt.setForeground(self._tinted_qcolor(hue, 0.55))
+        p = max(0.0, min(1.0, float(prob)))
+        fmt.setForeground(self._channel_qcolor(1.0 - p, p, 0.0))
         cursor.insertText(f"Thinking: {float(prob) * 100:.0f}%\n", fmt)
 
     def _insert_reply(self, cursor: QTextCursor, response: str) -> None:
         """Insert the assistant reply at *cursor*, per-token colored by generation
-        confidence when tension spans are available — the CoT shown above the reply,
-        each delimited by a muted label. Green = decisive token, red = the model nearly
-        said something else. Display-only: conversation history keeps the plain answer.
-        Falls back to plain text when capture is off (no spans).
+        signals when tension spans are available — the CoT shown above the reply, each
+        delimited by a muted label. Grey = nothing happened; red = tension, green =
+        relief, blue = pain (see the section comment above). Display-only: conversation
+        history keeps the plain answer. Falls back to plain text when capture is off.
         """
         spans = self._client.last_status.get("tension_spans") or {}
         cot = spans.get("cot")
@@ -1885,7 +1943,7 @@ class ChatWidget(QWidget):
             cursor.insertText(response)
             return
         muted = QTextCharFormat()
-        muted.setForeground(QColor(150, 150, 150))
+        muted.setForeground(self._MUTED_GREY)
         if cot:
             cursor.insertText("⟨thinking⟩\n", muted)
             self._insert_colored_spans(cursor, cot)
@@ -1904,15 +1962,52 @@ class ChatWidget(QWidget):
     _FRICTION_FULL_SCALE = 0.5
 
     def _friction_to_qcolor(self, contested_frac: float) -> QColor:
-        """Map a segment's contested fraction to a chip color.
-
-        More contested (more friction) = warmer/redder; decisive = green. Drives off
-        contested_frac rather than the old logit margin, so it is model-agnostic and
-        does not need an empirical clip. Red-green axis is debug-only; not for production.
-        """
+        """Map a segment's contested fraction to a chip colour: a red lift, like the
+        tokens' tension channel. Drives off contested_frac rather than the old logit
+        margin, so it is model-agnostic and does not need an empirical clip."""
         f = max(0.0, min(1.0, float(contested_frac) / self._FRICTION_FULL_SCALE))
-        hue = (1.0 - f) * (120.0 / 360.0)  # 0 friction = green, full scale = red
-        return self._tinted_qcolor(hue, 0.55)
+        return self._channel_qcolor(f, 0.0, 0.0)
+
+    def _append_channel_means(self, cursor: QTextCursor, neutral: QTextCharFormat,
+                              spans: Optional[dict] = None) -> None:
+        """One chip line with each segment's mean display strength per channel.
+
+        Read against the coloured text above it: the tokens show WHERE a channel lit,
+        this shows HOW MUCH of the segment it covered. Each number is printed in its own
+        channel's full colour so the legend is the number itself. Blue prints as ``—``
+        while no pain series arrives (no axis captured yet), so its absence is visible
+        rather than a silent zero. `spans` defaults to the last live reply's; the Chat
+        review tab passes a stored exchange's.
+        """
+        if spans is None:
+            spans = self._client.last_status.get("tension_spans") or {}
+        parts = []
+        for label, key in (("CoT", "cot"), ("ans", "answer")):
+            seg = spans.get(key) or []
+            if not seg:
+                continue
+            chans = [self._span_channels(e) for e in seg if e]
+            if not chans:
+                continue
+            n = len(chans)
+            has_pain = any(len(e) > 3 and e[3] is not None for e in seg)
+            parts.append((label, sum(c[0] for c in chans) / n,
+                          sum(c[1] for c in chans) / n,
+                          (sum(c[2] for c in chans) / n) if has_pain else None))
+        if not parts:
+            return
+        cursor.insertText("\n  channels · ", neutral)
+        for i, (label, r, g, b) in enumerate(parts):
+            if i:
+                cursor.insertText("   ", neutral)
+            cursor.insertText(f"{label} ", neutral)
+            for value, colour in ((r, self._channel_qcolor(1.0, 0.0, 0.0)),
+                                  (g, self._channel_qcolor(0.0, 1.0, 0.0)),
+                                  (b, self._channel_qcolor(0.0, 0.0, 1.0))):
+                fmt = QTextCharFormat()
+                fmt.setForeground(colour)
+                cursor.insertText("—" if value is None else f"{value:.2f}", fmt)
+                cursor.insertText(" ", neutral)
 
     def _append_tension_chip(self, cursor: QTextCursor) -> None:
         """Insert a one-line tension chip beneath the just-rendered reply.
@@ -1963,6 +2058,8 @@ class ChatWidget(QWidget):
             )
             cursor.insertText(f"\n  {label} forks · {picks}", fmt)
 
+        self._append_channel_means(cursor, neutral)
+
         # Reset format so subsequent inserts (the trailing \n\n) don't carry the chip color.
         cursor.setCharFormat(neutral)
 
@@ -1987,11 +2084,14 @@ class ChatWidget(QWidget):
     # wrong — most immediately, whether the injected RAG block is carrying near-duplicate
     # lines — and in a single-colour dump the block is a paragraph indistinguishable from
     # the prompt around it. Assistant history stays muted: it is context, not this turn.
+    # Light variants: the pane is black (see _channel_qcolor), and the token channels
+    # never use a hue this saturated, so a Debug segment cannot be mistaken for a lit
+    # token.
     _PROMPT_DEBUG_COLORS = {
-        "system": QColor(38, 88, 190),
-        "rag": QColor(20, 125, 60),
-        "user": QColor(190, 40, 40),
-        "assistant": QColor(140, 140, 140),
+        "system": QColor(120, 160, 255),
+        "rag": QColor(90, 200, 120),
+        "user": QColor(255, 110, 110),
+        "assistant": QColor(100, 100, 100),
     }
 
     def _on_prompt_debug(self, segments: list) -> None:
@@ -2008,7 +2108,7 @@ class ChatWidget(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         rule = QTextCharFormat()
-        rule.setForeground(QColor(150, 150, 150))
+        rule.setForeground(self._MUTED_GREY)
         cursor.insertText("\n───── prompt ─────\n", rule)
 
         for seg in segments:
@@ -2018,7 +2118,7 @@ class ChatWidget(QWidget):
             if not text.strip():
                 continue
             color = self._PROMPT_DEBUG_COLORS.get(
-                str(seg.get("kind", "")), QColor(90, 90, 90)
+                str(seg.get("kind", "")), self._MUTED_GREY
             )
             label = QTextCharFormat()
             label.setForeground(color)
@@ -2095,7 +2195,7 @@ class ChatWidget(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         rule = QTextCharFormat()
-        rule.setForeground(QColor(150, 150, 150))
+        rule.setForeground(self._MUTED_GREY)
         cursor.insertText(f"\n───── {head} ─────\n", rule)
 
         if skipped:
@@ -2106,7 +2206,7 @@ class ChatWidget(QWidget):
             # A failure is not a quiet outcome and must not be dressed as one — that
             # equivalence is exactly what hid a dead channel for a day.
             muted.setForeground(green if skipped in ("picked_nothing", "no_candidates",
-                                                     "empty") else QColor(190, 40, 40))
+                                                     "empty") else self._PROMPT_DEBUG_COLORS["user"])
             cursor.insertText(note + "\n", muted)
         elif text:
             body = QTextCharFormat()

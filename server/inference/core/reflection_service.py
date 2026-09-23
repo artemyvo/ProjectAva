@@ -1228,6 +1228,23 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
 
     sessions = sorted([str(s) for s in (msg.get("sessions") or [])])
 
+    # Admission + RESERVATION, before anything else has a side effect. The flag used to
+    # flip only when the executor thread began the run, so while the executor was busy
+    # (a background job, a queued run) two requests in a row were both accepted and
+    # queued behind it — and two in the same second got the same run id. Reserve the
+    # slot here; every early return below releases it, and `_run`'s finally clears it.
+    if _reflection_run_active:
+        await _send(ws, {
+            "type": "error",
+            "message": "A reflection run is already active — stop it before starting a new one.",
+        })
+        return
+    _reflection_run_active = True
+
+    def _release() -> None:
+        global _reflection_run_active
+        _reflection_run_active = False
+
     # "Revisit old chat": with no explicit sessions, the server picks one random chat
     # aged >= revisit.min_age_days and re-reflects it under the current persona.
     revisit = bool(msg.get("revisit"))
@@ -1235,6 +1252,7 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
         chosen = _pick_random_old_chat(_revisit_min_age_days(),
                                        _revisit_min_revisit_days())
         if not chosen:
+            _release()
             await _send(ws, {
                 "type": "error",
                 "message": (f"No chat at least {int(_revisit_min_age_days())} days old "
@@ -1248,14 +1266,8 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
         _record_revisited(chosen)
 
     if not sessions:
+        _release()
         await _send(ws, {"type": "error", "message": "sessions must be a non-empty list"})
-        return
-
-    if _reflection_run_active:
-        await _send(ws, {
-            "type": "error",
-            "message": "A reflection run is already active — stop it before starting a new one.",
-        })
         return
 
     # A background per-chat pass may hold the executor; an operator Sleep run preempts it
@@ -1309,7 +1321,14 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                 pass
 
     debug = bool(msg.get("debug", False))
+    store = _get_run_store()
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Second-resolution ids collide (a run that failed at admission and its retry, both
+    # in one second); the store would silently overwrite the first record.
+    _base_run_id, _n = run_id, 1
+    while store.get_run(run_id) is not None:
+        _n += 1
+        run_id = f"{_base_run_id}_{_n}"
 
     # Reflection packs to the reflection window (>= the chat context), letting a run
     # reason over more than a chat may grow to. Default = the physical ceiling the
@@ -1335,7 +1354,6 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
         debug=debug,
         revisit=revisit,
     )
-    store = _get_run_store()
     run = store.create_run(config)
     await _send(ws, {
         "type": "reflection_run_started",
@@ -1360,6 +1378,7 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
         store.finalize_run(run_id, "failed", {
             "error": detail, "mutations_applied": False,
         })
+        _release()
         return
 
     # Revisit: back up the chosen chat's live sidecar so it is recoverable if the run
@@ -1395,14 +1414,17 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
         checkpoint_completed_session(_DATA_DIR, filename, run_id)
 
     def _consume_pending_clean_base(filename: str) -> dict:
-        # Two-stage freeze — stage two: load (consume-once) the clean-base job payloads
-        # the background per-chat pass persisted for a `chat_reflected` chat, so this run's
-        # end-of-run clean-base phase finishes it.
-        from core.reflection_staging import (
-            load_pending_clean_base, delete_pending_clean_base)
-        data = load_pending_clean_base(_DATA_DIR, filename)
+        # Two-stage freeze — stage two: LOAD the clean-base job payloads the background
+        # per-chat pass persisted for a `chat_reflected` chat, so this run's end-of-run
+        # clean-base phase finishes it. Load only — the delete is `_ack_pending_clean_base`,
+        # which the runner calls once that phase has actually run, so a run stopped
+        # before it leaves the payload (and the chat's chat_reflected stamp) for the next.
+        from core.reflection_staging import load_pending_clean_base
+        return load_pending_clean_base(_DATA_DIR, filename)
+
+    def _ack_pending_clean_base(filename: str) -> None:
+        from core.reflection_staging import delete_pending_clean_base
         delete_pending_clean_base(_DATA_DIR, filename)
-        return data
 
     def _run_dry_summary() -> None:
         """Write-nothing reflection preview: generate + report, persist nothing.
@@ -1519,9 +1541,13 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
             # blames consolidation. Re-check what the entry gate checked; the model is
             # not something a later phase can recover.
             if _runtime.model is None or _runtime.tokenizer is None:
+                from core import agentic
+                loss = agentic.last_model_loss() or {}
                 detail = ("Model lost during the pre-reflection phases (a clean-base "
                           "swap released it and could not reload it — see the log for "
-                          "the load error). Restart the server and retry.")
+                          "the load error). "
+                          + (loss.get("recovery")
+                             or "Restart the server and retry."))
                 store.append_event(run_id, "run_failed", message=detail)
                 store.finalize_run(run_id, "failed", {
                     "error": detail, "mutations_applied": False,
@@ -1587,7 +1613,7 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                 # Build generation function pointing to staging RAG
                 generate_fn = _make_sync_reflect_generate(staging_rag)
 
-                staging_runner.execute_run(
+                outcome = staging_runner.execute_run(
                     config,
                     generate_fn=generate_fn,
                     store=store,
@@ -1609,11 +1635,20 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                     # already-reflected sessions survive to be recovered next run.
                     on_session_committed=_checkpoint_completed_session,
                     # Finish any chat the background pass already reflected per-chat:
-                    # load its persisted clean-base jobs into this run's clean-base phase.
+                    # load its persisted clean-base jobs into this run's clean-base phase,
+                    # and delete the payload only once that phase has run.
                     consume_pending_clean_base_fn=_consume_pending_clean_base,
+                    ack_pending_clean_base_fn=_ack_pending_clean_base,
+                    # The runner is one stage of this lifecycle; THIS function owns the
+                    # terminal status (merge / commit / persona / train still follow).
+                    finalize=False,
                 )
-                run_data = store.get_run(run_id)
-                success = run_data and run_data.get("status") == "completed"
+                success = outcome == "completed"
+                if outcome == "stopped":
+                    run_data = store.get_run(run_id)
+                    summary = dict((run_data or {}).get("summary") or {})
+                    summary["mutations_applied"] = False
+                    store.finalize_run(run_id, "stopped", summary)
             else:
                 success = True
                 store.update_status(run_id, phase="downstream")
@@ -1819,6 +1854,21 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                 # already finalized on disk above, so firing the POST — which may
                 # be followed within seconds by the watchdog stopping us — is the
                 # last thing we do.
+                if train_requested and store.is_stop_requested(run_id):
+                    # A stop that arrived while the downstream stages ran: the reflection
+                    # is committed (that work is done and safe), but the hand-off is the
+                    # one act that stops this server for a GPU-hour, so it is the one the
+                    # stop withholds. The run is already finalized `completed` above with
+                    # `training_handed_off` reporting what actually happened.
+                    train_requested = False
+                    store.append_event(
+                        run_id, "phase_done", phase="train",
+                        message="Stop requested — reflection committed, but the LoRA "
+                                "training hand-off was withheld.")
+                    run_data = store.get_run(run_id)
+                    summary = dict((run_data or {}).get("summary") or {})
+                    summary["training_handed_off"] = False
+                    store.finalize_run(run_id, "completed", summary)
                 if train_requested:
                     store.append_event(
                         run_id, "phase_started", phase="train",

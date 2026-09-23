@@ -44,7 +44,7 @@ from core import activity_log
 # "Hide reflection detail" box collapses the bodies for an overview.
 _ACTIVITY_MIRROR_EVENTS = {
     "run_started", "run_failed", "phase_started", "phase_done", "phase_error",
-    "session_started", "session_finalized", "session_skipped",
+    "session_started", "session_queued", "session_finalized", "session_skipped",
     "branch_started", "branch_done", "branch_skipped", "ask_resolved",
     # Both failure grains: `pass_warning` carries the recoverable ones an operator needs
     # while judging a new pass (an unparseable anchor, a retried verdict), which were
@@ -225,6 +225,13 @@ class ReflectionRunOverrides:
     # to skip. See core.trigger_hygiene.
     trigger_purge: Optional[bool] = None
 
+    # Fold the logged prompt deltas into PATTERNS (`data/hot/prompt/patterns.json`) inside
+    # the clean-base window — the prompt-rewrite budget (PROMPT_REWRITE.md §3). Default
+    # on. Reads the locator's op-log, groups same-change deltas on the clean base, weights
+    # each chat's vote by its exchange's tension rank. Writes only the derived file;
+    # nothing spends the budget here. Set False to skip. See core.prompt_patterns.
+    prompt_patterns: Optional[bool] = None
+
 
 @dataclass
 class ReflectionRunConfig:
@@ -278,8 +285,8 @@ def overrides_to_dict(o: ReflectionRunOverrides) -> dict:
         "disable_rag_for_branch_choice", "force_persona_digest", "apply_branch_judge",
         "persona_cluster_mapreduce", "persona_polarity", "user_notes",
         "force_user_portrait", "self_notes", "force_self_portrait", "chat_facts",
-        "fact_dedup", "trigger_purge", "skip_branching", "chunk_budget_frac",
-        "chars_per_token_hint",
+        "fact_dedup", "trigger_purge", "prompt_patterns", "skip_branching",
+        "chunk_budget_frac", "chars_per_token_hint",
     ):
         v = getattr(o, key)
         if v is not None:
@@ -304,10 +311,16 @@ _KNOWN_OVERRIDE_KEYS: frozenset[str] = frozenset({
     "skip_branching",
     "exchange_anchors", "recollection", "user_notes", "force_user_portrait",
     "self_notes", "force_self_portrait", "chat_facts",
-    "fact_dedup", "trigger_purge", "chunk_budget_frac", "chars_per_token_hint",
+    "fact_dedup", "trigger_purge", "prompt_patterns", "chunk_budget_frac",
+    "chars_per_token_hint",
 })
 
 _MNT_RE = re.compile(r"^\d+%?$")
+
+# The reflection-lane generation budget when a sampling override names none — ONE
+# definition, read by the runner as its `_DEFAULT_MAX_NEW_TOKENS`, so a partial override
+# (temperature only) keeps exactly the cap the runner would have used.
+DEFAULT_MAX_NEW_TOKENS_SETTING = "8192"
 
 
 def _check_mnt(value: str, name: str) -> None:
@@ -327,7 +340,11 @@ def _parse_sampling(raw: Any, name: str) -> ReflectionSampling:
     top_p = float(raw.get("top_p", 0.95))        # Gemma 4 recommended top_p (family top_k applied by backend)
     if not 0.0 <= top_p <= 1.0:
         raise ValueError(f"{name}.top_p must be in [0.0, 1.0], got {top_p}")
-    mnt = str(raw.get("max_new_tokens_setting", "75%"))
+    # Absent ⇒ the runner's own bounded cap, NOT a percentage: "75%" of a 60k window is
+    # 45k tokens of pre-allocated KV cache on every pass (see the runner's
+    # _DEFAULT_MAX_NEW_TOKENS note), and a client that only meant to change the
+    # temperature was silently trading the cap for that (2026-09-21).
+    mnt = str(raw.get("max_new_tokens_setting", DEFAULT_MAX_NEW_TOKENS_SETTING))
     _check_mnt(mnt, name)
     return ReflectionSampling(temperature=temp, top_p=top_p, max_new_tokens_setting=mnt)
 
@@ -397,6 +414,8 @@ def validate_overrides(raw: Any) -> ReflectionRunOverrides:
         o.fact_dedup = bool(raw["fact_dedup"])
     if "trigger_purge" in raw:
         o.trigger_purge = bool(raw["trigger_purge"])
+    if "prompt_patterns" in raw:
+        o.prompt_patterns = bool(raw["prompt_patterns"])
     if "force_user_portrait" in raw:
         o.force_user_portrait = bool(raw["force_user_portrait"])
     if "self_notes" in raw:

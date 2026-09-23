@@ -1,6 +1,6 @@
 # Ava Documentation Set
 
-Five files, split by rate of change. Read this first to know which file answers which
+Six files, split by rate of change. Read this first to know which file answers which
 question and which file to update after a code change.
 
 | File | Role | Changes when |
@@ -9,6 +9,7 @@ question and which file to update after a code change.
 | `AVA_MEMORY.md` | Cornerstone reference for the memory model — every channel that carries information forward (RAG channels, weights, persona, wander), its decay curve, channel coupling, and the memory-model open issues. | When a memory channel, decay curve, or their coupling changes; keep the per-channel open issues current. |
 | `AVA_STATUS.md` | Implementation truth table — Built / Partial / Logged-only / Pending / Removed. | **Every architecture-relevant code change.** This is the file most likely to be stale; trust it least-recently-checked, and fix it when you touch the code it describes. |
 | `AVA_CHANGELOG.md` | Curated technical history: architecture shifts, interpretation changes, negative results, rollback/replay assumptions. Not a git log. | When a change would alter how a future reader interprets existing artifacts or design decisions. Cite the commit hash. |
+| `MODULE_NOTES.md` | Long-form reference, one entry per module / protocol message / config knob: what it reads, produces and refuses, and why. Moved out of `../CLAUDE.md` on 2026-09-21 when that file reached ~400 KB. | A module's contract changes. Not a changelog — dated rationale goes to `AVA_CHANGELOG.md`. |
 | `AVA_OPEN_PROBLEMS.md` | Unresolved design and proof gaps, each split into "what exists" vs "what remains open". | When a gap opens, narrows, or closes — move solved items into STATUS/CHANGELOG rather than deleting the analysis. |
 
 ## Precedence on conflict
@@ -24,8 +25,9 @@ file against the codebase, even if nothing changed.
 ## Relation to the root-level docs
 
 - `../DEPLOY.md` — how to install and run the server and the client. Fine-grained
-  code-level facts (module responsibilities, protocol, storage paths) live in the
-  modules' own docstrings; design-level truth lives here.
+  code-level facts (module responsibilities, protocol, storage paths) live in
+  `MODULE_NOTES.md` in this folder and in the modules' own docstrings; design-level
+  truth lives here.
 - `AVA_DESIGN_LEGACY.md` (this folder) — the frozen legacy governing document this set
   was split from (formerly the repo-root `AVA_DESIGN.md`). Kept as the deep-design
   archive: extended analyses (e.g. "Belief-Adoption Dynamics — Fast Path vs. Slow

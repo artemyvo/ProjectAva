@@ -59,17 +59,25 @@ os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # ── data paths ────────────────────────────────────────────────────────────── #
+# Resolved through the shared resolver (training/reflections_path.py) and the staging
+# module's own path helper, not restated here: this file carried its own copy, which
+# still pointed chats at the retired inference/data/hot/chats after the corpus moved to
+# server/data/chats — so the CLI reflected an empty directory (2026-09-21).
+from training.reflections_path import hot_chats_dir as _hot_chats_dir
+from core.reflection_staging import get_staging_paths as _get_staging_paths
+
 _DATA_DIR          = _INFERENCE_DIR / "data"
-_CHATS_DIR         = _DATA_DIR / "hot" / "chats"
+_CHATS_DIR         = _hot_chats_dir()
 _MEMORY_DIR        = _DATA_DIR / "hot" / "memory"
 _CONSOLIDATION_DIR = _DATA_DIR / "hot" / "consolidation"
 _RUNS_DIR          = _DATA_DIR / "hot" / "reflection_runs"
 
-_STAGING_DIR               = _DATA_DIR / "hot" / "reflection_staging"
-_STAGING_CHATS_DIR         = _STAGING_DIR / "chats"
-_STAGING_MEMORY_DIR        = _STAGING_DIR / "memory"
-_STAGING_CONSOLIDATION_DIR = _STAGING_DIR / "consolidation"
-_STAGING_ARCHIVE_DIR       = _STAGING_DIR / "archive"
+_STAGING_PATHS             = _get_staging_paths(_DATA_DIR)
+_STAGING_DIR               = _STAGING_PATHS["staging_dir"]
+_STAGING_CHATS_DIR         = _STAGING_PATHS["chats_dir"]
+_STAGING_MEMORY_DIR        = _STAGING_PATHS["memory_dir"]
+_STAGING_CONSOLIDATION_DIR = _STAGING_PATHS["consolidation_dir"]
+_STAGING_ARCHIVE_DIR       = _STAGING_PATHS["archive_dir"]
 
 
 # ── config ────────────────────────────────────────────────────────────────── #
@@ -123,7 +131,6 @@ def _save_server_config(config: dict) -> None:
 
 
 import shutil
-import difflib
 
 def append_file_to_file(src: Path, dest: Path) -> int:
     if not src.exists():
@@ -143,156 +150,29 @@ def append_file_to_file(src: Path, dest: Path) -> int:
     return len(lines)
 
 def run_stage_diff() -> None:
-    print("\n🔍 Producing Sleep Pipeline Delta Diff...")
-    print("═" * 60)
-    
-    # 1. RAG memory delta
-    rag_staged = _STAGING_MEMORY_DIR / "rag_memory.jsonl"
-    if rag_staged.exists() and rag_staged.stat().st_size > 0:
-        print("📝 Staged RAG Memory Changes (rag_memory.jsonl):")
-        print("─" * 60)
-        print(rag_staged.read_text(encoding="utf-8").strip())
-        print("═" * 60)
-        
-    # 2. Weights delta
-    weights_staged = _STAGING_MEMORY_DIR / "weights_persona.jsonl"
-    if weights_staged.exists() and weights_staged.stat().st_size > 0:
-        print("📝 Staged Weights Persona Changes (weights_persona.jsonl):")
-        print("─" * 60)
-        print(weights_staged.read_text(encoding="utf-8").strip())
-        print("═" * 60)
-        
-    # 3. Ledger delta
-    ledger_staged = _STAGING_CONSOLIDATION_DIR / "consolidation_anchors.jsonl"
-    if ledger_staged.exists() and ledger_staged.stat().st_size > 0:
-        print("📝 Staged Consolidation Ledger Changes (consolidation_anchors.jsonl):")
-        print("─" * 60)
-        print(ledger_staged.read_text(encoding="utf-8").strip())
-        print("═" * 60)
-        
-    # 4. Chat sidecars diff
-    if _STAGING_CHATS_DIR.exists():
-        staged_sidecars = list(_STAGING_CHATS_DIR.glob("*.state.json"))
-        if staged_sidecars:
-            print("📝 Staged Chat Sidecar Diffs:")
-            print("─" * 60)
-            for sp in staged_sidecars:
-                lp = _CHATS_DIR / sp.name
-                sp_text = sp.read_text(encoding="utf-8").splitlines()
-                if lp.exists():
-                    lp_text = lp.read_text(encoding="utf-8").splitlines()
-                else:
-                    lp_text = []
-                diff = list(difflib.unified_diff(
-                    lp_text, sp_text,
-                    fromfile=f"live/chats/{lp.name}", tofile=f"staged/chats/{sp.name}",
-                    lineterm=""
-                ))
-                if diff:
-                    print("\n".join(diff))
-                else:
-                    print(f"No changes to {sp.name} (staged version matches live)")
-                print("─" * 60)
-            print("═" * 60)
+    """Thin wrappers over ``core.reflection_staging`` — the ONE implementation of the
+    staging stages, shared with the WebSocket service. This file used to carry a second
+    copy that had drifted: it committed ``*.state.json`` only (stranding every staged
+    gist + fact protocol), read the retired chats dir, and promoted a candidate adapter
+    into a ``models/`` beside ``server/`` rather than inside it (2026-09-21)."""
+    from core.reflection_staging import run_stage_diff as _diff
+    print(_diff(_DATA_DIR), flush=True)
 
 def run_stage_merge_rag() -> dict:
-    print("Merging RAG memory delta to live RAG log...")
-    rag_staged = _STAGING_MEMORY_DIR / "rag_memory.jsonl"
-    rag_live = _MEMORY_DIR / "rag_memory.jsonl"
-    appended = append_file_to_file(rag_staged, rag_live)
-    print(f"Merged {appended} RAG memory line(s) into {rag_live}.")
-
-    # Rebuild live RAG index
-    from core.rag_engine import RagEngine
-    rag = RagEngine(
-        _CHATS_DIR, _INFERENCE_DIR / "prompts",
-        memory_dir=_MEMORY_DIR, consolidation_dir=_CONSOLIDATION_DIR,
-    )
-    print("Rebuilding live RAG index...")
-    rag.build_index_async()
-    return {"rag_memory_lines": appended}
+    from core.reflection_staging import run_stage_merge_rag as _merge
+    return _merge(_DATA_DIR, _INFERENCE_DIR)
 
 def run_stage_commit_training() -> dict:
-    print("Merging weights persona delta to live...")
-    w_staged = _STAGING_MEMORY_DIR / "weights_persona.jsonl"
-    w_live = _MEMORY_DIR / "weights_persona.jsonl"
-    w_appended = append_file_to_file(w_staged, w_live)
-    print(f"Merged {w_appended} weights persona line(s) into {w_live}.")
-
-    print("Merging consolidation ledger anchors delta to live...")
-    l_staged = _STAGING_CONSOLIDATION_DIR / "consolidation_anchors.jsonl"
-    l_live = _CONSOLIDATION_DIR / "consolidation_anchors.jsonl"
-    l_appended = append_file_to_file(l_staged, l_live)
-    print(f"Merged {l_appended} ledger line(s) into {l_live}.")
-
-    print("Committing staged sidecars to live...")
-    sidecars_copied = 0
-    archived_count = 0
-    if _STAGING_CHATS_DIR.exists():
-        for sp in _STAGING_CHATS_DIR.glob("*.state.json"):
-            lp = _CHATS_DIR / sp.name
-            shutil.copy2(sp, lp)
-            sidecars_copied += 1
-    print(f"Committed {sidecars_copied} sidecar file(s) to live chats.")
-
-    # Check if there are staged archived chats to commit
-    staged_archive = _STAGING_ARCHIVE_DIR / "chats"
-    live_archive = _DATA_DIR / "archive" / "chats"
-    if staged_archive.exists():
-        live_archive.mkdir(parents=True, exist_ok=True)
-        for f in staged_archive.glob("*"):
-            # Copy to archive
-            shutil.copy2(f, live_archive / f.name)
-            # Delete from live hot chats
-            live_hot = _CHATS_DIR / f.name
-            if live_hot.exists():
-                live_hot.unlink()
-            archived_count += 1
-        print(f"Committed {archived_count} archived file(s) to live archive and cleaned from live hot chats.")
-
-    return {
-        "weights_persona_lines": w_appended,
-        "ledger_lines": l_appended,
-        "sidecars_copied": sidecars_copied,
-        "archived": archived_count,
-    }
+    from core.reflection_staging import run_stage_commit_training as _commit
+    return _commit(_DATA_DIR)
 
 def run_stage_apply() -> dict:
-    counts: dict = {}
-    # 1. Merge RAG
-    counts.update(run_stage_merge_rag())
-    # 2. Commit training / sidecars
-    counts.update(run_stage_commit_training())
-
-    # 3. Promote candidate adapter if present
-    candidate_dir = _SERVER_DIR.parent / "models" / "candidate"
-    if candidate_dir.exists():
-        new_adapter_id = _SERVER_DIR.parent / "models" / f"adapter-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        print(f"Promoting candidate model adapter to {new_adapter_id}...")
-        new_adapter_id.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(candidate_dir, new_adapter_id)
-
-        # Update config
-        config = _load_server_config()
-        config["adapter_id"] = str(new_adapter_id)
-        _save_server_config(config)
-        print("Updated server_config.json adapter_id to point to new adapter weights.")
-        counts["promoted_adapter"] = str(new_adapter_id)
-
-    # 4. Clean up staging
-    run_stage_discard()
-    print("Sleep staging workspace committed successfully.")
-    return counts
+    from core.reflection_staging import run_stage_apply as _apply
+    return _apply(_DATA_DIR, _INFERENCE_DIR, _SERVER_DIR)
 
 def run_stage_discard() -> dict:
-    print("Cleaning up Sleep staging workspace...")
-    if _STAGING_DIR.exists():
-        shutil.rmtree(_STAGING_DIR)
-    candidate_dir = _SERVER_DIR.parent / "models" / "candidate"
-    if candidate_dir.exists():
-        shutil.rmtree(candidate_dir)
-    print("Staging directories and candidate model weights deleted.")
-    return {}
+    from core.reflection_staging import run_stage_discard as _discard
+    return _discard(_DATA_DIR, _SERVER_DIR)
 
 
 # ── response cleaning (mirror of server.py _clean_reflect_response) ────────
@@ -366,14 +246,17 @@ def _session_has_pending_revision(filename: str) -> bool:
 
 
 def _consume_pending_clean_base_cli(filename: str) -> dict:
-    """Load (consume-once) a chat_reflected chat's persisted clean-base job payloads so
-    this run's clean-base phase finishes it. See the two-stage freeze in
-    ``core.background_reflection``."""
-    from core.reflection_staging import (
-        load_pending_clean_base, delete_pending_clean_base)
-    data = load_pending_clean_base(_DATA_DIR, filename)
+    """LOAD a chat_reflected chat's persisted clean-base job payloads so this run's
+    clean-base phase finishes it (two-stage freeze, ``core.background_reflection``). The
+    delete is ``_ack_pending_clean_base_cli``, called by the runner only once that phase
+    has run — mirrors ``reflection_service``."""
+    from core.reflection_staging import load_pending_clean_base
+    return load_pending_clean_base(_DATA_DIR, filename)
+
+
+def _ack_pending_clean_base_cli(filename: str) -> None:
+    from core.reflection_staging import delete_pending_clean_base
     delete_pending_clean_base(_DATA_DIR, filename)
-    return data
 
 
 def _find_pending_sessions() -> list[str]:
@@ -1189,6 +1072,7 @@ def main() -> None:
             # Two-stage freeze: finish any chat the background pass reflected per-chat by
             # loading (consume-once) its persisted clean-base jobs into the clean-base phase.
             consume_pending_clean_base_fn=_consume_pending_clean_base_cli,
+            ack_pending_clean_base_fn=_ack_pending_clean_base_cli,
         )
     except KeyboardInterrupt:
         print("\n[interrupted] Requesting stop...", flush=True)
@@ -1225,6 +1109,8 @@ def main() -> None:
             from core.reflection_archive import archive_reflection, archive_adapter
             for rid in owners:
                 archive_reflection(run_id=rid, runs_dir=_RUNS_DIR, staging_dir=_STAGING_DIR,
+                                   persona_dir=_DATA_DIR / "hot" / "persona",
+                                   users_dir=_DATA_DIR / "hot" / "users",
                                    source="cli")
             counts = run_stage_apply()
             # apply may promote a staged candidate to a persistent adapter — archive it

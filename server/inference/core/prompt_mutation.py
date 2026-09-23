@@ -11,9 +11,9 @@ persona→prompt-mutation design path.)
 drift signal the revision pass already produced), measures it against the persona digest
 (the "better me"), and appends any proposed standing-prompt delta to a separate
 append-only op-log — ``data/hot/prompt/prompt_deltas.jsonl`` — surfaced read-only in the
-Debug tab. No prompt is ever changed; the live ``chat_prompt.txt`` is read but never
-written. Aggregating, gating (Curiosity-Token / maturity), validating, and actually
-promoting a delta are the future, separate steps.
+Debug tab. No prompt is ever changed here: the active experiment is read first, with
+``chat_prompt.txt`` as the seed fallback. Aggregation and autonomous activation live
+in ``prompt_patterns`` and ``prompt_rewrite`` (PROMPT_REWRITE.md).
 
 The pure halves (parse / gap-test / read-write the log) are GPU-free and self-tested;
 the orchestration that needs a ``generate_fn`` lives in the runner.
@@ -34,6 +34,55 @@ _THINK_RE = re.compile(r"(?is)<think>.*?</think>")
 _FIELDS = ("VERDICT", "DRIFT", "MISSING", "DELTA", "SCOPE")
 _VALID_VERDICTS = ("prompt-adequate", "prompt-gap")
 _VALID_SCOPES = ("disposition", "line", "voice")
+
+
+#: Locator labels stamped on each delta record (PROMPT_REWRITE.md §2): which cell of the
+#: verdict × tension square sent the exchange to this pass.
+LOCATOR_REVISE = "revise"            # the revision pass flagged the reply as not hers
+LOCATOR_KEEP_TENSION = "keep_tension"   # kept, but unusually torn getting there
+
+
+def locator_note(locator: str, tension: Optional[dict] = None) -> str:
+    """The one paragraph of the pass prompt that must differ per locator — fills the
+    ``{locator}`` slot in ``prompt_mutation_prompt.txt`` (prepended when a customized
+    file lacks the slot; see :func:`compose_prompt`).
+
+    The prompt file was written for a *revise* exchange ("one your revision pass already
+    flagged as not quite yours"); read over a *keep* exchange that line is false and
+    steers the pass into inventing a drift. The keep cell is a different question: she
+    stood by the reply, but the thought behind it was unusually contested for this
+    adapter and language — so the pass is asked whether a standing line would have
+    settled that pull, not what went wrong."""
+    if locator == LOCATOR_KEEP_TENSION:
+        rank = (tension or {}).get("rank")
+        pct = f"the top {max(1, int(round((1.0 - float(rank)) * 100)))}%" if isinstance(rank, (int, float)) else "the top few percent"
+        return (
+            "This exchange is here for a different reason than a drift: your revision pass "
+            "KEPT this reply — it was yours. But the thinking behind it was unusually torn: "
+            f"measured against your other conversations in this language, its uncertainty "
+            f"was in {pct}. You reached the reply through a conflict you had to resolve on the "
+            "spot. The question is whether that conflict is a STANDING one — a pull you would "
+            "keep having to settle in the same kind of moment — and if so, whether a line in "
+            "your prompt would settle it once, by taking a side. A reply you stood behind is "
+            "not evidence of a gap by itself; a recurring conflict behind it may be."
+        )
+    return (
+        "This exchange is here because your revision pass flagged the reply as not quite "
+        "yours: it drifted, and your revision already wrote the reply you stand behind."
+    )
+
+
+def compose_prompt(template: str, *, current_prompt: str, persona: str,
+                   locator: str, tension: Optional[dict] = None) -> str:
+    """Fill the pass template. A ``{locator}`` slot takes the locator note; a customized
+    file without the slot gets the note prepended rather than silently dropped."""
+    note = locator_note(locator, tension)
+    out = (template
+           .replace("{current_prompt}", current_prompt)
+           .replace("{persona}", persona))
+    if "{locator}" in out:
+        return out.replace("{locator}", note)
+    return note + "\n\n" + out
 
 
 # ── parsing (GPU-free) ─────────────────────────────────────────────────────── #
@@ -111,8 +160,16 @@ def load_prompt_mutation_prompt(prompts_dir: Optional[Path] = None) -> str:
         encoding="utf-8").strip()
 
 
-def load_current_chat_prompt(prompts_dir: Optional[Path] = None) -> str:
-    """Load the live standing chat prompt — the text a delta would be measured against."""
+def load_current_chat_prompt(prompts_dir: Optional[Path] = None, *,
+                             state_dir: Optional[Path] = None) -> str:
+    """Load the active experiment first, then the seed, as the serving loader does."""
+    from core.prompt_experiment import active_experiment_prompt
+    if state_dir is None:
+        from training.reflections_path import prompt_dir
+        state_dir = prompt_dir()
+    active = active_experiment_prompt(state_dir)
+    if active:
+        return active
     try:
         return (_prompts_dir(prompts_dir) / "chat_prompt.txt").read_text(
             encoding="utf-8").strip()
@@ -192,4 +249,37 @@ if __name__ == "__main__":
         assert len(rows) == 2 and rows[0]["delta"] == "second", rows  # newest first
         assert rows[0]["ts"], "ts auto-stamped"
 
+        # The locator follows the live experiment across replacement and Revert;
+        # absent/inactive/malformed records fall back to the unchanged seed.
+        from core.prompt_experiment import save_experiment, clear_experiment, EXPERIMENT_FILE
+        prompts = Path(d) / "prompts"
+        state = Path(d) / "state"
+        prompts.mkdir()
+        seed = prompts / "chat_prompt.txt"
+        seed.write_text("Seed prompt", encoding="utf-8")
+        def current():
+            return load_current_chat_prompt(prompts, state_dir=state)
+        assert current() == "Seed prompt"
+        for live in ("First live prompt", "Replacement live prompt"):
+            save_experiment(state, prompt=live, base_prompt="Seed prompt")
+            assert current() == live
+        clear_experiment(state)
+        assert current() == "Seed prompt"
+        for raw in ('{"active": false, "prompt": "Inactive prompt"}', '{broken'):
+            (state / EXPERIMENT_FILE).write_text(raw, encoding="utf-8")
+            assert current() == "Seed prompt"
+        assert seed.read_text(encoding="utf-8") == "Seed prompt"
+
+    # Locator note + template composition.
+    tpl = "HEAD\n{locator}\nPROMPT:{current_prompt}\nME:{persona}"
+    out = compose_prompt(tpl, current_prompt="P", persona="D", locator=LOCATOR_REVISE)
+    assert out.startswith("HEAD\nThis exchange is here because your revision pass flagged"), out
+    assert "PROMPT:P" in out and "ME:D" in out
+    out = compose_prompt(tpl, current_prompt="P", persona="D",
+                         locator=LOCATOR_KEEP_TENSION, tension={"rank": 0.93})
+    assert "KEPT this reply" in out and "the top 7%" in out, out
+    # A customized template without the slot gets the note prepended, never dropped.
+    out = compose_prompt("PROMPT:{current_prompt}", current_prompt="P", persona="D",
+                         locator=LOCATOR_KEEP_TENSION)
+    assert out.startswith("This exchange is here for a different reason") and out.endswith("PROMPT:P"), out
     print("prompt_mutation self-test OK")

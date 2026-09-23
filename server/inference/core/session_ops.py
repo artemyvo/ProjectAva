@@ -43,6 +43,7 @@ from core.chat_sidecar import (
 from core.training_review import WANDER_PREFIX
 
 # ── Injected server capabilities (populated by configure()) ──
+_tension_spans: Optional[Callable[[Any], Optional[dict]]] = None
 _send: Callable = None                       # async _send(ws, msg)
 _get_rag: Callable = None
 _is_reflection_active: Callable = None
@@ -51,7 +52,8 @@ _CHATS_DIR: Any = None
 _DATA_DIR: Any = None
 
 def configure(*, send, get_rag, chats_dir, data_dir=None,
-              is_reflection_active=lambda: False, mark_activity=None) -> None:
+              is_reflection_active=lambda: False, mark_activity=None,
+              tension_spans=None) -> None:
     """Wire in the server capabilities the moved session-CRUD code depends on.
 
     Called once from server startup, before the WebSocket server accepts clients.
@@ -61,9 +63,14 @@ def configure(*, send, get_rag, chats_dir, data_dir=None,
     ``mark_activity`` is ``idle_scheduler.mark_activity`` — the dataset-repair handlers call
     it so an operator working the Training review tab counts as the box being busy (see
     ``handle_apply_regenerated_exchange``).
+    ``tension_spans`` is ``generation.stored_tension_spans`` — decodes a transcript's
+    stored per-token series into coloured spans for the Chat review tab; blocking, so
+    ``handle_get_session`` runs it in the default executor. None ⇒ no spans attached.
     """
     global _send, _get_rag, _is_reflection_active, _mark_activity, _CHATS_DIR, _DATA_DIR
+    global _tension_spans
     _send = send
+    _tension_spans = tension_spans
     _get_rag = get_rag
     _is_reflection_active = is_reflection_active
     if mark_activity is not None:
@@ -396,7 +403,26 @@ async def handle_get_session(ws, msg: dict) -> None:
         await _send(ws, {"type": "error", "message": f"Could not read session: {e}"})
         return
 
+    # Chat review colouring: decode each exchange's stored tension series into
+    # `[text, margin, relief, pain]` spans (render-only, attached to the reply, never
+    # written to the file). Off the event loop — a tokenizer may load on first use.
+    if _tension_spans is not None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, _attach_tension_spans, data)
+        except Exception as e:
+            print(f"[review] tension spans skipped: {e}")
+
     await _send(ws, {"type": "session_data", "data": data})
+
+
+def _attach_tension_spans(data: dict) -> None:
+    for ex in data.get("exchanges") or []:
+        if not isinstance(ex, dict):
+            continue
+        spans = _tension_spans(ex.get("tension"))
+        if spans:
+            ex["tension_spans"] = spans
 
 async def handle_load_session(ws, msg: dict) -> None:
     """Load a past session's exchanges into the active conversation state.
@@ -1199,7 +1225,15 @@ async def handle_delete_session(ws, msg: dict) -> None:
     sideways — so a bad transcript can't be reflected on or retrieved. Refuses to
     delete the session the active logger is currently writing to (clear context
     first), and refreshes the chat-RAG index so the removed chat drops out of
-    retrieval immediately. Path-guarded to hot/chats like the other session ops."""
+    retrieval immediately. Path-guarded to hot/chats like the other session ops.
+
+    Deleting an Ava-initiated chat is also how the user declines *that* conversation, so
+    the reach-out thread it opened is closed here, at the point of effect
+    (`chat_worklog.close_removed_session`) — otherwise the deliberation executive went
+    on reading it as a loose thread awaiting a reply for the sweep's 48 h age window and
+    chose to wait on a chat that no longer existed instead of starting a new one. Who it
+    was with and whether they had answered are read off the transcript BEFORE it goes,
+    since the closing entry names them."""
     filename = msg.get("filename", "")
     try:
         path = (_CHATS_DIR / filename).resolve()
@@ -1226,6 +1260,17 @@ async def handle_delete_session(ws, msg: dict) -> None:
         })
         return
 
+    # What the closing worklog entry needs, read before the file is gone. Best-effort:
+    # an unreadable transcript still deletes, and its thread still closes, unnamed.
+    who, unanswered = "", None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        who = (data.get("user") or "").strip()
+        if (data.get("initiated_by") or "").strip() == "ava":
+            unanswered = len(data.get("exchanges") or []) <= 1
+    except Exception:
+        pass
+
     removed: list[str] = []
     try:
         # Every file the stem owns goes with the transcript — a summary or fact record
@@ -1242,6 +1287,15 @@ async def handle_delete_session(ws, msg: dict) -> None:
         await _send(ws, {"type": "error", "message": f"Could not delete session: {e}"})
         return
 
+    # The chat no longer exists, so no thread may wait on it (see the docstring).
+    threads_closed = 0
+    try:
+        from core import chat_worklog
+        threads_closed = len(chat_worklog.close_removed_session(
+            path.name, who, unanswered=unanswered))
+    except Exception:
+        pass
+
     # Drop the deleted chat from retrieval right away. Rebuild off the event loop
     # (re-embeds the remaining chats) so a large corpus doesn't stall the socket.
     try:
@@ -1249,4 +1303,5 @@ async def handle_delete_session(ws, msg: dict) -> None:
     except Exception:
         pass
 
-    await _send(ws, {"type": "session_deleted", "filename": filename, "removed": removed})
+    await _send(ws, {"type": "session_deleted", "filename": filename, "removed": removed,
+                     "threads_closed": threads_closed})

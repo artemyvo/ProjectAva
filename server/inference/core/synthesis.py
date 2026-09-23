@@ -1037,7 +1037,10 @@ def run_synthesis_blocking(
         # synthesized unless the ANALYSIS was on-contract — so a later window retries.
         if truncated:
             closed = "</think>" in (raw_opener or "").lower()
-            print(f"[synthesis] {chosen}: opener hit the {opener_reserve}-token cap "
+            looped = bool(getattr(generate, "last_loop", None))   # halt vs cap — see outreach
+            print(f"[synthesis] {chosen}: opener "
+                  + ("was halted by the loop guard " if looped
+                     else f"hit the {opener_reserve}-token cap ")
                   + ("mid-message (reasoning closed, answer cut)" if closed
                      else "before it closed its reasoning")
                   + " — refusing to send a partial message", flush=True)

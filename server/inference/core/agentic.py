@@ -41,6 +41,64 @@ from typing import Any, Callable, Optional, Protocol
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Model-loss escalation
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Called when a swap has released the loaded model and could NOT bring one back — not
+# the swap target and not the previous model, after the retry below. Injected by
+# ``server.main()`` (``configure``); it requests a watchdog restart, which relaunches
+# the process on the config's ``adapter_id`` — the last adapter that was promoted,
+# i.e. the last known good one. This module stays GPU-free and import-light, so the
+# hook is a plain callable returning a one-line note of what it did (or ``None``).
+_on_model_lost: Optional[Callable[[str], Optional[str]]] = None
+_last_model_loss: Optional[dict] = None
+
+
+def configure(*, on_model_lost: Optional[Callable[[str], Optional[str]]] = None) -> None:
+    global _on_model_lost
+    _on_model_lost = on_model_lost
+
+
+def last_model_loss() -> Optional[dict]:
+    """``{"reason", "recovery"}`` of the most recent unrecovered swap failure in this
+    process, or ``None``. ``recovery`` is the note the escalation hook returned — what
+    a caller reporting "no model is loaded" should tell the operator to expect."""
+    return dict(_last_model_loss) if _last_model_loss else None
+
+
+def _model_lost(reason: str, log: Callable[[str], None]) -> None:
+    global _last_model_loss
+    _last_model_loss = {"reason": reason, "recovery": None}
+    log(f"[agentic] NO MODEL IS LOADED: {reason}")
+    if _on_model_lost is None:
+        log("[agentic] no model-loss handler configured — reload from the client.")
+        return
+    try:
+        note = _on_model_lost(reason)
+    except Exception as exc:
+        note = f"model-loss handler failed: {type(exc).__name__}: {exc}"
+    if note:
+        _last_model_loss["recovery"] = str(note)
+        log(f"[agentic] {note}")
+
+
+def _drop_tracebacks(exc: BaseException) -> None:
+    """Sever the traceback from *exc* and every exception chained under it.
+
+    A traceback pins its frames, and a load that failed in ``backend.load`` has the
+    partially-materialized model in exactly those frames — tens of GB that stay
+    resident until the traceback is gone. Dropping it once on the outer exception is
+    not enough: a load that failed while handling an earlier failure carries that
+    earlier one as ``__context__``, with its own traceback and its own frames."""
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        cur.__traceback__ = None
+        cur = cur.__cause__ or cur.__context__
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Generate contract
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -130,9 +188,11 @@ def swap_model(backend: Any, model_state: Any, *, adapter_id: Optional[str],
     definition of release → reclaim → load and one failure discipline: a failed load
     restores the PREVIOUS model — the original failure logged and its traceback
     DROPPED first (those frames pin the failed load's partially-materialized tensors),
-    then a reclaim, so an OOM's debris can't cascade into the restore — and re-raises
-    the original error; a restore that ALSO fails is logged as its own no-model event
-    while the original error still propagates (the restore failure is usually its echo).
+    then, OUTSIDE the except block, a reclaim and the restore (``_restore_previous``:
+    once more after a second reclaim if the first attempt fails), so an OOM's debris
+    can't cascade into the restore — and re-raises the original error; a restore that
+    ALSO fails is escalated through the model-loss hook (``configure``) while the
+    original error still propagates (the restore failure is usually its echo).
 
     Executor-thread only, exclusive GPU — and the caller must hold NO reference to the
     outgoing model in its own frame (``release()``'s ``del`` reaches only its own
@@ -159,22 +219,51 @@ def swap_model(backend: Any, model_state: Any, *, adapter_id: Optional[str],
         log(f"[agentic] loading {model_id} with adapter {adapter_id}…")
     else:
         log(f"[agentic] loading clean base {model_id} (adapter OFF)…")
+    failed: Optional[BaseException] = None
     try:
         return _load_model_into_state(backend, st, model_id, ctx, adapter_id,
                                       reflect_ctx, prepare)
     except Exception as exc:
         log("[agentic] swap load failed; restoring the previous model…")
         traceback.print_exc()
-        exc.__traceback__ = None
+        _drop_tracebacks(exc)
+        failed = exc
+    # The restore runs OUTSIDE the except block, deliberately. Inside it, the
+    # interpreter's own exception state still references the traceback — on Python
+    # 3.10 as a separate ``exc_info`` slot that ``exc.__traceback__ = None`` does not
+    # touch — so the failed load's frames, and the ~20 GB of weights they hold, stayed
+    # resident through the restore. Observed 2026-09-17 on the RTX 5090: the clean-base
+    # load was refused by the offload guard with 28 GiB free, and the restore then ran
+    # with 10 GiB free and was refused the same way, leaving the box with no model.
+    _restore_previous(backend, st, model_id, ctx, prev_adapter, reflect_ctx, prepare, log)
+    raise failed
+
+
+def _restore_previous(backend: Any, st: Any, model_id: str, ctx: int,
+                      adapter_id: Optional[str], reflect_ctx: Optional[int],
+                      prepare: Callable[[Any, str], None],
+                      log: Callable[[str], None]) -> bool:
+    """Reload the previous model after a failed swap; ``True`` when a model is loaded.
+
+    Reclaim → load, and on failure reclaim again — outside that failure's except block,
+    for the reason given at the call site — and try ONCE more, since the first attempt
+    may have run against the swap's debris. A second failure is escalated through the
+    configured model-loss hook (a watchdog restart onto the config's adapter); nothing is
+    raised here, the caller decides what its own contract says."""
+    for attempt in (1, 2):
         _reclaim_backend(backend)
         try:
-            _load_model_into_state(backend, st, model_id, ctx, prev_adapter,
-                                   reflect_ctx, prepare)
-        except Exception:
-            log("[agentic] RESTORE FAILED — no model is loaded now; "
-                "reload from the client.")
+            _load_model_into_state(backend, st, model_id, ctx, adapter_id, reflect_ctx,
+                                   prepare)
+            return True
+        except Exception as exc:
+            log(f"[agentic] restore attempt {attempt} failed: {type(exc).__name__}: {exc}")
             traceback.print_exc()
-        raise exc
+            _drop_tracebacks(exc)
+            reason = (f"restoring {model_id} (adapter {adapter_id or 'OFF'}) failed twice "
+                      f"after a failed swap: {type(exc).__name__}: {exc}")
+    _model_lost(reason, log)
+    return False
 
 
 class CleanBaseSession:
@@ -207,8 +296,9 @@ class CleanBaseSession:
         ``_do_load`` post-load fixups (pad token, ensure_chat_template).
 
     Failure safety: if loading the clean base fails mid-enter, the original adapter
-    model is reloaded before the error propagates, so the server is never left with
-    nothing loaded.
+    model is reloaded before the error propagates (retried once after a real reclaim);
+    if THAT fails too — on enter or on exit — the model-loss hook is called, which on a
+    watchdog-run box requests a restart onto the config's adapter. See ``swap_model``.
     """
 
     def __init__(
@@ -281,10 +371,17 @@ class CleanBaseSession:
             f"[agentic] reloading adapter model {spec.get('model_id')} "
             f"(adapter {'ON' if adapter_id else 'OFF'})…"
         )
-        # Let a restore failure propagate — a server with no model is a loud,
-        # actionable error, not something to swallow.
-        self._load_into_state(spec["model_id"], spec["context_length"], adapter_id,
-                              spec.get("reflect_context_length"))
+        # Same restore discipline as a failed swap (retry once after a real reclaim,
+        # escalate on a second failure) — and then let the failure propagate: a server
+        # with no model is a loud, actionable error, not something to swallow.
+        ok = _restore_previous(self._backend, st, spec["model_id"], spec["context_length"],
+                               adapter_id, spec.get("reflect_context_length"),
+                               self._prepare, self._log)
+        if not ok:
+            loss = last_model_loss() or {}
+            raise RuntimeError(
+                f"CleanBaseSession: restoring the previous model failed — no model is "
+                f"loaded. {loss.get('recovery') or 'Reload from the client.'}")
         return False  # never suppress the body's exception
 
 
@@ -472,21 +569,28 @@ def _selftest() -> None:
             self.context_length, self.reflect_context_length = 1024, 2048
 
     class _FakeBackend:
-        def __init__(self, fail_on=()):
+        def __init__(self, fail_on=(), fail_times=None):
+            # fail_on: adapters whose load ALWAYS fails; fail_times: {adapter: n} — the
+            # first n loads of that adapter fail, later ones succeed (a restore that
+            # works once the failed swap's debris is actually gone).
             self.fail_on = set(fail_on)
-            self.loads, self.releases = [], 0
+            self.fail_times = dict(fail_times or {})
+            self.loads, self.releases, self.reclaims = [], 0, 0
 
         def load(self, model_id, ctx, adapter_id=None, **kw):
             self.loads.append(adapter_id)
             if adapter_id in self.fail_on:
                 raise RuntimeError(f"oom loading {adapter_id}")
+            if self.fail_times.get(adapter_id, 0) > 0:
+                self.fail_times[adapter_id] -= 1
+                raise RuntimeError(f"oom loading {adapter_id} (transient)")
             return (f"model:{adapter_id}", "tok")
+
+        def reclaim(self):
+            self.reclaims += 1
 
         def release(self, model, tokenizer):
             self.releases += 1
-
-        def reclaim(self):
-            pass
 
     # One-way sticky swap (the Training-review regenerate path): loads the target and
     # LEAVES it loaded — no restore — so a repair session's next regeneration with the
@@ -532,8 +636,28 @@ def _selftest() -> None:
     assert st.adapter_id == "A" and st.model == "model:A", (st.adapter_id, st.model)
     assert be.loads == ["B", "A"], be.loads
 
-    # Restore fails too -> original error STILL propagates (the restore failure is
-    # its echo, logged not raised), and the state is honestly empty.
+    # A restore that fails ONCE (the swap's debris still resident) is retried after a
+    # second reclaim and succeeds: the previous model is back, the hook never fires.
+    global _last_model_loss
+    _last_model_loss = None
+    hook_calls: list = []
+    configure(on_model_lost=lambda reason: (hook_calls.append(reason) or
+                                            "restart requested (fake)"))
+    st, be = _FakeState(), _FakeBackend(fail_on={"B"}, fail_times={"A": 1})
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            swap_model(be, st, adapter_id="B")
+            raise AssertionError("swap should have failed")
+        except RuntimeError as e:
+            assert "oom loading B" in str(e), e
+    assert st.adapter_id == "A" and st.model == "model:A", (st.adapter_id, st.model)
+    assert be.loads == ["B", "A", "A"], be.loads
+    assert be.reclaims >= 3, be.reclaims            # release, then one per attempt
+    assert hook_calls == [] and last_model_loss() is None
+
+    # Restore fails twice -> original error STILL propagates (the restore failure is
+    # its echo, logged not raised), the state is honestly empty, and the model-loss
+    # hook fired exactly once with the recovery note recorded for callers to report.
     st, be = _FakeState(), _FakeBackend(fail_on={"A", "B"})
     with contextlib.redirect_stderr(io.StringIO()):
         try:
@@ -542,6 +666,51 @@ def _selftest() -> None:
         except RuntimeError as e:
             assert "oom loading B" in str(e), e
     assert st.model is None and st.tokenizer is None, (st.model, st.tokenizer)
+    assert be.loads == ["B", "A", "A"], be.loads
+    assert len(hook_calls) == 1 and "failed twice" in hook_calls[0], hook_calls
+    loss = last_model_loss()
+    assert loss and loss["recovery"] == "restart requested (fake)", loss
+
+    # The exit-side restore has the same discipline: retried once, and a second
+    # failure raises (a server with no model must not be silent) naming the recovery.
+    hook_calls.clear()
+    st, be = _FakeState(), _FakeBackend(fail_times={"A": 1})
+    with contextlib.redirect_stderr(io.StringIO()):
+        with CleanBaseSession(be, st, swap_adapter_id="B"):
+            pass
+    assert st.adapter_id == "A" and st.model == "model:A", (st.adapter_id, st.model)
+    assert be.loads == ["B", "A", "A"] and hook_calls == [], (be.loads, hook_calls)
+    st, be = _FakeState(), _FakeBackend(fail_on={"A"})
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            with CleanBaseSession(be, st, swap_adapter_id="B"):
+                pass
+            raise AssertionError("exit should have failed")
+        except RuntimeError as e:
+            assert "no model is loaded" in str(e) and "restart requested (fake)" in str(e), e
+    assert st.model is None and len(hook_calls) == 1, (st.model, hook_calls)
+    # A hook that itself raises is contained: the loss is still recorded.
+    configure(on_model_lost=lambda reason: (_ for _ in ()).throw(ValueError("boom")))
+    st, be = _FakeState(), _FakeBackend(fail_on={"A", "B"})
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            swap_model(be, st, adapter_id="B")
+        except RuntimeError:
+            pass
+    assert "boom" in (last_model_loss() or {}).get("recovery", ""), last_model_loss()
+    configure(on_model_lost=None)
+    _last_model_loss = None
+
+    # Traceback severing walks the __context__ chain (a restore that failed while
+    # handling the swap failure carries the swap failure, and ITS frames, underneath).
+    try:
+        try:
+            raise RuntimeError("inner")
+        except RuntimeError:
+            raise ValueError("outer")
+    except ValueError as outer:
+        _drop_tracebacks(outer)
+        assert outer.__traceback__ is None and outer.__context__.__traceback__ is None
 
     print("agentic self-test: OK")
 

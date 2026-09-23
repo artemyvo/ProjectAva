@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,10 @@ from core.runtime_state import runtime as _runtime, session as _session
 
 EXPERIMENT_FILE = "experiment.json"
 EXPERIMENT_LOG_FILE = "experiment_log.jsonl"
+
+# Serializes prompt activation/revert with the autonomous event's final version check.
+# Never hold this across generation or an await; nested persistence calls use the RLock.
+STATE_LOCK = threading.RLock()
 
 # Occupancy flag — excludes a concurrent prompt-experiment generation and is folded into
 # the shared Sleep/GPU busy guard the same way outreach._outreach_active is.
@@ -63,6 +68,7 @@ _send: Callable = None
 _executor: Any = None
 _host_busy: Callable = None
 _mark_activity: Callable = None
+_on_revert: Optional[Callable] = None
 
 # A short user-turn nudge; the framing/instructions live in the system prompt
 # (prompt_experiment_prompt.txt), mirroring persona_preview's shape.
@@ -71,16 +77,18 @@ _USER_CONTENT = "Write the standing prompt you want to live under for this exper
 
 def configure(*, get_rag, make_sync_reflect_generate,
               load_base_prompt, prompts_dir, state_dir,
-              send=None, executor=None, host_busy=None, mark_activity=None) -> None:
+              send=None, executor=None, host_busy=None, mark_activity=None,
+              on_revert=None) -> None:
     """Wire in the server capabilities the prompt-experiment subsystem depends on.
 
     Called once from server startup, before the WebSocket server accepts clients.
     ``load_base_prompt`` returns the standing prompt *ignoring* any active experiment —
     it is what revert restores. ``send``/``executor``/``host_busy``/``mark_activity`` back
     the Sleep-tab triggers; the pure loader/persistence helpers need none of them.
+    ``on_revert`` interrupts any autonomous rewrite after the prompt is restored.
     """
     global _get_rag, _make_sync_reflect_generate, _load_base_prompt
-    global _PROMPTS_DIR, _STATE_DIR, _send, _executor, _host_busy, _mark_activity
+    global _PROMPTS_DIR, _STATE_DIR, _send, _executor, _host_busy, _mark_activity, _on_revert
     _get_rag = get_rag
     _make_sync_reflect_generate = make_sync_reflect_generate
     _load_base_prompt = load_base_prompt
@@ -90,6 +98,7 @@ def configure(*, get_rag, make_sync_reflect_generate,
     _executor = executor
     _host_busy = host_busy
     _mark_activity = mark_activity
+    _on_revert = on_revert
 
 
 # ── persistence (GPU-free) ─────────────────────────────────────────────────────
@@ -127,6 +136,13 @@ def active_experiment_prompt(state_dir: Path) -> Optional[str]:
 def save_experiment(state_dir: Path, *, prompt: str, base_prompt: str,
                     process: str = "") -> dict:
     """Persist a new active experiment record and return it (atomic write)."""
+    with STATE_LOCK:
+        return _save_experiment(state_dir, prompt=prompt, base_prompt=base_prompt,
+                                process=process)
+
+
+def _save_experiment(state_dir: Path, *, prompt: str, base_prompt: str,
+                     process: str) -> dict:
     state_dir = Path(state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     rec = {
@@ -162,6 +178,11 @@ def clear_experiment(state_dir: Path) -> Optional[dict]:
     Returns None if there was nothing active. Removes the record file so the loader
     falls back to the base standing prompt.
     """
+    with STATE_LOCK:
+        return _clear_experiment(state_dir)
+
+
+def _clear_experiment(state_dir: Path) -> Optional[dict]:
     rec = load_experiment(state_dir)
     if rec is None:
         # Still remove any stale/inactive file so the state is clean.
@@ -272,12 +293,13 @@ def run_prompt_experiment_blocking(
             return {"skipped": "no_prompt",
                     "message": "No usable <new_prompt> block was produced."}
 
-        rec = save_experiment(_STATE_DIR, prompt=new_prompt,
-                              base_prompt=base_prompt, process=raw)
         # Swap it into the live session so the next chat uses it without a restart. On a
         # restart, _load_system_prompt() re-reads the same record and reaches the same
         # state.
-        _session.system_prompt = new_prompt
+        with STATE_LOCK:
+            rec = save_experiment(_STATE_DIR, prompt=new_prompt,
+                                  base_prompt=base_prompt, process=raw)
+            _session.system_prompt = new_prompt
         print(f"[prompt_experiment] activated experimental prompt "
               f"({len(new_prompt)} chars); reverts on manual revert.", flush=True)
         return {"activated": True, "prompt": new_prompt,
@@ -337,15 +359,19 @@ async def handle_revert_prompt(ws, msg: dict) -> None:
 
     Terminal ``prompt_revert_done`` — ``reverted`` when one was cleared, else
     ``skipped: none_active``. Cheap (a file delete + a live-prompt reload); runs inline."""
-    rec = clear_experiment(_STATE_DIR)
+    with STATE_LOCK:
+        rec = clear_experiment(_STATE_DIR)
+        if rec is not None:
+            try:
+                _session.system_prompt = (_load_base_prompt() or "").strip() or _session.system_prompt
+            except Exception:
+                traceback.print_exc()
+            if _on_revert is not None:
+                _on_revert()
     if rec is None:
         await _send(ws, {"type": "prompt_revert_done", "skipped": "none_active",
                          "message": "No prompt experiment is active."})
         return
-    try:
-        _session.system_prompt = (_load_base_prompt() or "").strip() or _session.system_prompt
-    except Exception:
-        traceback.print_exc()
     print("[prompt_experiment] reverted to base standing prompt.", flush=True)
     await _send(ws, {"type": "prompt_revert_done", "reverted": True,
                      "prompt_chars": len(_session.system_prompt or "")})
@@ -371,11 +397,22 @@ async def handle_experiment_status(ws, msg: dict) -> None:
                          "prompt_chars": len(base)})
         return
     prompt = rec.get("prompt", "") or ""
+    process = str(rec.get("process") or "")
+    # Provenance for the Prompt tab: who put this prompt live. `rewrite:<event>` is Ava's
+    # own decision (core.prompt_rewrite), `manual` the operator's Update, anything else
+    # the Prompt-experiment button.
+    if process.startswith("rewrite:"):
+        set_by, event = "ava", process.split(":", 1)[1]
+    elif process == "manual":
+        set_by, event = "operator", ""
+    else:
+        set_by, event = "experiment", ""
     await _send(ws, {"type": "prompt_experiment_status", "active": True,
                      "prompt": prompt,
                      "base_prompt": rec.get("base_prompt", "") or base,
                      "prompt_chars": len(prompt),
-                     "created_ts": rec.get("created_ts", "")})
+                     "created_ts": rec.get("created_ts", ""),
+                     "set_by": set_by, "event": event})
 
 
 async def handle_set_prompt(ws, msg: dict) -> None:
@@ -410,13 +447,14 @@ async def handle_set_prompt(ws, msg: dict) -> None:
             base_prompt = ""
 
     try:
-        saved = save_experiment(_STATE_DIR, prompt=prompt, base_prompt=base_prompt,
-                                process="manual")
+        with STATE_LOCK:
+            saved = save_experiment(_STATE_DIR, prompt=prompt, base_prompt=base_prompt,
+                                    process="manual")
+            _session.system_prompt = prompt
     except Exception as e:  # noqa: BLE001 — surface the write failure to the tab
         traceback.print_exc()
         await _send(ws, {"type": "prompt_updated", "error": f"{type(e).__name__}: {e}"})
         return
-    _session.system_prompt = prompt
     print(f"[prompt_experiment] activated hand-written prompt ({len(prompt)} chars); "
           f"reverts on manual revert.", flush=True)
     await _send(ws, {"type": "prompt_updated", "activated": True,

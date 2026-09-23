@@ -48,16 +48,15 @@ difference from vLLM.
    │ model + RAG + digest      │  OpenAI       │ Encounter loop                │
    │ /v1/chat/completions ◄────┼───────────────┤ CounterpartClient.reply(...)  │
    │ (NEW — this doc)          │  HTTP POST    │ (EXISTS, unchanged)           │
-   │ stateless, does not log   │               │ logs + reflects on transcript │
+   │ request-stateless; logs local CoT   │               │ logs + reflects on transcript │
    └───────────────────────────┘               └───────────────────────────────┘
 ```
 
 ### Agreed scope (from the design conversation)
 
-- **Asymmetric.** One box **drives** (runs the Encounter loop, logs, reflects). The other
-  box **serves** (answers requests, stateless, does *not* log or reflect — for now).
-- **Only the driving Ava reflects** on the gossip. That is accepted and fine for v1.
-- **Serving-side reflection is a deferred future addition** (§7): ship the transcript back
+- **Asymmetric transport, both sides record experience.** One box drives the Encounter loop; the other serves stateless HTTP requests while correlating them into its own growing chat transcript with local CoT.
+- **Both sides can reflect** on their own recorded transcript. This path has been exercised between two GPU boxes.
+- **Historical rejected approach for serving-side reflection** (§7): ship the transcript back
   to the serving box and role-invert it so it, too, can reflect. Cheap when we get to it.
 - **Prompts will be adjusted** so each side knows it is meeting a *peer instance*, not the
   "non-subjective helpful assistant" the current Encounter framing asserts.

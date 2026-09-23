@@ -1,10 +1,24 @@
 # Consolidation & SFT — design
 
+Last code check: 2026-09-18, against `9ecb488`.
+
+## Current implementation
+
+The dense-model cycle has run end to end on the GPU box and is operationally sane. It builds a fresh LoRA on the frozen base from stored resolved targets plus durable wander material. `build_dataset` orders rows chronologically; hosted facts can be injected, explicit persona CoT prepending is retired, and persona-conditioned re-answers preserve their prompt context for parity.
+
+`train_lr_schedule` defaults to `age_ramp` (requested epochs honored). Optional `triangular` is a trapezoid: one warmup + `train_plateau_epochs` plateau + one decay epoch. Defaults are `train_lr=8e-6`, `lora_r=32`, fixed rsLoRA alpha 4, and an 8192-token training cap bounded by context length; a box’s explicit config/caller overrides take precedence. Wall-clock sample multipliers default to `1→2→4`, with cap-age contamination dose 1 and a 100-character minimum user turn. Optional folded contamination uses per-token weighting and is not optimizer-identical to two separate steps.
+
+Behavioral adapter validation is deliberately off (`validation_switch.VALIDATION_ENABLED=False`), including judge-override runs. Technical completion/masking/parity checks and quarantine remain active. A bad adapter is a disposable result that informs process correction; restoring a promotion gate is not required work.
+
+Forensic capture is best-effort: successful snapshots preserve exact retained rows (plus tagged, untrained previews when requested), but failure can return no snapshot while scratch render deletion proceeds. Early failures need not be captured. Runnable exports also omit associative state and graph aliases. See `documentation/AVA_OPEN_PROBLEMS.md` → Snapshot State Coverage / Forensic Evidence Durability.
+
+The older resumed-adapter, stage-count, accepted-forgetting, and probe-policy sections below are historical design records, not the current training contract. Current implementation detail is in `REBUILD.md` and `documentation/AVA_STATUS.md`.
+
 > **Superseded for the build path (REBUILD Phases 1–3 built 2026-07-05; wall-clock retrofit
 > 2026-07-06):** the code no longer implements the resumed-persistent-adapter scheme
 > described below. `train_cycle` now runs a **data-centric from-scratch build** — adapter as
 > build artifact (fresh LoRA on the frozen base every build, never resumed); reflect-once
-> bundles with one resolved target; one chronological oldest-first pass. See `REBUILD.md`
+> bundles with one resolved target; chronological oldest-first order with the configured epoch/schedule policy. See `REBUILD.md`
 > (repo root) for the authoritative design and `build_dataset.py` / `build_history.py` /
 > `decay.py` for the code.
 >
@@ -17,8 +31,8 @@
 > (`verbatim_rag_weight_hours` → 0 at `rag_cap_age_h≈96h`, still ~0.25 at the LoRA cap);
 > gist reaches 1.0 there, then decays to 0.2 at 192h and holds. Persona uses the separate
 > floored `rag_weight_hours` path. Modifiers are recomputed at retrieval time. Knobs on
-> `consolidation.wall_clock` (`decay.WallClockConfig`). Every build (promoted OR rejected)
-> writes an immutable forensic snapshot under `models/snapshots/<build_id>/`
+> `consolidation.wall_clock` (`decay.WallClockConfig`). Every build reaching outcome recording
+> attempts a materialized forensic snapshot under `models/snapshots/<build_id>/`
 > (`build_snapshot.py`); `builds.jsonl` carries `built_at`/`seed`/`snapshot_dir`. At cap age a
 > chat exchange also emits a **user-contamination** pair (masked 3.0 + `unmask_user` 1.0) —
 > or, with `contamination.fold` (default OFF), a single per-token-weighted row (LR-mult 4.0,
@@ -126,15 +140,7 @@ exchanges per cycle, this is a rare event, not a per-cycle step. The bottleneck 
 
 ### Probe-gated promotion — the regression probe
 
-> **Status (2026-07-06): validation is DISABLED.** `train_cycle._VALIDATION_ENABLED = False`
-> force-skips the probe (and its baselines) on every build, so **every build promotes
-> unguarded**. Reason: the probe — notably tier 5's answer-language check — is hard-coded to
-> a single (Russian) user and cannot gate a genuinely multilingual user base (French / Greek /
-> Hebrew), and near-term degradation is noticeable in live chat anyway. A correct probe is a
-> **separate design project** (see `documentation/AVA_OPEN_PROBLEMS.md → Validation`). The
-> probe code below is retained and unchanged, parked behind the switch; the adapter lineage +
-> forensic snapshots (`REBUILD.md §7`) keep any bad promotion reversible. The rest of this
-> section describes the probe *as designed*, for when it is re-armed.
+> **Current policy (2026-09-18): deliberately disabled.** `training.validation_switch.VALIDATION_ENABLED=False` force-skips the probe and baselines. Adapters are disposable build artifacts; ordinary chat reveals acute failure and process investigation follows. The multilingual caveat below is historical context, not the reason a gate must eventually return. The rest of this section describes the retained, inactive probe and its earlier design; it is not a roadmap commitment.
 
 After a cycle trains the new adapter, a small offline **regression probe** decides
 whether that adapter is *promoted* — i.e. whether `adapter_id` advances to it and
@@ -501,14 +507,14 @@ decay clock was the open greenfield step — now closed by the bundle age above.
 (`python -m training.selftest` — including the wall-clock age ramp, the decoupled RAG
 fade, reproducibility, the cap-age contamination split, and the forensic snapshot).
 `train_cycle.py` requires a GPU + a loaded model and Unsloth/TRL; it is written against
-that API but has **not** been run end-to-end here.
+that API and has been run end to end on the GPU box; the implementation is operationally sane.
 
 `train_cycle.py` now implements the **from-scratch** build: it loads the frozen base by
-`model_id` and fits a **fresh** LoRA every build (never resumes `adapter_id`), trains one
-chronological oldest-first pass with the wall-clock per-step LR ramp, and — with
+`model_id` and fits a **fresh** LoRA every build (never resumes `adapter_id`), trains in
+chronological order with the selected global schedule and wall-clock per-row LR ramp, and — with
 **validation disabled** (`validation_switch.VALIDATION_ENABLED = False`) — promotes
 unconditionally, saving the adapter, repointing `server_config.json`'s `adapter_id`
-(`model_id` is never rewritten), and writing the forensic snapshot + `builds.jsonl` line.
+(`model_id` is never rewritten), and attempting forensic capture before appending the `builds.jsonl` line.
 The regression probe is retained but force-skipped (see its section). The superseded
 merge-into-base and resume-adapter paths are gone. The cycle runs end-to-end on the GPU box
 (every adapter under `server/models/` is its output); the LoRA hyperparameters are tuned by

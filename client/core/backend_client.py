@@ -1154,6 +1154,15 @@ class BackendClient:
             self._send({"type": "revert_prompt"})
             return self._recv_until({"prompt_revert_done"})
 
+    def prompt_rewrite_status(self, attempts: int = 5) -> dict:
+        """Fetch the autonomous prompt rewrite's status for the Prompt tab: the gate's
+        verdict chain (why the `rewrite_prompt` action is or is not on Ava's menu), the
+        pattern budget, and the newest *attempts* records in full — timestamp, outcome,
+        chosen candidate, her WHY and every candidate's text."""
+        with self._rpc_lock:
+            self._send({"type": "prompt_rewrite_status", "attempts": int(attempts)})
+            return self._recv_until({"prompt_rewrite_status"})
+
     def prompt_experiment_status(self) -> dict:
         """Fetch the live standing prompt and whether it is a temporary experiment.
 

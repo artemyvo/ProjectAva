@@ -23,6 +23,16 @@ Applied only on a unified-memory box (``core.unified_memory``) unless
 Also: ``hf_offline_if_cached`` — a fully cached model spends ~12 s of every
 load on Hub HEAD requests (84 of them, profiled); when the snapshot is complete
 on disk, set ``HF_HUB_OFFLINE`` for the load so the resolver reads the cache.
+
+**That is an optimization and must never be why a load fails.** The check can only
+see the id it is handed, while the loader resolves more behind its back — a LoRA
+dir's base (followed here, see ``snapshot_is_cached``) and unsloth's bnb-4bit twin
+of a named repo (not knowable from here) — so a file nobody knew to look for can be
+missing with offline on. ``inference_backend.load`` therefore retries the load
+online once when an offline attempt dies on a missing cache entry. Both halves were
+added 2026-09-21, after a cleared HF cache left the box refusing to download its own
+base model: the guard was pointed at the adapter dir, which is trivially "on disk",
+and reported the load cached while the base it sits on was gone.
 """
 
 from __future__ import annotations
@@ -86,10 +96,37 @@ def uninstall() -> None:
         setattr(cml, _PATCHED_ATTR, None)
 
 
-def snapshot_is_cached(model_id: str) -> bool:
-    """True when ``model_id`` is a local dir or a complete HF-cache snapshot."""
-    if os.path.isdir(model_id):
+def adapter_base(path: str) -> Optional[str]:
+    """The base model a local LoRA dir resolves against, or None if it is not one.
+
+    A LoRA dir is a complete local snapshot of *itself* and nothing else: the weights
+    it sits on top of are named in its ``adapter_config.json`` and fetched from the Hub
+    at load time. So "is this on disk?" asked of an adapter has to be asked of its base
+    too — see ``snapshot_is_cached``."""
+    try:
+        import json
+        with open(os.path.join(path, "adapter_config.json"), "r", encoding="utf-8") as fh:
+            base = json.load(fh).get("base_model_name_or_path")
+    except Exception:
+        return None
+    return base if isinstance(base, str) and base.strip() else None
+
+
+def snapshot_is_cached(model_id: str, _seen: Optional[set] = None) -> bool:
+    """True when ``model_id`` and everything it loads through are on disk.
+
+    A local dir is trivially present, but a LoRA adapter dir is only half the load:
+    unsloth resolves the base from its ``adapter_config.json``, so the base decides
+    whether this load needs the Hub. Reporting an adapter "cached" with its base
+    missing is what turned a cleared HF cache into a refusal to download instead of a
+    download (2026-09-21)."""
+    _seen = _seen or set()
+    if model_id in _seen:
         return True
+    _seen.add(model_id)
+    if os.path.isdir(model_id):
+        base = adapter_base(model_id)
+        return base is None or snapshot_is_cached(base, _seen)
     try:
         from huggingface_hub import snapshot_download
         snapshot_download(model_id, local_files_only=True)
@@ -165,6 +202,33 @@ if __name__ == "__main__":
         ratio = r["clone_h2d_gbps"] / max(r["mmap_h2d_gbps"], 1e-9)
         print(f"clone/mmap ratio: {ratio:.0f}x  -> fast_load {'MATTERS on this box' if ratio > 3 else 'is not needed on this box'}")
         sys.exit(0)
+    # The offline guard, sealed from the Hub: a plain dir is cached, an adapter dir is
+    # cached only when its base is, and the guard stays off when it is not.
+    import json, tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = os.path.join(tmp, "plain"); os.makedirs(plain)
+        assert adapter_base(plain) is None and snapshot_is_cached(plain)
+        lora = os.path.join(tmp, "lora"); os.makedirs(lora)
+        with open(os.path.join(lora, "adapter_config.json"), "w") as fh:
+            json.dump({"base_model_name_or_path": "ava/does-not-exist-anywhere"}, fh)
+        assert adapter_base(lora) == "ava/does-not-exist-anywhere"
+        assert not snapshot_is_cached(lora), "an adapter whose base is gone is NOT cached"
+        with open(os.path.join(lora, "adapter_config.json"), "w") as fh:
+            json.dump({"base_model_name_or_path": plain}, fh)
+        assert snapshot_is_cached(lora), "an adapter whose base is a local dir IS cached"
+        with open(os.path.join(lora, "adapter_config.json"), "w") as fh:
+            json.dump({"base_model_name_or_path": lora}, fh)   # self-reference: must terminate
+        assert snapshot_is_cached(lora)
+        assert os.environ.get("HF_HUB_OFFLINE") is None
+        with hf_offline_if_cached(plain) as off:
+            assert off.active and os.environ.get("HF_HUB_OFFLINE") == "1"
+        assert os.environ.get("HF_HUB_OFFLINE") is None
+        with open(os.path.join(lora, "adapter_config.json"), "w") as fh:
+            json.dump({"base_model_name_or_path": "ava/does-not-exist-anywhere"}, fh)
+        with hf_offline_if_cached(lora) as off:
+            assert not off.active, "offline must stay OFF when the base still has to be fetched"
+            assert os.environ.get("HF_HUB_OFFLINE") is None
+
     os.environ["AVA_FAST_LOAD"] = "1"
     import torch
     import transformers.core_model_loading as cml

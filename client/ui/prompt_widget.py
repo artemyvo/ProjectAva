@@ -65,6 +65,29 @@ class PromptStatusWorker(QThread):
             self.error_occurred.emit(result.get("message", "Failed to fetch the prompt"))
 
 
+class RewriteStatusWorker(QThread):
+    """Fetches the autonomous rewrite's gate + attempt log off the GUI thread."""
+
+    ready = pyqtSignal(dict)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, client: "BackendClient", parent=None) -> None:
+        super().__init__(parent)
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            result = self._client.prompt_rewrite_status()
+        except Exception as e:  # noqa: BLE001
+            self.error_occurred.emit(str(e))
+            return
+        if result.get("type") == "prompt_rewrite_status" and not result.get("error"):
+            self.ready.emit(result)
+        else:
+            self.error_occurred.emit(result.get("error") or result.get("message")
+                                     or "Failed to fetch the rewrite status")
+
+
 class SetPromptWorker(QThread):
     """Applies the operator's edited prompt as the live experiment, off the GUI thread."""
 
@@ -196,8 +219,23 @@ class PromptWidget(QWidget):
         )
         splitter.addWidget(self.txt_log)
 
+        # The autonomous rewrite (core/prompt_rewrite.py): why the `rewrite_prompt` action
+        # is or is not on Ava's menu right now (the currency gate, condition by condition),
+        # the pattern budget, and the last attempts in full — timestamp, outcome, what she
+        # chose, her WHY, and every candidate she was choosing among. Read-only; refreshed
+        # with the tab, independent of unsaved edits in the prompt box (it never touches it).
+        self.txt_rewrite = QPlainTextEdit()
+        self.txt_rewrite.setReadOnly(True)
+        self.txt_rewrite.setFont(self.text_font)
+        self.txt_rewrite.setPlaceholderText(
+            "Autonomous rewrite: the gate's verdict, the pattern budget and the last "
+            "attempts (variants + her choice) load here on Refresh."
+        )
+        splitter.addWidget(self.txt_rewrite)
+
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 3)
         layout.addWidget(splitter, 1)
 
         btn_row = QHBoxLayout()
@@ -289,7 +327,15 @@ class PromptWidget(QWidget):
 
     def _render_status(self) -> None:
         if self._active:
-            state = "Experimental prompt is LIVE (temporary — Revert restores the base)"
+            set_by = getattr(self, "_set_by", "") or ""
+            if set_by == "ava":
+                ev = getattr(self, "_event", "") or ""
+                state = (f"Prompt set by AVA HERSELF (rewrite event {ev}) — LIVE; "
+                         f"Revert restores the base")
+            elif set_by == "operator":
+                state = "Hand-written prompt is LIVE (temporary — Revert restores the base)"
+            else:
+                state = "Experimental prompt is LIVE (temporary — Revert restores the base)"
         else:
             state = "Base standing prompt (no experiment active)"
         chars = len(self.txt_prompt.toPlainText())
@@ -336,6 +382,9 @@ class PromptWidget(QWidget):
             return
         if self._status_worker is not None and self._status_worker.isRunning():
             return
+        # The rewrite panel never touches the prompt box, so it refreshes whatever the
+        # edit state — the dirty guard below protects the box, not this.
+        self._refresh_rewrite_status(client)
         if self._is_dirty():
             if not force:
                 self._render_status()
@@ -358,10 +407,122 @@ class PromptWidget(QWidget):
         self._update_buttons()
         worker.start()
 
+    # ---------------------------------------------------------------- #
+    # Autonomous rewrite panel                                          #
+    # ---------------------------------------------------------------- #
+
+    def _refresh_rewrite_status(self, client) -> None:
+        worker = getattr(self, "_rewrite_worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        worker = RewriteStatusWorker(client, parent=self)
+        worker.ready.connect(self._on_rewrite_status_ready)
+        worker.error_occurred.connect(
+            lambda err: self.txt_rewrite.setPlainText(f"Rewrite status unavailable: {err}"))
+        worker.finished.connect(worker.deleteLater)
+        self._rewrite_worker = worker
+        worker.start()
+
+    @staticmethod
+    def _fmt_ts(ts: str) -> str:
+        return (ts or "").replace("T", " ")[:19] or "?"
+
+    def _on_rewrite_status_ready(self, r: dict) -> None:
+        self._rewrite_worker = None
+        lines: list[str] = []
+        gate = r.get("gate") or {}
+        st = r.get("settings") or {}
+        budget = r.get("budget") or {}
+        reason_text = {
+            "budget": "on her menu — a mature pattern funds it",
+            "continue": "on her menu — an interrupted event resumes",
+            "disabled": "prompt_rewrite.enabled is false",
+            "no_model": "no model loaded",
+            "no_mature_pattern": "no mature pattern (spent ones excluded)",
+            "gap": f"last attempt too recent — {gate.get('gap_hours_left', 0)} h of the "
+                   f"{st.get('min_gap_hours', 24)} h gap left",
+            "no_new_deltas": "nothing reflected since the last attempt (no new delta)",
+        }.get(gate.get("reason", ""), gate.get("reason", "?"))
+        verdict = "OFFERED" if gate.get("offered") else "NOT OFFERED"
+        lines.append(f"AUTONOMOUS REWRITE — {verdict}: {reason_text}")
+        lines.append(
+            f"  enabled={'yes' if r.get('enabled') else 'NO'} · "
+            f"model={'loaded' if r.get('model_loaded') else 'NOT loaded'} · "
+            f"event running={'yes' if r.get('active') else 'no'} · "
+            f"samples={st.get('samples')} @ {st.get('temperatures')} · "
+            f"final={st.get('final_temperature')} · gap={st.get('min_gap_hours')} h · "
+            f"order_check={'on' if st.get('order_check') else 'off'}")
+        lines.append(
+            f"  budget: {budget.get('n_patterns', 0)} pattern(s) in patterns.json "
+            f"({budget.get('n_mature_in_file', 0)} mature there, "
+            f"{len(gate.get('mature') or [])} still unspent) · "
+            f"{r.get('unconsumed_deltas', 0)} unspent delta(s) · "
+            f"{gate.get('deltas_since_last_attempt', 0)} new since the last attempt · "
+            f"folded {self._fmt_ts(budget.get('built_at', ''))} · "
+            f"last attempt {self._fmt_ts(budget.get('last_attempt_ts', '')) if budget.get('last_attempt_ts') else 'never'}")
+        if gate.get("in_flight"):
+            ev = gate["in_flight"]
+            lines.append(
+                f"  IN FLIGHT: event {ev.get('event_id')} started "
+                f"{self._fmt_ts(ev.get('started_ts', ''))} — {ev.get('samples_done', 0)} draft(s) "
+                f"done, consensus={'yes' if ev.get('consensus') else 'no'}, "
+                f"final={'yes' if ev.get('final') else 'no'}")
+        pats = budget.get("patterns") or []
+        if pats:
+            lines.append("  patterns (weight = tension-weighted recurrence over distinct chats):")
+            for p_ in pats[:12]:
+                tag = "MATURE" if p_.get("mature") else "forming"
+                lines.append(f"    - [{p_.get('scope') or '?'}] {tag} w={p_.get('weighted_recurrence')} "
+                             f"chats={p_.get('recurrences')}: {(p_.get('delta') or '')[:200]}")
+        if gate.get("offer_line"):
+            lines.append("  the line she would see: " + gate["offer_line"])
+
+        attempts = r.get("attempts") or []
+        lines.append("")
+        if not attempts:
+            lines.append("ATTEMPTS: none yet.")
+        else:
+            lines.append(f"ATTEMPTS: {r.get('attempts_total', len(attempts))} total; newest first.")
+        for i, a in enumerate(attempts):
+            outcome = str(a.get("outcome") or "?").upper()
+            head = (f"— {self._fmt_ts(a.get('ts', ''))} · event {a.get('event') or '?'} · "
+                    f"{outcome} · chosen: {a.get('chosen') or '—'}")
+            if a.get("choice_unparsed"):
+                head += " · (choice unparsed → kept the current prompt)"
+            if a.get("order_check"):
+                oc = a["order_check"]
+                head += (f" · order check {'agreed' if oc.get('agree') else 'DISAGREED'}"
+                         f" (reversed pick: {oc.get('reversed_pick')})")
+            lines.append(head)
+            if a.get("why"):
+                lines.append(f"  WHY: {a['why']}")
+            if a.get("patterns_weighed"):
+                lines.append(f"  patterns weighed: {', '.join(map(str, a['patterns_weighed']))}"
+                             f" · consumed keys: {len(a.get('consumed_keys') or [])}")
+            cands = a.get("candidates") or {}
+            if i == 0 and cands:
+                lines.append(f"  candidates ({len(cands)}):")
+                order = ["incumbent"] + sorted(k for k in cands if k.startswith("sample_"))                     + (["final"] if "final" in cands else [])
+                for label in order:
+                    if label not in cands:
+                        continue
+                    mark = "  ← CHOSEN" if label == a.get("chosen") else ""
+                    lines.append(f"  ===== {label}{mark} =====")
+                    lines.append((cands[label] or "").strip() or "(empty)")
+                    lines.append("")
+            elif cands:
+                lines.append(f"  candidates: {len(cands)} (texts shown for the newest attempt only)")
+        self.txt_rewrite.setPlainText("\n".join(lines))
+
     def _on_status_ready(self, result: dict) -> None:
         self._status_worker = None
         self._active = bool(result.get("active"))
         self._base_prompt = result.get("base_prompt", "") or ""
+        # Provenance (2026-09-19): `set_by` ava/operator/experiment + the rewrite event id,
+        # so an operator can see that Ava changed her own prompt rather than assuming the
+        # experiment button was pressed. Revert is the veto either way.
+        self._set_by = result.get("set_by", "") or ""
+        self._event = result.get("event", "") or ""
         prompt = result.get("prompt", "") or ""
         self.txt_prompt.blockSignals(True)
         self.txt_prompt.setPlainText(prompt)
@@ -639,3 +800,4 @@ class PromptWidget(QWidget):
         self.text_font = font
         self.txt_prompt.setFont(font)
         self.txt_log.setFont(font)
+        self.txt_rewrite.setFont(font)

@@ -1,5 +1,7 @@
 # Natural-Flow Replay Rebuild — Design
 
+> **Scope clarification (2026-09-18):** This is an unimplemented historical replay proposal, not the working from-scratch training cycle. That cycle has been exercised on the GPU box. Existing review archives have no ordered replay manifests; transcripts alone do not restore historical frozen decisions or associative access history. The current snapshot/evidence limits are in `documentation/AVA_OPEN_PROBLEMS.md`. Do not treat this proposed runbook as available functionality.
+
 Rebuild Ava's adapter + derived state after manual corruption repair, by
 **replaying the intended nightly cron cadence** over the surviving chat corpus
 instead of collapsing everything into one build. GPU cost is not a constraint;

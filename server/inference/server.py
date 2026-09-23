@@ -176,8 +176,12 @@ Server → client messages (all include "type"):
   prompt_updated          {activated?, replaced?, prompt_chars?, created_ts? | skipped, message?}
                           — terminal result of a hand-written prompt swap (set_prompt)
   prompt_revert_done      {reverted?, prompt_chars? | skipped, message?} — terminal revert result
-  prompt_experiment_status {active, prompt, base_prompt, prompt_chars, created_ts?} — the live
-                          standing prompt + whether it is an experiment (backs the Prompt tab)
+  prompt_rewrite_status  {attempts?} — the autonomous rewrite's gate verdict chain, budget and
+                          the newest attempts with every candidate (Prompt tab). Replies
+                          prompt_rewrite_status
+  prompt_experiment_status {active, prompt, base_prompt, prompt_chars, created_ts?, set_by?, event?}
+                          — the live standing prompt + whether it is an experiment and who set it
+                          (ava = her own rewrite event / operator / experiment; backs the Prompt tab)
   reflection_prompts           {sleep_prompt, revision_prompt, branch_prompt}
   reflection_run_started       {run_id, status}
   reflection_run_status        {run_id, status, phase, session_index, session_total,
@@ -270,6 +274,7 @@ from core import chat_worklog
 from core import graph_rebuild
 from core import assoc_bridge
 from core import prompt_experiment
+from core import prompt_rewrite
 from core import reflection_service
 from core import generation
 from core import session_ops
@@ -322,6 +327,57 @@ _STAGING_ARCHIVE_DIR       = _STAGING_DIR / "archive"
 # GPU, runs the offline train cycle, then relaunches us with the new adapter.
 _WATCHDOG_MGMT_URL = os.environ.get("AVA_WATCHDOG_URL", "http://127.0.0.1:8766")
 
+# Grace between "no model could be brought back" and the restart request: the caller
+# that lost the model (a reflection run, a regenerate) must get to write its own
+# failure record before the watchdog kills us — milliseconds of filesystem work.
+_MODEL_LOST_RESTART_DELAY_S = 10.0
+
+
+def _on_model_lost(reason: str) -> str:
+    """A swap released the model and could not bring one back (see ``agentic``).
+
+    The process is poisoned rather than merely empty: the failed loads' debris sits
+    in the CUDA allocator (observed 2026-09-17: 20 GB reserved, 2 GB allocated, 10 GiB
+    free, hours after the failure), and every path — chat, idle jobs, the next Sleep
+    run — now dies on "no model loaded". The one clean recovery is a fresh process, so
+    ask the watchdog to restart us: it relaunches on ``server_config.json``'s
+    ``adapter_id``, the last adapter that was promoted — the last known good one. The
+    request is delayed so the caller can finalize its run, and posted from a daemon
+    thread since the watchdog kills us before it answers. Without a watchdog (a bare
+    ``server.py``) there is nothing to ask; the note says so and the operator reloads.
+    Returns the one-line note the callers report."""
+    try:
+        activity_log.append("server", "model_lost", f"no model is loaded: {reason}",
+                            level="event")
+    except Exception:
+        pass
+    url = f"{_WATCHDOG_MGMT_URL.rstrip('/')}/restart"
+
+    def _request() -> None:
+        time.sleep(_MODEL_LOST_RESTART_DELAY_S)
+        print(f"[server] model lost — requesting a watchdog restart ({url}); the box "
+              f"relaunches on the configured adapter", flush=True)
+        try:
+            activity_log.append("server", "restart_requested",
+                                "restarting via the watchdog onto the configured adapter",
+                                level="event")
+        except Exception:
+            pass
+        try:
+            req = urllib.request.Request(url, data=b"{}", method="POST",
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=30).read()
+        except Exception as exc:
+            # The usual outcome of a SUCCESSFUL restart is that we are killed mid-request
+            # (connection reset) — only a refused connection means no watchdog.
+            print(f"[server] watchdog restart request ended: {type(exc).__name__}: {exc} "
+                  f"(if no watchdog runs this box, restart the server by hand)", flush=True)
+
+    threading.Thread(target=_request, name="model-lost-restart", daemon=True).start()
+    return (f"a watchdog restart onto the configured adapter has been requested "
+            f"({url}, in {int(_MODEL_LOST_RESTART_DELAY_S)} s); reconnect once the model "
+            f"reloads — if no watchdog runs this box, restart the server by hand")
+
 # Branch-and-select replay primitives (eligibility, prefix replay, embedder
 # filtering, chooser-prompt budgeting + tuning constants) live in core.branch_replay
 # so the WebSocket server and the headless CLI runner share one implementation.
@@ -361,6 +417,21 @@ _CHAT_REPETITION_PENALTY: Optional[float] = 1.1
 _cancel_event = threading.Event()
 _executor = ThreadPoolExecutor(max_workers=1)
 _active_ws = None  # websocket that currently owns the shared session, or None
+
+# `assoc_feed`'s cadence (see its registration in main()): re-arm every 15 min once it
+# has fired; while a client is connected, fire only after this much real idle time.
+_ASSOC_FEED_INTERVAL_S = 900.0
+_ASSOC_FEED_CONNECTED_IDLE_S = 3600.0
+
+
+def _assoc_feed_ready() -> bool:
+    """The `assoc_feed` idle job's gate: fire on its short idle window only when no client
+    is connected; with one connected, wait `_ASSOC_FEED_CONNECTED_IDLE_S` of real idle
+    time. A connected client is the one signal the server has that someone may be
+    composing a message it cannot see — see the registration for the full reasoning."""
+    if _active_ws is None:
+        return True
+    return idle_scheduler.seconds_idle() >= _ASSOC_FEED_CONNECTED_IDLE_S
 # The reflection run lives in core.reflection_service and the encounter in
 # core.encounter_run; each owns its executor-occupancy flag. The guards below read
 # `reflection_service._reflection_run_active` / `encounter_run._encounter_active`.
@@ -383,46 +454,57 @@ _host_busy = idle_scheduler.host_busy
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _backfill_server_config(config: dict, config_file) -> None:
-    """Persist newly-introduced config keys into an older ``server_config.json`` so the
-    operator can see and hand-edit them. Adds ``train_lr`` (base/peak SFT LR),
-    ``train_plateau_epochs`` (trapezoid hold-epoch count), and ``lora_r`` (adapter rank),
-    all defaulting from ``training.decay``, when absent, then rewrites the file in place. The
-    ``config`` dict is mutated so the running server sees the value too. Best-effort — a
-    write failure just leaves the key absent (the training default still applies)."""
+    """Persist every documented knob that is ABSENT from ``server_config.json`` with its
+    default, so the operator finds each new setting in the file on the next run instead of
+    in the code that reads it.
+
+    The list of knobs is ``server/config_schema.py`` — the same schema the settings editor
+    renders — and the policy (what is never written: box state like ``model_id`` /
+    ``adapter_id``; a null that would mean something other than absence; a key that is
+    present at any value) lives there as ``backfill_defaults``. Behaviour-preserving by
+    construction: each value written is the one the reader would have used anyway, so the
+    running box changes nothing and only the file grows. ``reflect_context_length`` derives
+    from ``context_length`` (no split), as the hand-written back-fill always did. The
+    ``config`` dict is mutated so the running server sees the same values it wrote.
+    Best-effort — a write failure just leaves the keys absent (the in-code defaults still
+    apply); an unloadable schema is reported and skipped rather than taking boot down."""
     if not isinstance(config, dict):
         return
     try:
-        from training.decay import (
-            TRAIN_LR_DEFAULT, TRAIN_PLATEAU_EPOCHS_DEFAULT, TRAIN_LORA_R_DEFAULT)
-    except Exception:
-        TRAIN_LR_DEFAULT, TRAIN_PLATEAU_EPOCHS_DEFAULT, TRAIN_LORA_R_DEFAULT = 8e-6, 3, 32
-    added = []
-    if "train_lr" not in config:
-        config["train_lr"] = TRAIN_LR_DEFAULT
-        added.append("train_lr")
-    if "lora_r" not in config:
-        config["lora_r"] = TRAIN_LORA_R_DEFAULT
-        added.append("lora_r")
-    if "train_plateau_epochs" not in config:
-        config["train_plateau_epochs"] = TRAIN_PLATEAU_EPOCHS_DEFAULT
-        added.append("train_plateau_epochs")
-    # Reflection window: the model is physically loaded at max(context_length,
-    # reflect_context_length), so reflection can pack a larger window than chat.
-    # Back-fill it behavior-preservingly (== context_length ⇒ no split) so the key
-    # is visible for hand-editing; raise it to give reflection more headroom.
-    if "reflect_context_length" not in config and "context_length" in config:
-        try:
-            config["reflect_context_length"] = int(config["context_length"])
-            added.append("reflect_context_length")
-        except (TypeError, ValueError):
-            pass
+        schema = _load_config_schema()
+        added = schema.backfill_defaults(config)
+    except Exception as e:
+        print(f"Warning: config back-fill skipped ({type(e).__name__}: {e})", flush=True)
+        return
     if added:
         try:
-            config_file.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-            print(f"Back-filled missing keys into server_config.json ({', '.join(added)}).",
-                  flush=True)
+            config_file.write_text(schema.config_text(config), encoding="utf-8")
+            print(f"Back-filled {len(added)} missing setting(s) into server_config.json: "
+                  f"{', '.join(added)}", flush=True)
         except Exception as e:
             print(f"Warning: could not back-fill server_config.json: {e}", flush=True)
+
+
+_config_schema_mod = None
+
+
+def _load_config_schema():
+    """``server/config_schema.py`` loaded by path (it sits one level above this role dir,
+    beside ``server_config.json`` and ``settings.py``, and ``server/`` is not on
+    ``sys.path`` at import time)."""
+    global _config_schema_mod
+    if _config_schema_mod is None:
+        import importlib.util
+        import sys as _sys
+        path = _SERVER_DIR.parent / "config_schema.py"
+        spec = importlib.util.spec_from_file_location("config_schema", path)
+        mod = importlib.util.module_from_spec(spec)
+        # Registered BEFORE exec: its dataclasses resolve their own module through
+        # sys.modules (postponed annotations), and fail on an unregistered one.
+        _sys.modules.setdefault("config_schema", mod)
+        spec.loader.exec_module(mod)
+        _config_schema_mod = _sys.modules["config_schema"]
+    return _config_schema_mod
 
 
 def _server_config_file() -> Path:
@@ -1887,7 +1969,8 @@ def _outreach_consumed_interval(result: dict) -> bool:
             or result.get("error")):
         return True
     skipped = str(result.get("skipped") or "")
-    if skipped in {"declined", "truncated", "reachout_cooldown", "reachout_backoff"}:
+    if skipped in {"declined", "truncated", "opener_leak",
+                   "reachout_cooldown", "reachout_backoff"}:
         return True     # a decision pass ran but no session was written
     return False        # nothing to weigh yet — cheap, retry next poll
 
@@ -2043,6 +2126,24 @@ def _synthesis_on_stage(kw: dict) -> None:
     activity_log.append("synthesis", "progress", f"Synthesis: {msg}", phase=stage)
 
 
+def _prompt_rewrite_on_stage(kw: dict) -> None:
+    stage = str(kw.get("stage") or "")
+    ev = str(kw.get("event") or "")
+    msg = {
+        "started": f"Started rewriting her standing prompt (event {ev}, "
+                   f"{kw.get('patterns', 0)} pattern(s) as evidence)",
+        "resumed": f"Resumed the rewrite (event {ev}, {kw.get('samples_done', 0)} draft(s) done)",
+        "discarded": f"Discarded a stale rewrite (event {ev}): {kw.get('reason', '')}",
+        "generating": f"Rewrite: {kw.get('what', 'generating')}",
+        "sample": f"Rewrite: draft {kw.get('k')}/{kw.get('n')} written ({kw.get('chars', 0)} chars)",
+        "consensus": f"Rewrite: consensus notes written ({kw.get('chars', 0)} chars)",
+        "final": f"Rewrite: final draft written ({kw.get('chars', 0)} chars)",
+        "chosen": f"Rewrite: she chose {kw.get('chosen')}"
+                  + (" (choice unparsed — kept the current prompt)" if kw.get("unparsed") else ""),
+    }.get(stage, stage or "working")
+    activity_log.append("prompt_rewrite", "progress", msg, phase=stage)
+
+
 def _checkin_on_stage(kw: dict) -> None:
     stage = str(kw.get("stage") or "")
     # A wake decides per person and the stages of several arrive in sequence, so every line
@@ -2115,6 +2216,7 @@ _HANDLERS_WS_MSG = {                # handler(ws, msg)
     "set_prompt": prompt_experiment.handle_set_prompt,
     "revert_prompt": prompt_experiment.handle_revert_prompt,
     "prompt_experiment_status": prompt_experiment.handle_experiment_status,
+    "prompt_rewrite_status": prompt_rewrite.handle_rewrite_status,
     "persona_preview": reflection_service.handle_persona_preview,
     "start_reflection_run": reflection_service.handle_start_reflection_run,
     "reflection_run_status": reflection_service.handle_reflection_run_status,
@@ -2425,6 +2527,7 @@ def main() -> None:
         send=_send, get_rag=_get_rag, chats_dir=_CHATS_DIR, data_dir=_DATA_DIR,
         is_reflection_active=lambda: reflection_service._reflection_run_active,
         mark_activity=_mark_activity,
+        tension_spans=generation.stored_tension_spans,
     )
     # Wire the TIL/wander subsystem with the server capabilities it needs (it never
     # imports server). See core.til_wander.configure.
@@ -2527,7 +2630,26 @@ def main() -> None:
         prompts_dir=_PROMPTS_DIR, state_dir=_prompt_state_dir(),
         send=_send, executor=_executor, mark_activity=_mark_activity,
         host_busy=_host_busy,
+        on_revert=prompt_rewrite.request_preempt,
     )
+    # The autonomous prompt-rewrite EVENT (PROMPT_REWRITE.md §5; core.prompt_rewrite): the
+    # deliberation action that spends the pattern budget. Same seam and same experiment
+    # tier as the button above, plus the cancel event so a chat turn can preempt it
+    # (generation._preempt_background_reflection) and the persona dir for the judge frame.
+    from training.reflections_path import persona_dir as _persona_dir_fn
+    prompt_rewrite.configure(
+        get_rag=_get_rag,
+        make_sync_reflect_generate=generation._make_sync_reflect_generate,
+        load_base_prompt=_load_base_chat_prompt,
+        prompts_dir=_PROMPTS_DIR, state_dir=_prompt_state_dir(),
+        load_server_config=_load_server_config, cancel_event=_cancel_event,
+        persona_dir=_persona_dir_fn, send=_send,
+    )
+    # A clean-base / adapter swap that cannot bring a model back escalates here: a
+    # watchdog restart onto the config's adapter (the last known good one). See
+    # core.agentic.configure and _on_model_lost.
+    from core import agentic
+    agentic.configure(on_model_lost=_on_model_lost)
     # Wire the reflection-run service with the server capabilities it needs (it never
     # imports server). See core.reflection_service.configure.
     reflection_service.configure(
@@ -2612,6 +2734,7 @@ def main() -> None:
                                or checkin._checkin_active
                                or deliberation._deliberation_active
                                or modules._module_run_active
+                               or prompt_rewrite._rewrite_active
                                or background_reflection._background_reflection_active),
         model_loaded=lambda: _runtime.model is not None,
         lock_file=_MEMORY_DIR / "wake.lock",
@@ -2647,6 +2770,20 @@ def main() -> None:
             return {"skipped": "no_wander_budget"}
         return til_wander.run_autonomous_wander_blocking()
 
+    def _wander_budget_note() -> str:
+        # One line for the deliberation context. Earned by conversation, spent per wander;
+        # zero means a chosen wander would be refused (`no_wander_budget`), which she
+        # should know before spending the hour on it.
+        try:
+            n = int(til_wander._wander_budget_available())
+        except Exception:
+            return ""
+        if n < 1:
+            return ("Reading budget: none unspent — a wander would be refused until a "
+                    "conversation earns one.")
+        return (f"Reading budget: {n} wander{'s' if n != 1 else ''} unspent, earned by "
+                f"conversation. A wander sends nothing to anyone.")
+
     def _run_revisit() -> dict:
         # The one drive that is not a blocking body: a revisit is a reflection run, i.e. a
         # coroutine that dispatches to THIS executor thread. Schedule it on the loop and
@@ -2662,7 +2799,15 @@ def main() -> None:
             reflection_service.handle_start_reflection_run(None, msg), _event_loop)
         return {"scheduled": "revisit"}
 
+    def _run_prompt_rewrite() -> dict:
+        # No IdleJob of its own, by design (PROMPT_REWRITE.md §4): the executive is the
+        # only trigger, and only when core.prompt_rewrite.offer() put it on her menu. The
+        # body re-checks that gate and reports a skip otherwise. Stage markers go to the
+        # activity journal; the generations report themselves through the reflect seam.
+        return prompt_rewrite.run_rewrite_blocking(on_stage=_prompt_rewrite_on_stage)
+
     _drives = {
+        "prompt_rewrite": _run_prompt_rewrite,
         "outreach": _run_outreach,
         "synthesis": _run_synthesis,
         "checkin": _run_checkin,
@@ -2754,11 +2899,27 @@ def main() -> None:
     # new or grown transcripts and texts ingested, their protocols imported) and a
     # rebuild when anything changed. It loads the BGE-M3 embedder on first use and a full
     # rebuild of a 400-document corpus is ~2.5 min, so unlike the tree fold it runs under
-    # the GPU lock like every other job — but it keeps the short idle window, since a
-    # library that lags the corpus is a channel that quietly answers from last week.
-    # Skips when current. `assoc.feed: false` turns it off.
+    # the GPU lock like every other job. Skips when current. `assoc.feed: false` turns
+    # it off.
+    #
+    # WHEN it may fire depends on whether anyone is at the box (2026-09-18). A chat turn
+    # does not check the GPU lock — it queues on the one executor thread behind whatever
+    # holds it — so a feed that started while the user was composing a long message
+    # (five idle minutes is a paragraph in Russian) landed their reply minutes late. The
+    # idle clock only sees SENT turns; typing is invisible to the server. So the gate
+    # reads the one signal it has: with a client connected, the feed waits for the full
+    # hour-idle window of the GPU-holding drives (a connected-and-silent hour is someone
+    # away from the keyboard, not someone mid-sentence); with no client at all it keeps
+    # the short window, since nobody can be typing. Neither half alone was right —
+    # "skip while connected" starves the feed on a box whose client is left open all
+    # day (the common state here), "an hour always" makes the library lag a corpus
+    # nobody is even looking at. Once it has fired, it re-arms every 15 minutes rather
+    # than hourly, so a long absence keeps the library within minutes of the corpus (a
+    # no-change wake is a `current` bail, cheap). The gate reads box state, not a
+    # sibling's — the starvation the `ready` doc warns about is job-on-job.
     idle_scheduler.register(idle_scheduler.IdleJob(
-        name="assoc_feed", interval_s=3600.0, idle_seconds=300.0,
+        name="assoc_feed", interval_s=_ASSOC_FEED_INTERVAL_S, idle_seconds=300.0,
+        ready=_assoc_feed_ready,
         run=assoc_bridge.run_feed_blocking,
         describe=assoc_bridge.describe_feed,
     ))
@@ -2798,9 +2959,10 @@ def main() -> None:
     # The deliberation EXECUTIVE (core.deliberation): Ava reads her recent worklog + open
     # threads and chooses among the drives above — or rest — then runs the choice in the
     # same GPU slot. Its dispatch map is the drives' own bodies. Registered as an idle job
-    # under `deliberation.mode` (default "shadow": beside the timers, so her choices can
-    # be compared against theirs in the Activity tab before anything is retired; "sole"
-    # retires the timers above; "off" leaves only the Worklog tab's dry-run button).
+    # under `deliberation.mode` (default "sole" since 2026-09-17: she is the only chooser
+    # and the drives' timers above are not registered; "shadow" keeps the timers beside
+    # her, so her choices can be compared against theirs in the Activity tab — the mode
+    # the executive shipped in; "off" leaves only the Worklog tab's dry-run button).
     # It takes the default idle window like the reach-out jobs, being a generation plus
     # whatever it dispatches. `revisit` is not a drive body: it is a reflection run,
     # scheduled onto the loop (see _run_revisit).
@@ -2818,7 +2980,16 @@ def main() -> None:
             "revisit": _run_revisit,
             "aha": _drives["assoc_aha"],
             "pivot": _drives["assoc_pivot"],
+            "rewrite_prompt": _drives["prompt_rewrite"],
         },
+        # The one conditionally-offered action: on her menu only while its gate is open.
+        offer_fn=prompt_rewrite.deliberation_offer,
+        # "Where things stand": the wander budget, so the executive sees the reading it
+        # can afford instead of learning at dispatch that the budget was empty — or, as
+        # observed under `sole` mode (2026-09-21), never choosing wander at all while
+        # budget sat unspent, having read the option as reacting to material that
+        # arrives on its own.
+        note_fns=[_wander_budget_note],
     )
     if _delib_cfg["mode"] != "off":
         idle_scheduler.register(idle_scheduler.IdleJob(

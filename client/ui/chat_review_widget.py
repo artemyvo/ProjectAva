@@ -7,7 +7,11 @@ the injected RAG block + any first-turn surfaced questions — logged verbatim p
 ``system_content``, because it cannot be reconstructed later), the raw retrieved
 ``rag_context``, the thinking block (``assistant_cot``) next to the answer, and the
 per-turn bookkeeping: generation params, input tokens, the tension summary + its
-contested-token trace, meta feedback, corruption flags, rewrite history.
+contested-token trace, meta feedback, corruption flags, rewrite history. The CoT and
+the reply are painted in the Chat tab's three channels (red = tension, green = relief,
+blue = pain) when the server could decode the exchange's stored token series
+(``tension_spans`` on the fetched exchange — render-only, attached by ``get_session``,
+never written to the file); the "Channels" toggle falls back to the plain stored text.
 
 It loosely mimics the Chat tab's shape (chat list on the left, conversation on the
 right) but chats nowhere: read-only, and it never touches server state beyond the two
@@ -25,15 +29,17 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QPlainTextEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextEdit,
     QListWidget, QListWidgetItem, QSplitter, QCheckBox, QLineEdit,
 )
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QTextCursor, QTextCharFormat
 from PyQt6.QtCore import Qt
 
 # The list/fetch workers are generic read-only RPC threads; reuse them rather than
-# cloning (the Chat tab owns them, and never imports this module — no cycle).
-from ui.chat_widget import SessionsWorker, PreviewSessionWorker
+# cloning (the Chat tab owns them, and never imports this module — no cycle). The
+# three-channel colouring (span painting, the channel-means line, the black pane) is
+# the Chat tab's too, called on its instance so the Gain knob applies to both views.
+from ui.chat_widget import SessionsWorker, PreviewSessionWorker, ChatWidget
 
 _RULE = "═" * 78
 _SUB = "─" * 78
@@ -135,17 +141,27 @@ class ChatReviewWidget(QWidget):
             "Sampling params, input tokens, think-open probability, meta feedback, "
             "corruption flags, and rewrite history."
         )
+        self._chk_channels = QCheckBox("Channels")
+        self._chk_channels.setToolTip(
+            "Paint the CoT and the reply in the Chat tab's three channels, decoded from "
+            "the token series stored with the exchange: red = tension (the model nearly "
+            "said something else), green = relief (its uncertainty just dropped), blue = "
+            "pain (axis projection, once captured). The Chat tab's Gain knob applies. "
+            "Untick for the plain stored text; exchanges without a stored series (or "
+            "whose model's tokenizer is not on the server) show plain text regardless."
+        )
         for chk in (self._chk_system, self._chk_rag, self._chk_cot,
-                    self._chk_tension, self._chk_meta):
+                    self._chk_tension, self._chk_meta, self._chk_channels):
             chk.setChecked(True)
             chk.toggled.connect(self._rerender)
             toggles.addWidget(chk)
         toggles.addStretch()
         right_layout.addLayout(toggles)
 
-        self._out = QPlainTextEdit()
+        self._out = QTextEdit()
         self._out.setReadOnly(True)
         self._out.setFont(self.text_font)
+        ChatWidget.paint_black_pane(self._out)
         self._out.setPlaceholderText(
             "Select a chat on the left to review it.\n\n"
             "Read-only: this shows the transcript exactly as logged — the assembled "
@@ -263,14 +279,33 @@ class ChatReviewWidget(QWidget):
 
     # ── rendering ──────────────────────────────────────────────────────────────
     def _rerender(self) -> None:
-        """Re-render the cached session (toggles change the view, never refetch)."""
+        """Re-render the cached session (toggles change the view, never refetch).
+
+        The render is a list of items: a ``str`` is one plain line; ``("spans", list)``
+        is a coloured token run (the Chat tab paints it); ``("means", dict)`` is the
+        per-channel means line under a reply. Plain lines take the pane's neutral grey.
+        """
         if self._data is None:
             return
-        self._out.setPlainText(self._render(self._data, self._filename))
+        items = self._render(self._data, self._filename)
+        self._out.clear()
+        cursor = self._out.textCursor()
+        neutral = QTextCharFormat()
+        chat = self._chat_widget
+        for item in items:
+            if isinstance(item, str):
+                cursor.insertText(item + "\n", neutral)
+            elif item[0] == "spans":
+                chat._insert_colored_spans(cursor, item[1])
+                cursor.insertText("\n", neutral)
+            elif item[0] == "means":
+                chat._append_channel_means(cursor, neutral, spans=item[1])
+                cursor.insertText("\n", neutral)
+        cursor.setCharFormat(neutral)
         self._out.verticalScrollBar().setValue(0)
 
-    def _render(self, data: dict, filename: str) -> str:
-        lines: list[str] = []
+    def _render(self, data: dict, filename: str) -> list:
+        lines: list = []
         lines.extend(self._render_header(data, filename))
 
         exchanges = data.get("exchanges") or []
@@ -287,7 +322,7 @@ class ChatReviewWidget(QWidget):
             prev_system = str(ex.get("system_content") or "")
         if not exchanges:
             lines.append("(this chat has no exchanges)")
-        return "\n".join(lines)
+        return lines
 
     def _render_header(self, data: dict, filename: str) -> list[str]:
         exchanges = data.get("exchanges") or []
@@ -337,8 +372,12 @@ class ChatReviewWidget(QWidget):
         session_user: str,
         opener: bool,
         prev_system: str,
-    ) -> list[str]:
+    ) -> list:
         speaker = str(ex.get("speaker") or "").strip() or session_user or "user"
+        # Decoded, colourable token runs for this exchange (attached by get_session
+        # when the stored series could be decoded); None ⇒ plain stored text.
+        spans = ex.get("tension_spans") if self._chk_channels.isChecked() else None
+        spans = spans if isinstance(spans, dict) else {}
         lines = [_SUB, f"EXCHANGE {index + 1}/{total}    id {ex.get('exchange_id', '—')}"]
 
         if self._chk_meta.isChecked():
@@ -392,12 +431,21 @@ class ChatReviewWidget(QWidget):
 
         if self._chk_cot.isChecked():
             cot = str(ex.get("assistant_cot") or "").strip()
-            lines.append("▶ CoT (assistant_cot):")
-            lines.append(cot or "(no thinking block)")
+            if spans.get("cot"):
+                lines.append("▶ CoT (decoded from the stored token series, channels):")
+                lines.append(("spans", spans["cot"]))
+            else:
+                lines.append("▶ CoT (assistant_cot):")
+                lines.append(cot or "(no thinking block)")
             lines.append("")
 
-        lines.append("▶ Ava:")
-        lines.append(str(ex.get("assistant_response") or "").strip() or "(empty)")
+        if spans.get("answer"):
+            lines.append("▶ Ava (decoded from the stored token series, channels):")
+            lines.append(("spans", spans["answer"]))
+            lines.append(("means", spans))
+        else:
+            lines.append("▶ Ava:")
+            lines.append(str(ex.get("assistant_response") or "").strip() or "(empty)")
         lines.append("")
 
         if self._chk_tension.isChecked():

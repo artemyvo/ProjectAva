@@ -8,13 +8,10 @@ three pivot bridges, activation-dependent decay and inferred edges as knobs, `se
 the fast path, `rebuild` + manifest + drift, the HTTP facade; 126 benches incl. the
 three-tier ladder). The §12 gate verdict for tier 3 on the fixtures: **even with tier 2**
 (within 0.01 overall, ahead on chat once edge strength is learned), not a clear win, so
-the default pull is tier 2 and L4 ships as the knob the design provided for. The real
-corpus is still the pending measurement for every gate. Description revised 2026-09-09
-after an external review (§0). This is a new
-project that starts on the DGX Spark. Ava is its quarry — the ideas and some reference code
+the default pull is tier 2 and L4 ships as the knob the design provided for. The live Ava corpus was measured on 2026-09-10: tier 2 improved fact-to-source MRR over tier 1 (0.44 vs 0.32), with tier 3 even. This is one-corpus evidence, not a universal ranking. Description revised 2026-09-09
+after an external review (§0). The implementation runs on the GPU box and is operationally sane; Ava uses it for live fact fetch by default. Ava is its quarry — the ideas and some reference code
 come from there — but it is not a fork of Ava's repository, it carries none of her subject
-(no training, no persona, no portraits), and it does not depend on her at runtime. The one
-chat on this box was a functionality check of the machine, not a corpus.
+(no training, no persona, no portraits), and it does not depend on her at runtime. Historical fixture results remain distinct from the live-corpus measurements in §12.
 
 **Order of work, fixed by the goal:**
 
@@ -36,6 +33,8 @@ stated, and word-level pivots in the manner of Дягилева and Башлач
 requirements were given in the first conversation and are unchanged; §3–§6 carry them.
 
 ---
+
+**Ava state boundary (2026-09-18).** The derived build/index is rebuildable, but the library root also holds model-generated witness/relation records, access/activation history, and needs. Re-importing source texts does not reproduce those historical records exactly. Ava's current runnable snapshot exporter omits `server/data/assoc/` and does not name BGE-M3 in its external-dependency manifest. This is an integration gap, tracked in `documentation/AVA_OPEN_PROBLEMS.md`, not a failure of the exercised retrieval path. In default `deliberation.mode=sole`, aha and pivot run when the executive chooses them; feed and witness remain maintenance jobs.
 
 ## 0. Review corrections (2026-09-09)
 

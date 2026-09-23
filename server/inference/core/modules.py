@@ -175,6 +175,12 @@ class ModuleSpec:
     # first `assoc_fetch` simulation on the training box did, the file being default-written by the
     # live path only. The callable writes the file, so an operator's edit then sticks.
     default_prompt: Optional[Callable[[], str]] = None
+    # A module that is a FORWARD PASS rather than a generation (2026-09-22: `axis_probe`).
+    # When set, the run loads the input, hands it here with the loaded model, and returns
+    # what comes back — no prompt, no generation, no `build`/`finish`. The callable gets
+    # ``(input_doc, meta, on_stage)`` and returns the display dict (`lines` / `count`).
+    # Still the workbench contract: reads one input, writes nothing.
+    forward: Optional[Callable[..., dict]] = None
 
 
 # ── chat_facts: the per-chat extraction protocol ──────────────────────────────
@@ -650,6 +656,132 @@ _ASSOC_PIVOT = ModuleSpec(
     default_prompt=lambda: __import__("core.assoc_bridge", fromlist=["load_pivot_prompt"]).load_pivot_prompt(),
 )
 
+# ── axis_probe: project one chat's replies onto the stored hidden-state axes ──
+# A forward-pass module (ModuleSpec.forward), not a generation: AVA_REWARD_LOOP.md §4.8.5
+# and §7 item 5 — "one text → per-layer projections, writes nothing". For every exchange
+# of the chosen chat it reads Ava's reply (and her CoT) through the same decoder-layer
+# hooks the live capture uses (`hidden_capture.forward_rows`), projects every token onto
+# every axis under `data/axes/`, and prints per axis the mean and peak z with the tokens
+# that peaked. Each reply is read twice — bare, and as her turn under the persona-empty
+# framing (`chat_prompt.txt` + `persona_undecided_prompt.txt` as the system message, the
+# user turn before it) — and both means are printed side by side: that pairing is P8,
+# the persona confound made visible before anyone trusts the blue channel on a live turn.
+# No axis files ⇒ `no_axes`, pointing at `extract_axes.py`.
+
+_PROBE_TOP_K = 5
+
+
+def _probe_persona_system() -> str:
+    parts = []
+    for name in ("chat_prompt.txt", "persona_undecided_prompt.txt"):
+        try:
+            p = _PROMPTS_DIR / name
+            if p.exists():
+                parts.append(p.read_text(encoding="utf-8").strip())
+        except Exception:
+            continue
+    return "\n\n".join(x for x in parts if x)
+
+
+def _find_subseq_end(hay: list, needle: list) -> Optional[int]:
+    """The shared locator (`hidden_capture.find_subseq`); kept under its old name for the
+    self-test."""
+    from core import hidden_capture as hc
+    return hc.find_subseq(hay, needle)
+
+
+def _axis_probe_forward(session: dict, meta: dict, on_stage) -> dict:
+    import numpy as np
+    from pathlib import Path as _P
+    from core import hidden_capture as hc
+    axes_dir = _CHATS_DIR.parent / hc.AXES_DIRNAME if _CHATS_DIR is not None else _P("data/axes")
+    axes = hc.load_axes(axes_dir, _runtime.model_id or "")
+    if not axes:
+        return {"skipped": "no_axes",
+                "message": f"No axis files under {axes_dir} for {_runtime.model_id!r} — run "
+                           f"`extract_axes.py` on the box (AVA_REWARD_LOOP.md §4.8)."}
+    model, tokenizer = _runtime.model, _runtime.tokenizer
+    text_tok = getattr(tokenizer, "tokenizer", tokenizer)
+    layers = sorted({a.layer for a in axes})
+    system = _probe_persona_system()
+    lines = ["axes: " + ", ".join(f"{a.name} (L{a.layer}, {a.baseline} baseline)" for a in axes),
+             "z = projection, z-scored against the axis file's baseline (live = framed neutral "
+             "chat turns; extraction = templated control sentences, a different format). "
+             "bare = the text alone; framed = as Ava's turn under the persona-empty prompt (P8).",
+             ""]
+    records = []
+    exchanges = session.get("exchanges") or []
+    for i, ex in enumerate(exchanges):
+        if not isinstance(ex, dict):
+            continue
+        on_stage(stage="probing", part=i + 1, parts=len(exchanges))
+        user = str(ex.get("user_prompt") or "")
+        for label, key in (("reply", "assistant_response"), ("cot", "assistant_cot")):
+            text = str(ex.get(key) or "").strip()
+            if not text:
+                continue
+            rows, ids = hc.forward_rows(model, tokenizer, text, layers, all_positions=True)
+            framed_rows = None
+            framed_slice = None
+            if label == "reply":
+                try:
+                    span = hc.reply_span_rows(model, tokenizer, system, user, text, layers)
+                    if span is not None:
+                        framed_rows = span
+                        framed_slice = slice(None)
+                except Exception as e:
+                    lines.append(f"  (framed reading failed: {type(e).__name__}: {e})")
+            for a in axes:
+                mat = rows.get(a.layer)
+                if mat is None or mat.shape[1] != a.vector.shape[0]:
+                    continue
+                z = ((mat.astype(np.float32) @ a.vector) - a.mean) / (a.std or 1.0)
+                order = np.argsort(-z)[:_PROBE_TOP_K]
+                peaks = "  ".join(
+                    f"«{text_tok.decode([ids[j]]).strip() or '·'}»{z[j]:+.1f}" for j in order)
+                framed_mean = None
+                if framed_rows is not None and framed_slice is not None and a.layer in framed_rows:
+                    fm = framed_rows[a.layer][framed_slice]
+                    if len(fm):
+                        framed_mean = float((((fm.astype(np.float32) @ a.vector) - a.mean) / (a.std or 1.0)).mean())
+                rec = {"exchange": i, "part": label, "axis": a.name, "layer": a.layer,
+                       "mean_z": float(z.mean()), "max_z": float(z.max()), "n_tokens": int(len(z)),
+                       "framed_mean_z": framed_mean}
+                records.append(rec)
+                framed_txt = (f"  framed {framed_mean:+.2f} (Δ {framed_mean - z.mean():+.2f})"
+                              if framed_mean is not None else "")
+                lines.append(f"ex {i + 1} {label:<5} {a.name:<8} bare mean {z.mean():+.2f} "
+                             f"peak {z.max():+.2f}{framed_txt}   peaks: {peaks}")
+        lines.append("")
+    return {"records": records, "count": len(records), "lines": lines,
+            "axes": [{"name": a.name, "layer": a.layer, "path": a.path} for a in axes]}
+
+
+def _axis_probe_build(session: dict, window: int, tokenizer) -> list:
+    """Never called — a forward-pass module has no generation. Kept so the spec shape
+    (and the registry self-test's `finish accepts context` check) hold for every module."""
+    return []
+
+
+def _axis_probe_finish(raws: list, *, truncated: bool, context: dict = None) -> dict:
+    return {"records": [], "count": 0, "lines": []}
+
+
+_AXIS_PROBE = ModuleSpec(
+    name="axis_probe",
+    label="Axis probe (hidden-state projections, no generation)",
+    prompt_file="",
+    max_new_tokens="0",
+    build=_axis_probe_build,
+    finish=_axis_probe_finish,
+    describe_output="Per exchange and axis: mean/peak z of Ava's reply (and CoT) tokens on each "
+                    "stored axis, bare vs persona-empty framing, with the peaking tokens. "
+                    "A forward pass; nothing is generated or written.",
+    source="chat",
+    forward=_axis_probe_forward,
+)
+
+
 MODULES: dict[str, ModuleSpec] = {
     _CHAT_FACTS.name: _CHAT_FACTS,
     _CHAT_SUMMARY.name: _CHAT_SUMMARY,
@@ -657,6 +789,7 @@ MODULES: dict[str, ModuleSpec] = {
     _FACT_FETCH.name: _FACT_FETCH,
     _ASSOC_FETCH.name: _ASSOC_FETCH,
     _ASSOC_PIVOT.name: _ASSOC_PIVOT,
+    _AXIS_PROBE.name: _AXIS_PROBE,
 }
 
 
@@ -838,6 +971,25 @@ def run_module_blocking(
             # Kept under the historical key: an empty input is the same refusal whatever
             # the lane, and only the sentence describing it is per-source.
             return {"skipped": "empty_session", "message": meta["empty_reason"]}
+
+        if spec.forward is not None:
+            # A forward-pass module: no prompt, no generation. See ModuleSpec.forward.
+            _stage(stage="reading", session=filename, units=meta["units"],
+                   unit_label=meta["unit_label"], exchanges=meta["units"])
+            activity_log.set_ambient_label(f"module:{spec.name}")
+            result = spec.forward(session, meta, _stage)
+            if result.get("skipped"):
+                return result
+            _stage(stage="parsed", count=int(result.get("count") or 0))
+            return {
+                "ok": True, "module": spec.name, "source": spec.source, "session": filename,
+                "units": meta["units"], "unit_label": meta["unit_label"],
+                "exchanges": meta["units"], "parts": 1, "raw": "",
+                **result,
+                "truncated": False, "stopped_on_loop": False, "cut_before_answer": False,
+                "input_tokens": None, "max_new_tokens": None, "context_length": None,
+                "written": False,
+            }
 
         system_prompt = (prompt or "").strip() or load_module_prompt(spec)
         if not system_prompt:
@@ -1032,7 +1184,11 @@ def _selftest() -> None:
 
     print("registry")
     check("the registry", sorted(MODULES),
-          ["assoc_fetch", "assoc_pivot", "chat_facts", "chat_summary", "fact_fetch", "til_facts"])
+          ["assoc_fetch", "assoc_pivot", "axis_probe", "chat_facts", "chat_summary", "fact_fetch",
+           "til_facts"])
+    check("axis_probe is a forward pass", MODULES["axis_probe"].forward is not None, True)
+    check("subsequence finder", _find_subseq_end([1, 2, 3, 4, 2, 3, 9], [2, 3]), 4)
+    check("subsequence finder miss", _find_subseq_end([1, 2], [7]), None)
     check("nothing injects yet",
           [s.injectables for s in MODULES.values()], [()] * len(MODULES))
     check("every module can render its own result without client help",

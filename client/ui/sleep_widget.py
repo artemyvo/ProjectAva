@@ -724,6 +724,7 @@ class SleepWidget(QWidget):
         "run_started",
         "session_started",
         "session_skipped",
+        "session_queued",
         "phase_started",
         "phase_progress",
         "phase_done",
@@ -2948,7 +2949,16 @@ class SleepWidget(QWidget):
                 "declined": "She decided not to raise anything this time.",
                 "truncated": "She ran past the token budget — before reaching a decision, "
                              "or mid-message after it. Nothing was written; the question "
-                             "is still in her pool (try again).",
+                             "stays in her pool but is held out of selection for 24 h, so "
+                             "the next attempt weighs a different one (raise "
+                             "outreach.max_new_tokens if this recurs).",
+                "opener_leak": "Reasoning markers survived into her message — nothing "
+                               "sent; the question is held out of selection for 24 h.",
+                "all_awaiting_reply": "Every candidate question is still waiting on an "
+                                      "answer to an opener she already sent.",
+                "all_recently_failed": "Every candidate question failed to be decided "
+                                       "within the last 24 h (token budget) and is held; "
+                                       "nothing to weigh until the hold lapses.",
                 "no_model": "No model loaded.",
                 "busy": "Another GPU job is in progress.",
                 "empty_ask": "The selected question was empty.",
@@ -3628,7 +3638,10 @@ class SleepWidget(QWidget):
             sampling = {
                 "temperature": effective_temperature,
                 "top_p": 0.95,   # Gemma 4 recommended (family top_k applied server-side)
-                "max_new_tokens_setting": "75%",
+                # No max_new_tokens_setting: a temperature change must not replace the
+                # server's bounded cap (its KV cache is pre-allocated for the whole
+                # budget; "75%" of a 60k window was 45k tokens per pass). Absent ⇒ the
+                # server's default cap, the same one an untouched temperature gets.
             }
             overrides["sleep_sampling"] = sampling
             overrides["revision_sampling"] = sampling
@@ -3791,7 +3804,10 @@ class SleepWidget(QWidget):
             sampling = {
                 "temperature": effective_temperature,
                 "top_p": 0.95,   # Gemma 4 recommended (family top_k applied server-side)
-                "max_new_tokens_setting": "75%",
+                # No max_new_tokens_setting: a temperature change must not replace the
+                # server's bounded cap (its KV cache is pre-allocated for the whole
+                # budget; "75%" of a 60k window was 45k tokens per pass). Absent ⇒ the
+                # server's default cap, the same one an untouched temperature gets.
             }
             overrides["sleep_sampling"] = sampling
 
@@ -3867,7 +3883,10 @@ class SleepWidget(QWidget):
             sampling = {
                 "temperature": effective_temperature,
                 "top_p": 0.95,   # Gemma 4 recommended (family top_k applied server-side)
-                "max_new_tokens_setting": "75%",
+                # No max_new_tokens_setting: a temperature change must not replace the
+                # server's bounded cap (its KV cache is pre-allocated for the whole
+                # budget; "75%" of a 60k window was 45k tokens per pass). Absent ⇒ the
+                # server's default cap, the same one an untouched temperature gets.
             }
             overrides["sleep_sampling"] = sampling
             overrides["revision_sampling"] = sampling

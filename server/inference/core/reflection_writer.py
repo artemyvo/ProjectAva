@@ -2144,11 +2144,17 @@ def write_revision_sidecar(
     run_id: str,
     live_session: Optional[str] = None,
     fallback_chats_dir: Optional[Path] = None,
+    why: str = "",
+    pass_info: Optional[dict] = None,
+    run_kind: str = "",
+    judgement_raw: str = "",
 ) -> None:
     """Persist verdict + target to the chat sidecar without importing server globals.
 
     Replaces the server-local ``_write_revision_sidecar`` so the runner can call
     it directly from the executor thread using the chats_dir it already owns.
+    `why` / `pass_info` / `run_kind` / `judgement_raw` go to the revisions ledger only
+    (`core.revision_ledger`): the sidecar record does not carry them.
     """
     if not isinstance(summary, dict):
         return
@@ -2170,6 +2176,7 @@ def write_revision_sidecar(
                 summary.get("target_generation") or anchor.get("target_generation") or ""),
             persona_context=str(anchor.get("persona_context") or ""),
             live_session=live_session,
+            why=why, pass_info=pass_info, run_kind=run_kind, judgement_raw=judgement_raw,
         )
     except Exception:
         pass

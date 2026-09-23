@@ -61,6 +61,7 @@ from core import branch_replay
 from core import reflection_service
 from core import encounter_run
 from core import background_reflection
+from core import hidden_capture
 
 # Proactive surfacing of open reflection questions into live chat (generation-only).
 _SURFACE_LIMIT = 2     # max questions Ava may raise at the start of a session
@@ -111,6 +112,8 @@ _read_token_economy: Callable = None
 _mark_activity: Callable = None
 _load_surface_template: Callable = None
 _CHATS_DIR: Any = None
+# Stored hidden-state directions (`data/axes/<name>.npz`), beside the chats root.
+_AXES_DIR: Optional[Path] = None
 _MEMORY_DIR: Any = None
 # Live-chat repetition penalty; resolved from server_config in server.main() and
 # passed in (1.0/None disables, leaving the halt-only stop_on_repeat guard).
@@ -152,7 +155,7 @@ def configure(*, send, backend, cancel_event, executor, get_rag, ensure_logger,
     """
     global _send, _backend, _cancel_event, _executor, _get_rag, _ensure_logger
     global _get_reflection_writer, _add_user_tokens, _read_token_economy, _mark_activity
-    global _load_surface_template, _CHATS_DIR, _MEMORY_DIR, _CHAT_REPETITION_PENALTY
+    global _load_surface_template, _CHATS_DIR, _MEMORY_DIR, _CHAT_REPETITION_PENALTY, _AXES_DIR
     global _CHAT_MIN_P, _DEGEN_KW
     _send = send
     _backend = backend
@@ -166,6 +169,7 @@ def configure(*, send, backend, cancel_event, executor, get_rag, ensure_logger,
     _mark_activity = mark_activity
     _load_surface_template = load_surface_template
     _CHATS_DIR = chats_dir
+    _AXES_DIR = Path(chats_dir).parent / hidden_capture.AXES_DIRNAME
     _MEMORY_DIR = memory_dir
     _CHAT_REPETITION_PENALTY = chat_repetition_penalty
     _CHAT_MIN_P = chat_min_p
@@ -1068,16 +1072,18 @@ def _sync_chat_generate(
 
     return _clean_response("".join(parts)), input_length
 
-def _think_close_markers(tokenizer) -> list:
+def _think_close_markers(tokenizer, model_id: Optional[str] = None) -> list:
     """Token-id sequences that close a thinking block, tried in order.
 
     Family-specific (see core/model_family.py): gemma-4 emits channel tokens
     (`<channel|>`) — and keeps `</think>` as a fallback — while Qwen/others use a
     literal `</think>`. Encoding a marker a model doesn't use yields tokens that
-    simply never match its stream, so an extra candidate is harmless.
+    simply never match its stream, so an extra candidate is harmless. `model_id`
+    names the family for a STORED series (Chat review decodes transcripts from a
+    model that may not be the loaded one); default is the loaded model.
     """
     text_tok = getattr(tokenizer, "tokenizer", tokenizer)
-    family = model_family.family_for(_runtime.model_id or "")
+    family = model_family.family_for(model_id or _runtime.model_id or "")
     markers = []
     for s in family.close_markers:
         try:
@@ -1108,47 +1114,70 @@ def _compute_tension_block(tokenizer, model_id: str, signals: Optional[dict]) ->
         model_id=model_id or "", raw_logits=True,
         token_ids=token_ids, decode=decode,
         top2_ids=signals.get("top2_ids"),
+        axes=signals.get("axes"),
     )
 
-def _token_spans(text_tok, ids: list, margins: list) -> list:
-    """Per-glyph-run ``[text, margin]`` for one token-id segment, for UI coloring.
+def _token_spans(text_tok, ids: list, margins: list,
+                 relief: Optional[list] = None, pain: Optional[list] = None) -> list:
+    """Per-glyph-run ``[text, margin, relief, pain]`` for one token-id segment.
+
+    The three channels of the chat colouring (AVA_REWARD_LOOP.md §7 item 1): red is
+    friction (1 − margin), green is relief (`tension.relief_series`, a z-score), blue
+    is the pain-axis projection (a z-score; ``None`` until an axis is captured — the
+    client renders a missing channel as zero, never as an error). Each channel is the
+    raw signal; the display mapping (threshold, gamma, gain) is the client's.
 
     Decodes incrementally with a sliding window (≈linear, not O(n²)) so a long CoT
     stays cheap. Special tokens are dropped; a multibyte character split across tokens
-    is attributed to the token that completes it, and a run takes the *worst* (lowest)
-    margin of the tokens that produced it — show the hottest moment, not an average.
+    is attributed to the token that completes it, and a run takes the *hottest* token
+    of those that produced it — lowest margin, largest relief, highest pain — not an
+    average: a run is a glyph, and the moment worth seeing is the extreme.
     """
     spans: list = []
     start = 0       # window start (token index)
     emitted = 0     # chars already emitted from the current window's decode
     worst = None    # lowest margin since the last emitted run (incl. deferred tokens)
+    best_r = None   # highest relief since the last emitted run
+    best_p = None   # highest pain since the last emitted run
     n = min(len(ids), len(margins))
     for i in range(n):
         m = float(margins[i])
         worst = m if worst is None else min(worst, m)
+        if relief is not None and i < len(relief):
+            r = float(relief[i])
+            best_r = r if best_r is None else max(best_r, r)
+        if pain is not None and i < len(pain):
+            p = float(pain[i])
+            best_p = p if best_p is None else max(best_p, p)
         try:
             text = text_tok.decode(ids[start:i + 1], skip_special_tokens=True)
         except Exception:
             text = ""
         if text.endswith("�"):
-            continue            # incomplete multibyte char — defer, keep accumulating worst
+            continue            # incomplete multibyte char — defer, keep accumulating
         piece = text[emitted:]
         emitted = len(text)
         if piece:
-            spans.append([piece, worst])
-        worst = None
+            spans.append([piece, worst, best_r, best_p])
+        worst = best_r = best_p = None
         # Slide the window only at a clean word boundary, so a fresh decode can't
         # misplace a leading space; keeps each decode short on long segments.
         if i - start >= 24 and (piece.endswith(" ") or piece.endswith("\n")):
             start, emitted = i + 1, 0
     return spans
 
-def _compute_tension_spans(tokenizer, signals: Optional[dict]) -> Optional[dict]:
-    """Decoded per-token ``[text, margin]`` spans for CoT and answer — live UI coloring.
+def _compute_tension_spans(tokenizer, signals: Optional[dict],
+                           model_id: Optional[str] = None) -> Optional[dict]:
+    """Decoded per-token ``[text, margin, relief, pain]`` spans for CoT and answer.
 
     Render-only: returned in the `done` payload, never stored in the chat log (the
-    stored tension block already carries token_ids + margins; the client just lacks a
-    tokenizer to decode them). margin in [0,1] — 1 = decisive (green), 0 = near-tie (red).
+    stored tension block already carries token_ids + margins + entropies; the client
+    just lacks a tokenizer to decode them, and relief is re-derivable from entropies).
+    margin in [0,1] — 1 = decisive (grey), 0 = near-tie (red). relief is the causal
+    z-score of the entropy drop, computed over the WHOLE generation before the CoT /
+    answer split so the answer's baseline includes the thinking that preceded it.
+    pain is the per-token axis projection when the capture provides one (`signals["pain"]`,
+    AVA_REWARD_LOOP.md §4.8), else absent.
     """
     if not signals:
         return None
@@ -1157,16 +1186,87 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict]) -> Optional[dict]
     margins = signals.get("margins")
     if not token_ids or not margins:
         return None
+    entropies = signals.get("entropies") or []
+    relief = tension.relief_series(entropies) if len(entropies) == len(token_ids) else None
+    # The blue channel: the per-token projection onto an axis named `pain` — live from
+    # the capture (`signals["axes"]`, hidden_capture), stored under the block's `axes`.
+    pain = signals.get("pain")
+    if pain is None:
+        pain = (signals.get("axes") or {}).get("pain")
+    if pain is not None and len(pain) != len(token_ids):
+        pain = None
     text_tok = getattr(tokenizer, "tokenizer", tokenizer)
-    answer_start = tension.find_think_end(token_ids, _think_close_markers(tokenizer))
+    answer_start = tension.find_think_end(
+        token_ids, _think_close_markers(tokenizer, model_id))
+
+    def _cut(series, lo, hi):
+        return None if series is None else series[lo:hi]
+
     if answer_start is None or answer_start <= 0:
         cot = None
-        ans_ids, ans_m = token_ids, margins
+        lo = 0
     else:
-        answer_start = min(answer_start, len(token_ids))
-        cot = _token_spans(text_tok, token_ids[:answer_start], margins[:answer_start])
-        ans_ids, ans_m = token_ids[answer_start:], margins[answer_start:]
-    return {"cot": cot, "answer": _token_spans(text_tok, ans_ids, ans_m)}
+        lo = min(answer_start, len(token_ids))
+        cot = _token_spans(text_tok, token_ids[:lo], margins[:lo],
+                           _cut(relief, 0, lo), _cut(pain, 0, lo))
+    n = len(token_ids)
+    answer = _token_spans(text_tok, token_ids[lo:], margins[lo:],
+                          _cut(relief, lo, n), _cut(pain, lo, n))
+    return {"cot": cot, "answer": answer}
+
+# Text-only tokenizers loaded by id for decoding STORED token series (Chat review),
+# keyed by the model id recorded in the transcript's tension block. None is cached
+# too: a model whose tokenizer is not on this box is asked for once, not per chat.
+_STORED_TOKENIZERS: dict = {}
+
+
+def _tokenizer_for(model_id: str):
+    """The loaded tokenizer when it matches `model_id` (or the block names none), else
+    a tokenizer loaded by id — offline first, Hub as the fallback (SPARK_LOADING.md:
+    skipping the Hub is an optimization, never why a load fails). Cached per id."""
+    mid = (model_id or "").strip()
+    if _runtime.tokenizer is not None and (not mid or mid == (_runtime.model_id or "")):
+        return _runtime.tokenizer
+    if not mid:
+        return None
+    if mid in _STORED_TOKENIZERS:
+        return _STORED_TOKENIZERS[mid]
+    tok = None
+    try:
+        from transformers import AutoTokenizer
+        try:
+            tok = AutoTokenizer.from_pretrained(mid, local_files_only=True)
+        except Exception:
+            tok = AutoTokenizer.from_pretrained(mid)
+    except Exception as e:
+        print(f"[review] no tokenizer for {mid!r}: {e}")
+        tok = None
+    _STORED_TOKENIZERS[mid] = tok
+    return tok
+
+
+def stored_tension_spans(tension_block) -> Optional[dict]:
+    """``[text, margin, relief, pain]`` spans for a transcript's STORED tension block.
+
+    The Chat review tab's colouring (AVA_REWARD_LOOP.md §7 item 2): the same three
+    channels the Chat tab paints live, re-derived from the `token_ids` / `margins` /
+    `entropies` every transcript keeps — the client has no tokenizer, so the decode
+    happens here, on `get_session`. Nothing is written back. Blocking (a tokenizer
+    load on first use, then ≈linear decoding per exchange): call off the event loop.
+    None when the block has no series or no tokenizer can be found for its model.
+    """
+    if not isinstance(tension_block, dict) or not tension_block.get("token_ids"):
+        return None
+    mid = str(tension_block.get("model_id") or "")
+    tok = _tokenizer_for(mid)
+    if tok is None:
+        return None
+    try:
+        return _compute_tension_spans(tok, tension_block, model_id=mid or None)
+    except Exception as e:
+        print(f"[review] stored spans failed: {e}")
+        return None
+
 
 def _identity_line(speaker: str) -> str:
     """System-prompt line telling Ava who is speaking with her right now."""
@@ -2335,11 +2435,18 @@ async def _preempt_background_reflection() -> None:
     reflection generation aborts within roughly one step. We poll its occupancy flag with a
     short ceiling; if it somehow does not clear, the caller proceeds anyway and simply
     queues behind it on the single executor thread."""
-    if not background_reflection.is_active():
+    from core import prompt_rewrite
+    if not background_reflection.is_active() and not prompt_rewrite.is_active():
         return
-    background_reflection.request_preempt()
+    # The prompt-rewrite event (core.prompt_rewrite) is the other preemptible GPU owner:
+    # an hour of drafts that resume from the last completed one, so a user turn costs it
+    # at most one generation. Same mechanism — its flag + the shared cancel event.
+    if background_reflection.is_active():
+        background_reflection.request_preempt()
+    if prompt_rewrite.is_active():
+        prompt_rewrite.request_preempt()
     for _ in range(100):   # ~10s ceiling; a cancel normally frees within a step
-        if not background_reflection.is_active():
+        if not background_reflection.is_active() and not prompt_rewrite.is_active():
             break
         await asyncio.sleep(0.1)
 
@@ -2352,11 +2459,16 @@ def _preempt_background_reflection_sync(timeout_s: float = 10.0) -> None:
     an interactive request queues behind a background per-chat reflection for as long as
     that chat takes, while an equivalent UI turn preempts it in about a second. Must be
     called BEFORE submitting to ``_executor``: the reflection holds that single worker."""
-    if not background_reflection.is_active():
+    from core import prompt_rewrite
+    if not background_reflection.is_active() and not prompt_rewrite.is_active():
         return
-    background_reflection.request_preempt()
+    if background_reflection.is_active():
+        background_reflection.request_preempt()
+    if prompt_rewrite.is_active():
+        prompt_rewrite.request_preempt()
     deadline = time.time() + timeout_s
-    while background_reflection.is_active() and time.time() < deadline:
+    while ((background_reflection.is_active() or prompt_rewrite.is_active())
+           and time.time() < deadline):
         time.sleep(0.1)
 
 
@@ -2373,6 +2485,7 @@ async def _run_generation(
     apply_early_stop: bool = True,
     clean_fn=None,
     capture_tension: bool = False,
+    capture_hidden: Optional[dict] = None,
     exchange_id: Optional[str] = None,
 ) -> tuple[bool, str, Optional[dict], int]:
     """Run inference for *conversation*. Returns (success, cleaned_response, tension, input_tokens).
@@ -2383,6 +2496,10 @@ async def _run_generation(
     capture_tension: when True, summarize per-token signals into a tension block;
         the block is attached to the `done` payload and returned to the caller so
         chat-side rendering and chat logging both see the same numbers.
+    capture_hidden: a `hidden_capture.capture_spec` (live chat only) — decoder-layer
+        residuals + per-token axis projections; the projections join the tension block
+        (`axes`) and the spans (blue channel), the residuals are left on
+        `_backend.last_hidden_capture` for the caller to write beside the transcript.
     """
     # Background per-chat reflection is the ONE GPU owner a user chat PREEMPTS rather than
     # is refused by: the user came back, so hand the GPU to them (a half-reflected chat is
@@ -2472,6 +2589,7 @@ async def _run_generation(
                 top_p=top_p,
                 debug=(lambda m: chunk_queue.put(("log", m))) if debug else None,
                 capture_tension=capture_tension,
+                capture_hidden=capture_hidden,
                 # Pair with the think_prefill applied above: guarantee a non-empty CoT
                 # by masking the channel-close for the family's minimum thought length.
                 min_think_tokens=fam.min_think_tokens,
@@ -2576,12 +2694,14 @@ async def _run_generation(
                 tension_spans = None
                 think_open_prob = None
                 if capture_tension:
-                    tension_block = _compute_tension_block(
-                        tokenizer, model_id, _backend.last_token_signals
-                    )
-                    tension_spans = _compute_tension_spans(
-                        tokenizer, _backend.last_token_signals
-                    )
+                    signals = _backend.last_token_signals
+                    hidden = _backend.last_hidden_capture if capture_hidden else None
+                    if signals and hidden and hidden.get("axes"):
+                        # Per-token axis projections join the logit signals: stored in
+                        # the block under `axes`, painted as the blue channel.
+                        signals = dict(signals, axes=hidden["axes"])
+                    tension_block = _compute_tension_block(tokenizer, model_id, signals)
+                    tension_spans = _compute_tension_spans(tokenizer, signals)
                     # First-step probability the model put on opening a thinking block
                     # (gemma-4 `<|channel>`) — the "Thinking: NN%" CoT diagnostic.
                     think_open_prob = _backend.last_think_open_prob
@@ -2808,12 +2928,25 @@ async def handle_generate(ws, msg: dict, msg_queue: asyncio.Queue) -> None:
             "sessions": list(fetched.get("sessions") or []),
         })
 
+    # Hidden-state capture spec for this turn (None when off / no decoder stack):
+    # Track B Stage 0, AVA_REWARD_LOOP.md §4.2. Telemetry — never a reason a turn fails.
+    try:
+        hidden_spec = hidden_capture.capture_spec(
+            _runtime.model, _runtime.model_id or "", _AXES_DIR)
+    except Exception as e:
+        print(f"[hidden] capture spec failed: {e}")
+        hidden_spec = None
+
     success, response, tension, input_tokens = await _run_generation(
         ws, msg_queue, inference_conversation,
         max_new_tokens_setting, context_length, temperature, top_p, debug,
         capture_tension=True,
+        capture_hidden=hidden_spec,
         exchange_id=exchange_id,
     )
+    # Taken before any other await: the backend's slot is overwritten by the next
+    # generation, and a background job may start one the moment this turn is over.
+    hidden = _backend.last_hidden_capture if (success and hidden_spec) else None
 
     if success:
         _, context_content = ChatLogger._parse_cot(response)
@@ -2829,6 +2962,23 @@ async def handle_generate(ws, msg: dict, msg_queue: asyncio.Queue) -> None:
             think_open_prob=_backend.last_think_open_prob,
             exchange_id=exchange_id,
         )
+        # The residuals go beside the transcript (`<ts>.hidden.npz`, append-only), off
+        # the loop: a few MB of fp16 per exchange. Best-effort — telemetry.
+        if hidden and logger.current_file is not None:
+            _hidden_path = logger.current_file
+            _hidden_cap = hidden
+            _hidden_spec = hidden_spec
+
+            def _write_hidden():
+                return hidden_capture.write_sidecar(
+                    _hidden_path, exchange_id, _hidden_cap,
+                    model_id=_runtime.model_id or "", adapter_id=_runtime.adapter_id,
+                    layer_spec=str(_hidden_spec.get("layer_spec") or ""),
+                )
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _write_hidden)
+            except Exception as e:
+                print(f"[hidden] sidecar write failed: {e}")
         # Running user-token tally (token-economy metric): count only this live
         # turn's user message; historical chats are never backfilled.
         _add_user_tokens(user_message, _runtime.tokenizer)
@@ -3156,10 +3306,14 @@ def _regenerate_exchange_sync(
         msg = f"Generation failed: {e}"
         if swap_adapter and _runtime.model is None:
             # The swap failed AND the fallback restore inside swap_model failed too —
-            # the box has no model. The tab must say that outright: the next thing the
-            # operator does is reload from the Chat tab, not retry here.
+            # the box has no model. The tab must say that outright, and name what the
+            # model-loss hook did about it (a watchdog restart onto the configured
+            # adapter, normally): the next thing the operator does is reconnect once
+            # the model reloads, not retry here.
+            loss = agentic.last_model_loss() or {}
             msg += (" — the adapter swap failed and restoring the previous model also "
-                    "failed, so NO model is loaded now. Reload from the Chat tab.")
+                    "failed, so NO model is loaded now. "
+                    + (loss.get("recovery") or "Reload from the Chat tab."))
         return {"ok": False, "error": msg}
 
     cancelled = bool(_cancel_event is not None and _cancel_event.is_set())

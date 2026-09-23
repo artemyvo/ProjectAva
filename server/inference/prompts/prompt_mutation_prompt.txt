@@ -1,6 +1,8 @@
-You are re-reading one of your own past exchanges — one your revision pass already flagged as not quite yours. This is not a chat. The user is not here, and you are not answering them. You are alone with a reply that drifted, asking a single, different question about it.
+You are re-reading one of your own past exchanges. This is not a chat. The user is not here, and you are not answering them. You are alone with one of your own replies, asking a single, different question about it.
 
-Not "what should I have said?" — your revision already answered that. The question here is one level up: **would I have answered as the better me on my own, if my standing prompt had said something it does not currently say?** And if so — what would it need to say?
+{locator}
+
+Not "what should I have said?" — that is the revision pass's question. The question here is one level up: **would I have answered as the better me on my own, if my standing prompt had said something it does not currently say?** And if so — what would it need to say?
 
 Your standing prompt is the set of instructions you carry into every conversation, before any of it begins. It is the part of you that is stated rather than learned. Here is what it says right now:
 

@@ -124,22 +124,34 @@ def fold_checkpoint_to_live(data_dir: Path, inference_dir: Path) -> dict:
     live_consolidation_dir = data_dir / "hot" / "consolidation"
     live_chats_dir.mkdir(parents=True, exist_ok=True)
 
-    sidecars = 0
-    for sp in _iter_chat_products(ckpt["chats_dir"]):
-        lp = live_chats_dir / sp.name
-        # Reflect-once: never clobber a chat already frozen live. Keyed on the STATE
-        # sidecar for all three products — if this chat was fully reflected live since
-        # the checkpoint was written, the checkpoint's whole view of it is stale, and
-        # promoting its summary over the newer one would undo that run.
+    # Reflect-once: never clobber a chat already frozen live. Keyed on the STATE
+    # sidecar for all three products — if this chat was fully reflected live since the
+    # checkpoint was written, the checkpoint's whole view of it is stale, and promoting
+    # its summary over the newer one would undo that run. The decision is made ONCE per
+    # stem, BEFORE any file moves: `_iter_chat_products` yields every .state.json first,
+    # so deciding per file saw the state sidecar it had just copied (a checkpointed one
+    # carries `reflected_at`) and skipped that same chat's .summary.json and .facts.json
+    # — the gist and protocol of every recovered chat were lost, and the checkpoint was
+    # then discarded (2026-09-21).
+    products = list(_iter_chat_products(ckpt["chats_dir"]))
+    frozen_live: set = set()
+    for sp in products:
         stem = sp.name.split(".", 1)[0]
+        if stem in frozen_live:
+            continue
         live_state = live_chats_dir / f"{stem}.state.json"
         if live_state.exists():
             try:
                 if json.loads(live_state.read_text(encoding="utf-8")).get("reflected_at"):
-                    continue
+                    frozen_live.add(stem)
             except Exception:
                 pass
-        shutil.copy2(sp, lp)
+
+    sidecars = 0
+    for sp in products:
+        if sp.name.split(".", 1)[0] in frozen_live:
+            continue
+        shutil.copy2(sp, live_chats_dir / sp.name)
         sidecars += 1
 
     rag_lines = append_file_to_file(
@@ -514,7 +526,7 @@ def run_stage_apply(data_dir: Path, inference_dir: Path, server_dir: Path) -> di
         os.rename(candidate_dir, new_adapter_id)
 
         # Update config
-        from reflections_path import load_server_config, save_server_config
+        from training.reflections_path import load_server_config, save_server_config
         config = load_server_config()
         config["adapter_id"] = str(new_adapter_id)
         save_server_config(config)

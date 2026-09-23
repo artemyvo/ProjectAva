@@ -40,7 +40,10 @@ from typing import Optional
 # The episode kinds — one per subsystem that closes a meaningful unit of activity. Unknown
 # kinds are coerced to "conversation" so a typo never silently drops an entry.
 _KINDS = {"conversation", "wander", "outreach", "synthesis", "checkin",
-          "reflection", "encounter"}
+          "reflection", "encounter", "aha", "pivot",
+          # `prompt`: she rewrote (or weighed rewriting) her standing prompt —
+          # core.prompt_rewrite; a changed rewrite OPENS a thread the next one closes.
+          "prompt"}
 
 _lock = threading.Lock()
 _entries: list[dict] = []      # full history in memory (durable memory, NOT a bounded ring)

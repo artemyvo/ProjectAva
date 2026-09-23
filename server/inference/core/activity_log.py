@@ -416,11 +416,14 @@ def end_pass(pass_id: str, *, text: str = "", tokens: int = 0, **detail) -> None
         return
     elapsed = time.monotonic() - st["started"]
     label = st["label"]
+    # Both halts end on a non-EOS token, so `truncated` is True for them too; the halt is
+    # the more specific fact and the one that names a cause. Naming both sent the reader
+    # after a budget that was never the problem (a loop halt at 791 of 12288 tokens).
     flags = []
-    if detail.get("truncated"):
-        flags.append("hit the token cap")
     if detail.get("stopped_on_loop"):
         flags.append("halted on the loop guard")
+    elif detail.get("truncated"):
+        flags.append("hit the token cap")
     suffix = f" — {', '.join(flags)}" if flags else ""
     append(st["source"], "result",
            f"{label}: produced {len(body)} chars in {int(elapsed)}s{suffix}",
@@ -724,6 +727,11 @@ def _selftest() -> None:
         assert body["text"].endswith("y"), "the TAIL of a generation must survive"
         assert "hit the token cap" in body["message"]
         assert pid not in _passes, "end_pass must release the pass"
+        # A loop halt is reported as the halt, never as a cap hit (truncated is set too).
+        pid_l = begin_pass("looped")
+        end_pass(pid_l, text="z" * 20, tokens=5, truncated=True, stopped_on_loop=True)
+        assert "halted on the loop guard" in _events[-1]["message"]
+        assert "token cap" not in _events[-1]["message"]
 
         # a pass that produced nothing writes no body, but is still released
         pid2 = begin_pass("empty")

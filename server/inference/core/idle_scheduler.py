@@ -93,7 +93,11 @@ class IdleJob:
     #: generic "<name> finished". Skips/errors are phrased generically from their reason.
     describe: Optional[Callable[[dict], str]] = None
     #: monotonic timestamp of the last run that counted; 0.0 == never run
-    _last_ran: float = field(default=0.0, repr=False)
+    #: -inf, not 0.0: `time.monotonic()` is seconds since BOOT on Linux and near zero at
+    #: process start on macOS, so a 0.0 default read as "ran just now" on a box up
+    #: for less than one interval — every hourly job's first wake waited out the
+    #: remainder of that hour after a reboot, and the self-test failed on a Mac.
+    _last_ran: float = field(default=float("-inf"), repr=False)
 
 
 # ── module state ────────────────────────────────────────────────────────────────
@@ -149,6 +153,14 @@ def mark_activity() -> None:
     generation a job does while processing its own event never counts as user activity."""
     global _last_activity
     _last_activity = time.monotonic()
+
+
+def seconds_idle() -> float:
+    """Seconds since the last *real* activity (see :func:`mark_activity`). For a job's
+    ``ready`` gate that wants a second, longer idle window under some box condition —
+    e.g. "wait an hour while a client is connected, five minutes otherwise" — where the
+    static ``idle_seconds`` can express only one."""
+    return time.monotonic() - _last_activity
 
 
 def gpu_busy() -> bool:
@@ -463,7 +475,7 @@ def _selftest() -> None:
         assert not _job_idle_ok(j), "fresh activity should fail the 1s default window"
         assert _job_idle_ok(IdleJob("fast", 1.0, run=lambda: {}, idle_seconds=0.0)), \
             "idle_seconds=0 should ignore the shared idle window"
-        _last_activity = 0.0
+        _last_activity = float("-inf")   # "idle forever", whatever the clock's epoch
 
         # host_busy reflects both the GPU lock and the external predicate.
         _gpu_lock = None
@@ -503,7 +515,7 @@ def _selftest() -> None:
             assert a._last_ran > 0 and b._last_ran > 0, "both must advance their clocks"
             assert not _gpu_lock_handle().locked(), "lock must be released after dispatch"
 
-        _last_activity = 0.0
+        _last_activity = float("-inf")   # "idle forever", whatever the clock's epoch
         asyncio.run(_drive())
         assert not unlocked, f"jobs must only run under the GPU lock; {unlocked} did not"
 

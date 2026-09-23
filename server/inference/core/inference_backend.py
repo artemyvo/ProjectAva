@@ -37,8 +37,18 @@ os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 # and never alters a single sampled token. The n-gram window also catches loops
 # whose separator increments ("Note 2:", "Note 3:", …): the invariant span inside
 # the repeated body still recurs identically even though the full period varies.
+#
+# 8 repeats since 2026-09-22 (was 4). Four is what a DRAFTING pass produces on purpose:
+# outreach's decision CoT wrote "Draft 2", "Draft 3", a checked final OPENER inside its
+# <think>, then closed the channel and restated the OPENER for real — the same 12-token
+# run of the message four times, each separated by a hundred tokens of fresh critique —
+# and the guard cut the fourth off mid-word at 791 of 12288 tokens. The journal then
+# called it "hit the token cap" (a non-EOS stop looks the same), which is the wrong
+# knob to reach for. A genuine runaway repeats its span dozens of times to context
+# exhaustion, so the extra four periods it now runs before the halt cost a few hundred
+# tokens once; a draft→critique→restate CoT gets the room it needs every time.
 _LOOP_NGRAM = 12
-_LOOP_MIN_REPEATS = 4
+_LOOP_MIN_REPEATS = 8
 
 
 def detect_ngram_loop(gen_ids: list, ngram: int = _LOOP_NGRAM,
@@ -217,6 +227,21 @@ def _wants_fast_model(model_id: str) -> bool:
     return any(k in mid for k in ("qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6", "gemma-4"))
 
 
+def _is_hub_offline_error(exc: BaseException) -> bool:
+    """True when a load failed because a file was missing from the local HF cache while
+    Hub access was disabled — i.e. exactly what ``fast_load``'s offline optimization can
+    cause, and nothing else. Walks the cause/context chain, since transformers re-raises
+    huggingface_hub's ``LocalEntryNotFoundError`` as a bare ``OSError``."""
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ in ("LocalEntryNotFoundError", "OfflineModeIsEnabled"):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _stage_adapter_with_base(adapter_id: str, base_model_id: str) -> str:
     """Stage a throwaway copy of a LoRA adapter dir whose base is `base_model_id`.
 
@@ -310,6 +335,11 @@ class UnslothBackend(InferenceBackend):
     # (gemma-4 `<|channel>`) — the "Thinking: NN%" diagnostic. None when the family
     # has no sampled opener (qwen3 prefills it) or the marker doesn't resolve.
     last_think_open_prob: Optional[float] = None
+    # Populated by stream_generate when capture_hidden is given (a spec from
+    # core.hidden_capture.capture_spec): the reduced residual-stream capture for the
+    # exchange just generated — positions, per-layer fp16 residuals, per-token axis
+    # projections. Read by the server right after generation, like last_token_signals.
+    last_hidden_capture: Optional[dict] = None
     _lm_head_cache: Optional[tuple] = None
     # Monotonic timestamp per generated token (appended by the lm-head hook in
     # stream_generate, one call per token), reset at the start of each generation.
@@ -463,17 +493,37 @@ class UnslothBackend(InferenceBackend):
             # straight from file-backed pages on GB10) and skip Hub round trips for
             # a model that is already on disk. See core/fast_load.py.
             fast = fast_load.install()
+            # head_dim>256 GQA layers (Gemma-4 global) off SDPA's math backend.
+            from core import sdpa_gqa
+            gqa = sdpa_gqa.install()
             print(f"[load] {unified_memory.describe()} placement={placement_kw or 'default'} "
-                  f"fast_load={fast}", flush=True)
+                  f"fast_load={fast} sdpa_gqa={gqa}", flush=True)
             if unified_memory.is_unified_memory() and not fast:
                 print("!!! FAST LOAD NOT ACTIVE on a unified-memory box: expect this load to take "
                       "minutes, not seconds (mmap->device copies at ~0.16 GB/s). See SPARK_LOADING.md.",
                       flush=True)
-            with fast_load.hf_offline_if_cached(load_name) as off:
-                print(f"[load] hf_offline={off.active}", flush=True)
-                model, tokenizer = _Loader.from_pretrained(
+            def _from_pretrained():
+                return _Loader.from_pretrained(
                     model_name=load_name, max_seq_length=context_length, **quant_kw, **placement_kw,
                 )
+
+            guard = fast_load.hf_offline_if_cached(load_name)
+            try:
+                with guard as off:
+                    print(f"[load] hf_offline={off.active}", flush=True)
+                    model, tokenizer = _from_pretrained()
+            except Exception as exc:
+                # Skipping Hub round trips is an OPTIMIZATION and must never be the reason
+                # a load fails. The pre-check can only see what it is pointed at, and the
+                # loader resolves more than that behind its back — an adapter's base, and
+                # unsloth's bnb-4bit twin of a named repo — so a file it did not know to
+                # look for can be missing while offline is on. Retry online once (2026-09-21:
+                # a cleared HF cache left the box refusing to download its own base model).
+                if not (guard.active and _is_hub_offline_error(exc)):
+                    raise
+                print(f"[load] offline resolve failed ({type(exc).__name__}); retrying with Hub "
+                      f"access — something this load needs is not on disk", flush=True)
+                model, tokenizer = _from_pretrained()
         finally:
             if staged_dir is not None:
                 import shutil
@@ -495,9 +545,11 @@ class UnslothBackend(InferenceBackend):
     def _assert_fully_materialized(cls, model: Any) -> None:
         """Refuse a model accelerate has offloaded to cpu/disk (or left on meta).
 
-        Nothing in this project passes ``device_map``/``max_memory``, so when free VRAM
-        is short at load time accelerate decides on its own to dispatch part of the model
-        off-GPU and installs ``AlignDevicesHook``s over it. That load SUCCEEDS — the
+        Wherever the loader plans its own placement (a multi-GPU box, or a discrete GPU
+        with ``AVA_LOAD_PLACEMENT=planner``; a single-GPU box is pinned to device 0 since
+        2026-09-17 — see ``core.unified_memory.load_kwargs``), free VRAM short at load
+        time makes accelerate dispatch part of the model off-GPU on its own and install
+        ``AlignDevicesHook``s over it. That load SUCCEEDS — the
         failure surfaces much later, on the first forward, as
 
             NotImplementedError: Cannot copy out of meta tensor; no data!
@@ -938,6 +990,7 @@ class UnslothBackend(InferenceBackend):
         debug: Optional[Callable[[str], None]] = None,
         capture_tension: bool = False,
         top_k: Optional[int] = None,
+        capture_hidden: Optional[dict] = None,
         repetition_penalty: Optional[float] = None,
         no_repeat_ngram_size: Optional[int] = None,
         stop_on_repeat: bool = False,
@@ -1343,6 +1396,7 @@ class UnslothBackend(InferenceBackend):
             # to per-segment stats happens server-side after the stream completes.
             self.last_token_signals = None
             self.last_think_open_prob = None
+            self.last_hidden_capture = None
             self.last_generation_truncated = None
             n_prompt = inputs["input_ids"].shape[1]
             tension_sig: list = []
@@ -1377,6 +1431,41 @@ class UnslothBackend(InferenceBackend):
                         open_probs.append(op)
 
                 lm_hook = lm_head.register_forward_hook(_lm_hook)
+
+            # Hidden-state capture (optional; live chat only): a forward hook on each
+            # decoder layer in the spec keeps that step's last-position residual on
+            # device — a clone, since fused kernels may reuse the layer's output buffer.
+            # Reduced to a few stored positions + per-token axis projections after the
+            # stream ends (core.hidden_capture.reduce_capture); nothing is read back
+            # into generation. Cost: one slice + clone per layer per token.
+            hidden_hooks: list = []
+            hidden_rows: dict = {}
+            if capture_hidden:
+                layers_mod = capture_hidden.get("layers_module")
+                gen_kwargs["return_dict_in_generate"] = True
+
+                def _make_hidden_hook(rows: list):
+                    def _hidden_hook(module, _inp, out):
+                        h = out[0] if isinstance(out, tuple) else out
+                        if h is None or not hasattr(h, "dim"):
+                            return
+                        if h.dim() == 3:
+                            row = h[0, -1, :]
+                        elif h.dim() == 2:
+                            row = h[-1, :]
+                        else:
+                            row = h.reshape(-1)
+                        rows.append(row.detach().clone())
+                    return _hidden_hook
+
+                for li in capture_hidden.get("hook_layers") or []:
+                    try:
+                        layer = layers_mod[li]
+                    except Exception:
+                        continue
+                    rows: list = []
+                    hidden_rows[int(li)] = rows
+                    hidden_hooks.append(layer.register_forward_hook(_make_hidden_hook(rows)))
 
             exc_holder: dict = {}
 
@@ -1424,6 +1513,11 @@ class UnslothBackend(InferenceBackend):
                 thread.join()
                 if lm_hook is not None:
                     lm_hook.remove()
+                for h in hidden_hooks:
+                    try:
+                        h.remove()
+                    except Exception:
+                        pass
                 self.last_tokens_per_sec = self._compute_tokens_per_sec()
                 if capture_tension:
                     self.last_token_signals = self._reduce_tension(
@@ -1432,6 +1526,11 @@ class UnslothBackend(InferenceBackend):
                     self.last_think_open_prob = self._first_open_prob(
                         exc_holder.get("out"), open_probs, n_prompt
                     )
+                if capture_hidden and hidden_rows:
+                    self.last_hidden_capture = self._reduce_hidden(
+                        exc_holder.get("out"), hidden_rows, n_prompt, tokenizer, capture_hidden
+                    )
+                    hidden_rows.clear()   # release the device rows
                 self.last_generation_truncated = self._was_truncated(
                     exc_holder.get("out"), stop_ids, closed_early, streamer_timed_out
                 )
@@ -1559,6 +1658,36 @@ class UnslothBackend(InferenceBackend):
         except Exception:
             return None
 
+    def _reduce_hidden(self, out: Any, rows: dict, n_prompt: int, tokenizer: Any,
+                       spec: dict) -> Optional[dict]:
+        """Reduce the decoder-layer hooks' rows to the stored capture (host side).
+
+        Same alignment rule as ``_reduce_tension``: a layer's row count must be an exact
+        multiple of the generated-token count or that layer is dropped. Any failure
+        yields None — the capture is telemetry and must never fail a turn."""
+        if out is None or not rows:
+            return None
+        try:
+            gen_ids = out.sequences[0, n_prompt:].tolist()
+        except Exception:
+            return None
+        try:
+            from core import hidden_capture
+            text_tok = getattr(tokenizer, "tokenizer", tokenizer)
+
+            def _decode(ids):
+                return text_tok.decode(list(ids))
+
+            return hidden_capture.reduce_capture(
+                gen_ids, rows, _decode,
+                store_layers=spec.get("store_layers") or [],
+                axes=spec.get("axes") or [],
+                max_positions=int(spec.get("max_positions") or hidden_capture.DEFAULT_MAX_POSITIONS),
+            )
+        except Exception as e:
+            print(f"[hidden] capture reduce failed: {e}")
+            return None
+
     def _reduce_tension(self, out: Any, signals: list, n_prompt: int) -> Optional[dict]:
         """Dedup the per-token signals against the generated tokens and bulk-sync.
 
@@ -1607,6 +1736,17 @@ if __name__ == "__main__":
     phrase = list(range(300, 314))
     assert not detect_ngram_loop(list(range(0, 50)) + phrase + list(range(60, 120)) + phrase), \
         "false positive on a phrase quoted twice"
+    # A drafting CoT: the same opener restated several times, each time after a run of
+    # fresh critique (drafts, a checklist, the closed-think restatement). Not a loop.
+    drafted = []
+    for k in range(5):
+        drafted += list(range(1000 * (k + 1), 1000 * (k + 1) + 90)) + phrase
+    assert not detect_ngram_loop(drafted), "false positive on a draft-and-restate CoT"
+    # ...but the same phrase past the threshold, however spaced, still is.
+    looped = []
+    for k in range(_LOOP_MIN_REPEATS):
+        looped += list(range(1000 * (k + 1), 1000 * (k + 1) + 90)) + phrase
+    assert detect_ngram_loop(looped), "spaced loop at the threshold missed"
     print("inference_backend repetition-detector self-test: OK")
 
     # detect_degeneration: the drifting-collapse guard the verbatim detector misses.

@@ -1804,7 +1804,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     # the inference package root — same two locations inference_backend purges.
     _purge_unsloth_compile_cache()
     from core.inference_backend import _wants_fast_model
-    from core import unified_memory, fast_load, moe_bnb_experts
+    from core import unified_memory, fast_load, moe_bnb_experts, sdpa_gqa
     # Same loader-class rule as inference_backend.load: FastModel for a
     # *ForConditionalGeneration checkpoint (gemma-4, Qwen3.5 incl. its text-only MoE
     # sizes), FastLanguageModel for a plain causal LM (qwen3, gpt-oss).
@@ -1836,8 +1836,12 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     _placement_kw = unified_memory.load_kwargs()
     _fast = fast_load.install()
     _moe_swap = moe_bnb_experts.install_if_needed(model_id)
+    # Gemma-4's head_dim-512 global layers: enable_gqa forces SDPA's math backend (an
+    # fp32 32 x L^2 score matrix, 4.87 GiB at 6388 tokens — the step-2 OOM of runs
+    # 20260923_003453 / _090623). Repeat K/V instead so mem-efficient runs.
+    _gqa = sdpa_gqa.install()
     print(f"[load] {unified_memory.describe()} placement={_placement_kw or 'default'} "
-          f"fast_load={_fast} perexpert_moe={_moe_swap}", flush=True)
+          f"fast_load={_fast} perexpert_moe={_moe_swap} sdpa_gqa={_gqa}", flush=True)
     with fast_load.hf_offline_if_cached(model_id):
         model, tokenizer = _Fast.from_pretrained(
             model_name=model_id, max_seq_length=context_length, load_in_4bit=True,
@@ -2130,6 +2134,21 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
             self.lr_scheduler = LambdaLR(opt, lr_lambda)
             return self.lr_scheduler
 
+    # Padding-free OFF, explicitly. Unsloth >= 2026.9 auto-enables it whenever
+    # `padding_free` is left at None and no data_collator is passed — and ours is swapped
+    # in AFTER construction (_final_turn_collator below), so the gate never sees it. At
+    # batch=1 there is no padding to save; what it does change is the attention call:
+    # the batch arrives as packed position_ids and SDPA runs against an explicit mask
+    # instead of is_causal. The first build under it (run 20260923_003453, RTX 5090,
+    # unsloth 2026.5.8 -> 2026.9.7 + torch 2.9 -> 2.12 the day before) OOMed at step 2
+    # inside scaled_dot_product_attention asking for 4.87 GiB with 27.4 GiB resident.
+    # Guarded on the field so an older TRL without it still builds its config.
+    # 2026-09-23: NOT the cause of that OOM (the next run died identically) — that was
+    # enable_gqa forcing SDPA's math backend on the head_dim-512 layers; see core/sdpa_gqa.py.
+    def _padding_free_off(cfg_cls) -> dict:
+        fields = getattr(cfg_cls, "__dataclass_fields__", {}) or {}
+        return {"padding_free": False} if "padding_free" in fields else {}
+
     # Hand SFTTrainer the underlying tokenizer for response-marker masking. The dataset is
     # already tokenized above, so SFT's normal text tokenization/EOS pass is bypassed.
     trainer = _OrderedSFTTrainer(
@@ -2153,6 +2172,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
             # Preserve train_row_id/lr_multiplier/unmask_user through response masking.
             # Metadata columns are validated then removed before the collator runs.
             remove_unused_columns=False,
+            **_padding_free_off(SFTConfig),
         ),
         callbacks=[_ProgressCallback(), _CacheReclaimCallback()],
     )

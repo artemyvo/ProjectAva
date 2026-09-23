@@ -7,6 +7,8 @@ happened to need them first:
 
     record_conversation()     — one first-person entry when a user conversation is
                                 processed, closing the reach-out thread that opened it
+    close_removed_session()   — close the threads keyed on a chat that left the corpus
+                                (the user deleting it is a closed thread, not an open one)
     expire_stale_reachouts()  — close the threads an answer can no longer close
     delete_stale_reachouts()  — drop the unanswered openers themselves from the corpus
 
@@ -25,6 +27,18 @@ thread hangs by construction. This closes it explicitly, after
 :data:`DEFAULT_STALE_HOURS`, by RECORDING a real closing episode rather than filtering at
 read time: being ignored is information a deliberation pass should have, and the fold stays
 an honest op-log instead of a rule applied at every read.
+
+``close_removed_session`` is the third way a thread stops being open, and the one the user
+drives: deleting an Ava-initiated chat from the Chat tab is how someone says they do not
+intend to have *that* conversation. Until 2026-09-20 the sweep did notice a session gone
+from disk, but only after the same 48 h age gate as an ignored opener, so for two days the
+deliberation executive still read the thread as "loose, awaiting a reply" — and chose to
+wait on a conversation that no longer existed instead of starting a new one. The deleted
+chat is treated as not existing, at the point of deletion
+(:func:`core.session_ops.handle_delete_session`) and, for anything that path missed, in the
+sweep before the age gate. No tombstone is written for it (that is the sweep's own
+deletion, of an opener that hung its full window): the user removing the chat is not the
+user ignoring it, and the reach-out backoff should not count it as silence.
 
 ``delete_stale_reachouts`` takes the same judgement to the corpus: once an opener is written
 off, the transcript goes too. It is not a conversation and never becomes one — reflection
@@ -173,6 +187,50 @@ def _age_hours(entry: dict, now: datetime) -> Optional[float]:
     return (now - dt).total_seconds() / 3600.0
 
 
+def _opener_kind(thread: dict) -> str:
+    """The closing entry takes the *opener's* kind — it is the tail of that episode."""
+    kind = thread.get("kind")
+    return kind if kind in ("outreach", "synthesis", "checkin") else "conversation"
+
+
+def close_removed_session(filename: str, who: str = "", *,
+                          unanswered: Optional[bool] = None) -> list[dict]:
+    """Close every open thread keyed on ``filename``, a chat that is no longer in the corpus.
+
+    Called at the point of removal by :func:`core.session_ops.handle_delete_session` —
+    where the caller still knows who the chat was with and whether they had answered — and
+    by :func:`expire_stale_reachouts` for a session found missing from disk. A thread on a
+    chat that does not exist is closed whatever its age: nothing can ever close it
+    otherwise, and to the deliberation executive an open thread reads as something to wait
+    on. ``unanswered=True`` records that the person took the conversation down without
+    replying, which is information (she should not raise the same thing again in the same
+    words) but not silence (no reach-out tombstone, no backoff). Best-effort; returns the
+    entries written."""
+    written: list[dict] = []
+    if not filename:
+        return written
+    try:
+        for t in worklog.open_threads():
+            if (t.get("refs") or {}).get("session") != filename:
+                continue
+            if unanswered:
+                reason = (f"{who or 'They'} took down the conversation I had opened before "
+                          f"answering it — I'll let that one go. Nothing is left for me to "
+                          f"wait on there, and it is not something to raise again in the "
+                          f"same words.")
+            elif unanswered is False:
+                reason = (f"The conversation with {who or 'them'} is no longer on record, so "
+                          f"there is nothing left for me to wait on there.")
+            else:
+                reason = ("That conversation is no longer on record, so there is nothing "
+                          "left for me to wait on.")
+            written.append(worklog.record(_opener_kind(t), reason,
+                                          refs={"session": filename}, closes=t.get("id")))
+    except Exception:
+        traceback.print_exc()
+    return written
+
+
 def expire_stale_reachouts(chats_dir, max_age_hours: float = DEFAULT_STALE_HOURS) -> list[dict]:
     """Close every reach-out thread an answer can no longer close. Returns the entries written.
 
@@ -180,7 +238,9 @@ def expire_stale_reachouts(chats_dir, max_age_hours: float = DEFAULT_STALE_HOURS
 
     * the session is still an unanswered Ava opener ``max_age_hours`` after she sent it;
     * the session is no longer on disk at all (nothing can close a thread pointing at a
-      chat that does not exist);
+      chat that does not exist) — closed at ANY age, ahead of the gate below: the user
+      deleting the chat is the common cause, :func:`close_removed_session` the record
+      site, and this is only the catch-up for a removal that path did not see;
     * the session WAS answered but its sidecar is already frozen — reflection has been and
       gone, so :func:`record_conversation` will never fire for it. This is the backlog left
       by the era when the close was wired only to the background pass; on a live box it is
@@ -210,41 +270,39 @@ def expire_stale_reachouts(chats_dir, max_age_hours: float = DEFAULT_STALE_HOURS
             filename = (t.get("refs") or {}).get("session")
             if not filename:
                 continue   # not a chat-keyed thread — out of scope
+            if filename not in on_disk:
+                # Gone from the corpus — a chat the user deleted, usually. No age gate:
+                # a thread on a chat that does not exist is not "awaiting a reply".
+                written.extend(close_removed_session(filename))
+                continue
             age = _age_hours(t, now)
             if age is None or age < max_age_hours:
                 continue
 
-            who = ""
-            if filename in on_disk:
+            try:
+                data = json.loads((d / filename).read_text(encoding="utf-8"))
+            except Exception:
+                continue   # unreadable → leave the thread alone rather than guess
+            who = (data.get("user") or "").strip()
+            if not is_unanswered_outreach(data):
+                # They replied. If the chat is still unfrozen, reflection owns this
+                # close (record_conversation fires when it processes the chat); if it
+                # is already frozen, that moment has passed and nothing else will.
                 try:
-                    data = json.loads((d / filename).read_text(encoding="utf-8"))
+                    frozen = (sidecar.is_reflected(filename)
+                              or sidecar.is_chat_reflected(filename))
                 except Exception:
-                    continue   # unreadable → leave the thread alone rather than guess
-                who = (data.get("user") or "").strip()
-                if not is_unanswered_outreach(data):
-                    # They replied. If the chat is still unfrozen, reflection owns this
-                    # close (record_conversation fires when it processes the chat); if it
-                    # is already frozen, that moment has passed and nothing else will.
-                    try:
-                        frozen = (sidecar.is_reflected(filename)
-                                  or sidecar.is_chat_reflected(filename))
-                    except Exception:
-                        continue
-                    if not frozen:
-                        continue
-                    reason = (f"{who or 'They'} did reply to that, and I have long since "
-                              f"thought it over — nothing left hanging there.")
-                else:
-                    reason = (f"I never heard back from {who or 'them'} — it has been about "
-                              f"{age:.0f} hours, so I'm letting that go.")
+                    continue
+                if not frozen:
+                    continue
+                reason = (f"{who or 'They'} did reply to that, and I have long since "
+                          f"thought it over — nothing left hanging there.")
             else:
-                reason = ("That conversation is no longer on record, so there is nothing "
-                          "left for me to wait on.")
+                reason = (f"I never heard back from {who or 'them'} — it has been about "
+                          f"{age:.0f} hours, so I'm letting that go.")
 
-            kind = t.get("kind") if t.get("kind") in ("outreach", "synthesis", "checkin") \
-                else "conversation"
-            written.append(worklog.record(kind, reason, refs={"session": filename},
-                                          closes=t.get("id")))
+            written.append(worklog.record(_opener_kind(t), reason,
+                                          refs={"session": filename}, closes=t.get("id")))
     except Exception:
         traceback.print_exc()
     return written
@@ -440,6 +498,10 @@ def _selftest() -> None:
                               refs={"session": "frozen.json"}, opens="awaiting a reply")
         gone = worklog.record("outreach", "vanished chat", refs={"session": "gone.json"},
                               opens="awaiting a reply")
+        # deleted by the user an hour after she sent it — must close WITHOUT the age gate
+        gone_fresh = worklog.record("synthesis", "just-deleted chat",
+                                    refs={"session": "gone_fresh.json"},
+                                    opens="awaiting a reply")
         bare = worklog.record("wander", "no session ref", opens="a loop of its own")
 
         # backdate everything but `fresh`
@@ -449,17 +511,33 @@ def _selftest() -> None:
                 entry["ts"] = old
 
         out = expire_stale_reachouts(chats, max_age_hours=DEFAULT_STALE_HOURS)
-        check("unanswered / vanished / already-reflected threads expired",
+        check("unanswered / vanished (any age) / already-reflected threads expired",
               sorted(e["closes"] for e in out),
-              sorted([stale["id"], froz["id"], gone["id"]]))
+              sorted([stale["id"], froz["id"], gone["id"], gone_fresh["id"]]))
         check("expiry keeps the opener's kind", {e["kind"] for e in out},
-              {"outreach", "checkin"})
+              {"outreach", "checkin", "synthesis"})
         hanging = {e["id"] for e in worklog.open_threads()}
         check("fresh / unreflected-answered / session-less threads survive", hanging,
               {fresh["id"], ansd["id"], bare["id"]})
 
         # idempotent: a second sweep finds nothing new to close
         check("sweep is idempotent", expire_stale_reachouts(chats), [])
+
+        # ── close_removed_session: the delete handler's point-of-effect close ──
+        # `fresh` is still open (on disk, under the age gate); the user deletes it.
+        (chats / "fresh.json").unlink()
+        out = close_removed_session("fresh.json", "Artemy", unanswered=True)
+        check("deleting an unanswered opener closes its thread at once",
+              [e["closes"] for e in out], [fresh["id"]])
+        check("the close names who took it down", "Artemy took down" in out[0]["summary"],
+              True)
+        check("...and keeps the opener's kind", out[0]["kind"], "checkin")
+        check("a second close is a no-op", close_removed_session("fresh.json"), [])
+        check("no thread for an unknown chat", close_removed_session("nope.json"), [])
+        check("empty filename closes nothing", close_removed_session(""), [])
+        hanging = {e["id"] for e in worklog.open_threads()}
+        check("only the answered-unfrozen and session-less threads remain", hanging,
+              {ansd["id"], bare["id"]})
 
         # an empty / mis-wired chats dir must never mass-close
         empty = root / "empty"

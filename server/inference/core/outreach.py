@@ -38,12 +38,14 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core.runtime_state import (runtime as _runtime, session as _session,
-                                reflect_window as _reflect_window)
+                                reflect_window as _reflect_window,
+                                reflect_output_reserve as _reserve)
 from core.field_parse import label as _label
 from core import activity_log
 from core import fact_fetch
@@ -100,7 +102,35 @@ _SURFACE_CEILING = 3
 # mid-deliberation rather than letting it settle. 8192 gives ~5735 / 2457. The cost is
 # only bounded, not spent: a decision that concludes in 900 tokens still costs 900, and
 # the input here is one small template, so nothing is taken from another budget.
-_DECISION_MAX_NEW_TOKENS = "8192"
+#
+# 12288 since 2026-09-20, and a config knob (``outreach.max_new_tokens``) clamped against
+# the reflect window by ``runtime_state.reflect_output_reserve`` — the same shape as
+# check-in's decision reserve and synthesis's two. At 8192 the pass was observed hitting
+# the cap INSIDE its think on a long philosophical meta ask (the question itself ran to
+# ~60 words, the deliberation drafted and critiqued three openers) — "budget 8192 of
+# 32768" with the window three quarters empty. Under the thought ceiling 12288 gives
+# ~8600 / 3690, matching the budget its two sibling decision passes already had.
+#
+# Not every cut opener is a budget problem: on 2026-09-22 a pass stopped at 791 of these
+# 12288 with the OPENER cut mid-word, and the journal's "hit the token cap" was the
+# verbatim-loop guard firing on the opener's fourth restatement (drafts in the CoT, then
+# the real one). Check `last_loop` / the pass's token count before raising this.
+_DECISION_MAX_NEW_TOKENS_DEFAULT = 12288
+# Input headroom the reserve must leave: the decision prompt is a template + the RAG block
+# + a facts block (~5k tokens observed), so 4096 is the floor its siblings use too.
+_MIN_DECISION_INPUT_BUDGET = 4096
+
+# A candidate whose last attempt produced no decision is held out of `_pick_ask` for this
+# long (process-local — see `_note_failed_attempt`). Without it the pick is a fixation
+# trap: `surfaceable_questions` orders fewest-raised-first and a truncated / leaked
+# attempt writes no `surface` op, so the same ask came back first on every wake, failed
+# the same way (a long question reasons long), and — under `deliberation.mode: sole`,
+# where the executive chooses `reach_out` and this is what it dispatches — spent every
+# deliberation hour on the one ask that could not be decided. 24 h, not the 72 h re-ask
+# gap: that one paces a question that WAS raised; this one only rotates past one that
+# could not be, and a later adapter or budget may well decide it.
+_FAILED_ASK_HOLD_HOURS = 24.0
+_failed_asks: dict[str, float] = {}   # ask key → time.monotonic() of the failed attempt
 
 # Re-ask gap: an ask this job raised more recently than this is not eligible again.
 # The passive path defaults to no gap because the *user* paces it (it fires only when
@@ -182,6 +212,48 @@ def _min_reask_hours() -> float:
         return _MIN_REASK_HOURS_DEFAULT
 
 
+def _decision_output_reserve() -> int:
+    """Generation headroom for the decision pass — ``outreach.max_new_tokens`` (default
+    ``_DECISION_MAX_NEW_TOKENS_DEFAULT``) clamped to fit the reflect window, the PHYSICAL
+    load the reflect-lane generate resolves ``max_new_tokens`` against."""
+    requested = _DECISION_MAX_NEW_TOKENS_DEFAULT
+    try:
+        cfg = _load_server_config() if _load_server_config is not None else {}
+        val = (cfg.get("outreach") or {}).get("max_new_tokens")
+        if val is not None:
+            requested = int(val)
+    except Exception:
+        requested = _DECISION_MAX_NEW_TOKENS_DEFAULT
+    try:
+        return _reserve(requested, min_input=_MIN_DECISION_INPUT_BUDGET)
+    except Exception:
+        return requested
+
+
+def _note_failed_attempt(ask_key: str) -> None:
+    """Hold *ask_key* out of selection for ``_FAILED_ASK_HOLD_HOURS`` after an attempt
+    that produced no decision (truncated / reasoning leaked into the opener).
+
+    Process-local on purpose: the durable stores this module writes (`surface` ops, the
+    reach-out tombstones) each mean something — a question raised, a message ignored —
+    and a generation that ran out of budget means neither, so recording it there would
+    advance the rotation or the backoff for an event the user never saw. A restart
+    forgets the hold; the cost is at most one repeated attempt."""
+    if ask_key:
+        _failed_asks[ask_key] = time.monotonic()
+
+
+def _recently_failed(ask: dict) -> bool:
+    key = ask.get("key") or ""
+    ts = _failed_asks.get(key)
+    if ts is None:
+        return False
+    if (time.monotonic() - ts) < _FAILED_ASK_HOLD_HOURS * 3600.0:
+        return True
+    _failed_asks.pop(key, None)
+    return False
+
+
 def _has_dangling_opener(ask: dict) -> bool:
     """True when a session this ask was already raised in is *still* unanswered.
 
@@ -229,7 +301,9 @@ def _pick_ask() -> tuple[Optional[dict], str]:
 
     Walks the surfaceable candidates (already gap-filtered and rotation-ordered by
     :meth:`ReflectionMemory.surfaceable_questions`) and takes the first with no
-    dangling unanswered opener."""
+    dangling unanswered opener that did not just fail to be decided
+    (:func:`_note_failed_attempt`). ``all_recently_failed`` names the case where the
+    hold alone emptied the walk, so it is not read as "nothing to raise"."""
     try:
         memory = ReflectionMemory(_MEMORY_DIR)
         candidates = memory.surfaceable_questions(
@@ -239,10 +313,14 @@ def _pick_ask() -> tuple[Optional[dict], str]:
         candidates = []
     if not candidates:
         return None, "no_candidates"
+    held = 0
     for ask in candidates:
+        if _recently_failed(ask):
+            held += 1
+            continue
         if not _has_dangling_opener(ask):
             return ask, ""
-    return None, "all_awaiting_reply"
+    return None, ("all_recently_failed" if held == len(candidates) else "all_awaiting_reply")
 
 
 def _standing_questions_block(user: str, exclude_key: str = "") -> str:
@@ -781,11 +859,11 @@ def run_outreach_decision_blocking(
         # it was the tighter budget of the two while asking for strictly more. Raised to
         # 4096 on the same reasoning as the synthesis analysis pass (d901fda), and to 8192
         # once the thought ceiling made the CoT/answer split explicit — see the note on
-        # _DECISION_MAX_NEW_TOKENS.
+        # _DECISION_MAX_NEW_TOKENS_DEFAULT.
         raw = generate(
             content, system_prompt,
             temperature=0.7, top_p=0.95,
-            max_new_tokens_setting=_DECISION_MAX_NEW_TOKENS,
+            max_new_tokens_setting=str(_decision_output_reserve()),
             rag_query=ask_content,
             facts_block=facts_block,
             rag_nominate_sessions=(facts.get("sources") or None),
@@ -818,6 +896,7 @@ def run_outreach_decision_blocking(
                 raw, getattr(generate, "last_truncated", None)):
             print(f"[outreach] discarding ask {ask_key[:8]}: generation was cut off before "
                   f"it closed its reasoning — no answer to parse", flush=True)
+            _note_failed_attempt(ask_key)
             return {"skipped": "truncated", "decision": False, "opener": "",
                     "question": ask_content, "ask_kind": ask_kind}
 
@@ -886,7 +965,9 @@ def run_outreach_decision_blocking(
             # it could emit the structured block (which parses the same — no DECISION →
             # default "no"). Report the cutoff honestly so it isn't read as a real decline.
             if getattr(generate, "last_truncated", None):
+                _note_failed_attempt(ask_key)
                 return {"skipped": "truncated", "decision": False, "opener": opener,
+                        "loop": bool(getattr(generate, "last_loop", None)),
                         "question": ask_content, "ask_kind": ask_kind}
             return {"skipped": "declined", "decision": False, "opener": opener,
                     "question": ask_content, "ask_kind": ask_kind}
@@ -901,10 +982,16 @@ def run_outreach_decision_blocking(
         # Nothing is lost: the ask stays open and un-surfaced, the reach-out gate is not
         # stamped, and the next idle window retries. See synthesis for the same guard.
         if getattr(generate, "last_truncated", None):
-            print(f"[outreach] discarding opener on ask {ask_key[:8]}: generation hit the "
-                  f"token cap mid-message — refusing to send a partial message", flush=True)
+            # `last_loop` tells the two non-EOS endings apart: a loop-guard halt at a
+            # tenth of the allowance is not a budget problem, and saying "token cap" for
+            # it sent the operator to raise `outreach.max_new_tokens` (2026-09-22).
+            looped = bool(getattr(generate, "last_loop", None))
+            print(f"[outreach] discarding opener on ask {ask_key[:8]}: generation "
+                  + ("was halted by the loop guard" if looped else "hit the token cap")
+                  + " mid-message — refusing to send a partial message", flush=True)
+            _note_failed_attempt(ask_key)
             return {"skipped": "truncated", "decision": True, "opener": "",
-                    "question": ask_content, "ask_kind": ask_kind}
+                    "loop": looped, "question": ask_content, "ask_kind": ask_kind}
 
         # Last backstop before anything reaches a chat: if a reasoning marker survived into
         # the opener, it is not a clean message whatever else parsed. Cheap, and it catches
@@ -913,6 +1000,7 @@ def run_outreach_decision_blocking(
         if _has_reasoning_leak(opener):
             print(f"[outreach] discarding opener on ask {ask_key[:8]}: reasoning markers "
                   f"survived into the message", flush=True)
+            _note_failed_attempt(ask_key)
             return {"skipped": "opener_leak", "decision": True, "opener": "",
                     "question": ask_content, "ask_kind": ask_kind}
 
