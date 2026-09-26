@@ -1244,8 +1244,9 @@ def _write_wander_exchange(ex: dict) -> dict:
         # trained twice.
         #
         # Deferring it costs nothing: the snippet is on disk now, so `til_facts.list_backlog`
-        # picks it up and the next reflection run's ingestion phase derives it — the same
-        # function, in the same place the NEWS lane has always called it from. And unlike
+        # picks it up and the background drain's TIL rung derives it on idle time
+        # (`background_reflection`, rung 3 — or the next Sleep's ingestion phase when that
+        # rung is switched off) with the same function the NEWS lane calls. And unlike
         # the recap it does not need reviewing: a protocol is a witness record of the text
         # ("record what the text says, not what you make of it"), closer to a photocopy
         # than to a judgement, and nobody reviews the news lane's either.
@@ -1402,7 +1403,8 @@ async def handle_til_apply(ws, msg: dict) -> None:
     await _send(ws, {"type": "til_applied", "counts": counts, "source": source})
 
 def run_facts_pass(record: dict, kind: str, snippet_path, *,
-                   run_id: str = "", on_block: Optional[Callable] = None) -> dict:
+                   run_id: str = "", on_block: Optional[Callable] = None,
+                   abort: Optional[Callable[[], bool]] = None) -> dict:
     """Write the fact-extraction protocol for one fetched text. Blocking (GPU thread).
 
     The TIL lane's counterpart of `reflection_runner._run_chat_facts_pass_for_session`,
@@ -1416,6 +1418,13 @@ def run_facts_pass(record: dict, kind: str, snippet_path, *,
     result beside the snippet. **Best-effort by construction:** it is the last thing the
     ingest/apply path does, after the learning output has already reached live memory, so
     a failure here costs a record and never the reading it came from.
+
+    *abort* (the background drain's preempt flag) is polled before every reading block
+    and again before the write; once it answers True the pass writes nothing and reports
+    ``{"skipped": "preempted"}``. The shared cancel event already cuts the generation in
+    flight, but every new generation clears that event on entry — so without the poll a
+    preempted multi-block text would read its remaining blocks to the end while the
+    user's turn waited, then record a protocol assembled around a cut block.
     """
     if _runtime.model is None:
         return {"skipped": "no_model"}
@@ -1442,6 +1451,8 @@ def run_facts_pass(record: dict, kind: str, snippet_path, *,
     truncated_any = False
     cut_parts = 0
     for i, content in enumerate(blocks, 1):
+        if abort is not None and abort():
+            return {"skipped": "preempted"}
         if on_block is not None:
             try:
                 on_block(i, len(blocks))
@@ -1481,6 +1492,8 @@ def run_facts_pass(record: dict, kind: str, snippet_path, *,
             continue
         facts.extend(til_facts.parse_facts(raw or "", truncated=trunc))
 
+    if abort is not None and abort():
+        return {"skipped": "preempted"}          # the last block may be the cut one
     written = til_facts.write_facts(snippet_path, record=record, kind=kind,
                                     facts=facts, run_id=run_id)
     return {"facts": len(facts), "parts": len(blocks), "truncated": truncated_any,
@@ -1717,7 +1730,8 @@ def _fetch_reading_facts(record: dict, kind: str) -> dict:
 
 
 def generate_gist_text(record: dict, kind: str, *,
-                       on_chunk: Optional[Callable] = None) -> dict:
+                       on_chunk: Optional[Callable] = None,
+                       abort: Optional[Callable[[], bool]] = None) -> dict:
     """Generate one text's recap and RETURN it. Writes nothing. Blocking (GPU thread).
 
     Split out of :func:`run_gist_pass` so the recap can be produced where the operator can
@@ -1732,6 +1746,10 @@ def generate_gist_text(record: dict, kind: str, *,
     The backlog and news paths keep calling :func:`run_gist_pass`, which is this plus the
     write — there is no operator in either, so nothing is being reviewed and generating at
     the point of writing is correct there.
+
+    *abort*: as on :func:`run_facts_pass` — polled after the stage-1 facts fetch (itself a
+    generation) and after the recap, so a preempted recap is reported
+    ``{"skipped": "preempted"}`` instead of being returned as if whole.
     """
     if _runtime.model is None:
         return {"skipped": "no_model"}
@@ -1759,6 +1777,8 @@ def generate_gist_text(record: dict, kind: str, *,
                          + _load_reading_block_template().replace("{facts}",
                                                                   facts["text"]))
 
+    if abort is not None and abort():
+        return {"skipped": "preempted"}
     activity_log.set_ambient_label(f"til_gist:{kind}")
     generate_fn = _make_sync_reflect_generate(_get_rag())
     raw = generate_fn(
@@ -1774,6 +1794,8 @@ def generate_gist_text(record: dict, kind: str, *,
         # `[fact] (about: …)` prefix filling the guard's window — does not exist here.
         on_chunk=on_chunk,
     )
+    if abort is not None and abort():
+        return {"skipped": "preempted"}
     return {"raw": raw or "", "text": til_gist.clean_gist(raw or ""),
             "truncated_input": truncated_input,
             "truncated": bool(getattr(generate_fn, "last_truncated", False)),
@@ -1801,7 +1823,8 @@ def write_gist_text(gen: dict, record: dict, kind: str, snippet_path, *,
             "rejected": bool(gen.get("raw") and not text)}
 
 
-def run_gist_pass(record: dict, kind: str, snippet_path, *, run_id: str = "") -> dict:
+def run_gist_pass(record: dict, kind: str, snippet_path, *, run_id: str = "",
+                  abort: Optional[Callable[[], bool]] = None) -> dict:
     """Generate AND write the prose recap for one fetched text. Blocking (GPU thread).
 
     :func:`generate_gist_text` + :func:`write_gist_text`, for the callers with no operator
@@ -1818,7 +1841,7 @@ def run_gist_pass(record: dict, kind: str, snippet_path, *, run_id: str = "") ->
     Best-effort like its sibling: a failure here costs a recap and never the reading it
     came from.
     """
-    gen = generate_gist_text(record, kind)
+    gen = generate_gist_text(record, kind, abort=abort)
     if gen.get("skipped"):
         return {"skipped": gen["skipped"]}
     out = write_gist_text(gen, record, kind, snippet_path, run_id=run_id)
@@ -1863,13 +1886,17 @@ def _record_gist(record: dict, kind: str, snippet_path, *, run_id: str = "",
 _DRAIN_UNPRODUCTIVE: set = set()
 
 
-def drain_gist_backlog(limit: int = 1, *, run_id: str = "") -> dict:
+def drain_gist_backlog(limit: int = 1, *, run_id: str = "",
+                       abort: Optional[Callable[[], bool]] = None) -> dict:
     """Recap up to *limit* snippets that have none. Blocking (GPU thread).
 
     The recap's counterpart of :func:`drain_facts_backlog`, and on any existing box the
     backlog IS the corpus — this artifact did not exist until now, so unlike the protocol
     (which at least runs at fetch time for new material) there is no material anywhere that
     already has one.
+
+    *abort* goes to the pass (:func:`generate_gist_text`): a preempted text is neither
+    written nor retired, and the drain stops there.
     """
     backlog = [(p, k) for p, k in til_gist.list_backlog(_TIL_SNIPPETS_DIR)
                if ("gist", str(p)) not in _DRAIN_UNPRODUCTIVE]
@@ -1882,7 +1909,7 @@ def drain_gist_backlog(limit: int = 1, *, run_id: str = "") -> dict:
         except Exception:
             _DRAIN_UNPRODUCTIVE.add(("gist", str(path)))     # unreadable ⇒ same wedge
             continue
-        res = run_gist_pass(record, kind, path, run_id=run_id)
+        res = run_gist_pass(record, kind, path, run_id=run_id, abort=abort)
         if res.get("skipped") == "no_text":
             # A per-TEXT condition wearing a skip's shape: returning here (as a box-level
             # skip does) would let one empty snippet stop every drain behind it.
@@ -1900,7 +1927,8 @@ def drain_gist_backlog(limit: int = 1, *, run_id: str = "") -> dict:
     return {"done": done, "remaining": len(backlog) - len(done)}
 
 
-def drain_facts_backlog(limit: int = 1, *, run_id: str = "") -> dict:
+def drain_facts_backlog(limit: int = 1, *, run_id: str = "",
+                        abort: Optional[Callable[[], bool]] = None) -> dict:
     """Record the protocol for up to *limit* snippets that have none. Blocking (GPU thread).
 
     Why this lane needs a backlog where chats did not: a chat is reflected once, soon
@@ -1912,7 +1940,9 @@ def drain_facts_backlog(limit: int = 1, *, run_id: str = "") -> dict:
     shared staleness probe), so this lane self-heals exactly as the chat one does.
 
     One snippet per call by default: it runs on the single GPU executor thread, and this
-    is maintenance that must never be the reason an interactive turn waits.
+    is maintenance that must never be the reason an interactive turn waits. *abort* goes
+    to the pass (:func:`run_facts_pass`): a preempted text is neither written nor retired,
+    and the drain stops there.
     """
     backlog = [(p, k) for p, k in til_facts.list_backlog(_TIL_SNIPPETS_DIR)
                if ("facts", str(p)) not in _DRAIN_UNPRODUCTIVE]
@@ -1925,7 +1955,7 @@ def drain_facts_backlog(limit: int = 1, *, run_id: str = "") -> dict:
         except Exception:
             _DRAIN_UNPRODUCTIVE.add(("facts", str(path)))    # unreadable ⇒ same wedge
             continue
-        res = run_facts_pass(record, kind, path, run_id=run_id)
+        res = run_facts_pass(record, kind, path, run_id=run_id, abort=abort)
         if res.get("skipped") == "no_text":
             # Per-text, not box state — see the gist drain's twin branch.
             _DRAIN_UNPRODUCTIVE.add(("facts", str(path)))
@@ -1943,6 +1973,22 @@ def drain_facts_backlog(limit: int = 1, *, run_id: str = "") -> dict:
                      "facts": res.get("facts", 0),
                      "cut": res.get("cut_parts", 0)})
     return {"done": done, "remaining": len(backlog) - len(done)}
+
+
+def backlog_counts() -> dict:
+    """How many texts each drain above would still take: ``{"facts": n, "gist": m}``.
+
+    The same listings the drains read, minus the texts this process already retired as
+    unproductive — so a count is what the next drains will actually attempt. GPU-free
+    (a directory walk). Zero on a box where the lane was never configured."""
+    if _TIL_SNIPPETS_DIR is None:
+        return {"facts": 0, "gist": 0}
+    return {
+        "facts": sum(1 for p, _k in til_facts.list_backlog(_TIL_SNIPPETS_DIR)
+                     if ("facts", str(p)) not in _DRAIN_UNPRODUCTIVE),
+        "gist": sum(1 for p, _k in til_gist.list_backlog(_TIL_SNIPPETS_DIR)
+                    if ("gist", str(p)) not in _DRAIN_UNPRODUCTIVE),
+    }
 
 
 def _ingestion_chunk(emit: Callable) -> Callable:
@@ -2177,6 +2223,85 @@ def ingest_lookup(emit: Callable) -> None:
 # GPU-free self-test                                                           #
 # --------------------------------------------------------------------------- #
 
+def _selftest_backlog_abort(check: Callable) -> None:
+    """The drains under a preempt, GPU-free: a fake model, a fake generate, temp dirs.
+
+    The background drain (``core.background_reflection``, rung 3) hands its preempt flag in
+    as *abort*. What must hold: a text cut by the user's return writes nothing, is NOT
+    retired as unproductive (it is retried whole on the next wake), and a multi-block
+    protocol stops at the block boundary instead of reading on to the end."""
+    import tempfile
+    global _PROMPTS_DIR, _TIL_SNIPPETS_DIR, _make_sync_reflect_generate, _get_rag
+    global _fetch_reading_facts
+
+    print("\nthe backlog drains under a preempt — nothing written, nothing retired")
+    saved = (_PROMPTS_DIR, _TIL_SNIPPETS_DIR, _make_sync_reflect_generate, _get_rag,
+             _fetch_reading_facts, _runtime.model, _runtime.context_length)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "prompts").mkdir()
+            for name in ("til_facts_prompt.txt", "til_gist_prompt.txt"):
+                (root / "prompts" / name).write_text("extract", encoding="utf-8")
+            (root / "snippets" / "wander").mkdir(parents=True)
+            snippet = root / "snippets" / "wander" / "20260101_000000_Test.json"
+            # Three ~1.5k-char paragraphs against a 2k-char block budget: three blocks.
+            para = "The lighthouse keeper logs the weather every hour. " * 30
+            snippet.write_text(json.dumps({"title": "Lighthouse", "wiki": "Test",
+                                           "text": "\n\n".join([para] * 3)}),
+                               encoding="utf-8")
+            _PROMPTS_DIR = root / "prompts"
+            _TIL_SNIPPETS_DIR = root / "snippets"
+            _get_rag = lambda: None
+            _fetch_reading_facts = lambda record, kind: {"text": ""}
+            _runtime.model = object()
+            _runtime.context_length = 1024
+
+            state = {"calls": 0, "abort": False}
+            answer = ("[fact] (about: lighthouse) (class: standing) "
+                      "The keeper logs the weather hourly.")
+
+            def fake_generate(content, system, **kw):
+                state["calls"] += 1
+                state["abort"] = True        # the user comes back mid-generation
+                return answer
+            fake_generate.last_truncated = False
+            _make_sync_reflect_generate = lambda rag: fake_generate
+            abort = lambda: state["abort"]
+
+            check("three reading blocks to protocol",
+                  len(til_facts.build_reading_blocks(
+                      json.loads(snippet.read_text(encoding="utf-8")), "wander",
+                      til_facts.block_budget_chars(1024))), 3)
+            res = drain_facts_backlog(1, run_id="t", abort=abort)
+            check("a preempted protocol reports the preempt", res.get("skipped"),
+                  "preempted")
+            check("...stops at the block boundary", state["calls"], 1)
+            check("...writes nothing", til_facts.has_facts(snippet), False)
+            check("...and is not retired", backlog_counts()["facts"], 1)
+
+            res = drain_gist_backlog(1, run_id="t", abort=abort)
+            check("a recap asked for after the preempt never generates",
+                  (res.get("skipped"), state["calls"]), ("preempted", 1))
+            state["abort"] = False
+            res = drain_gist_backlog(1, run_id="t",
+                                     abort=lambda: state["calls"] >= 2)
+            check("a recap cut mid-generation is reported, not written",
+                  (res.get("skipped"), til_gist.has_gist(snippet)), ("preempted", False))
+            check("...and stays in its backlog", backlog_counts()["gist"], 1)
+
+            # Undisturbed, the same text is recorded whole and leaves the backlog.
+            state["abort"] = False
+            res = drain_facts_backlog(1, run_id="t")
+            check("an undisturbed protocol reads every block and lands",
+                  (len(res.get("done") or []), til_facts.has_facts(snippet)), (1, True))
+            check("the protocol backlog is empty", backlog_counts()["facts"], 0)
+    finally:
+        (_PROMPTS_DIR, _TIL_SNIPPETS_DIR, _make_sync_reflect_generate, _get_rag,
+         _fetch_reading_facts, _runtime.model, _runtime.context_length) = saved
+        _DRAIN_UNPRODUCTIVE.clear()
+
+
 def _selftest() -> None:
     """Run: ``python -m core.til_wander``. Covers the pure lookup-pairing logic.
 
@@ -2271,6 +2396,8 @@ def _selftest() -> None:
               "<think>## RAG\n- [fact] draft</think>Просто эссе о дружбе."), True)
     check("no answer region is its own named failure",
           "answer region" in learning_contract_problem("<think>cut mid-thought"), True)
+
+    _selftest_backlog_abort(check)
 
     if failures:
         print("\nFAILURES:")

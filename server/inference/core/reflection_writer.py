@@ -62,6 +62,29 @@ _ITEM_RE = re.compile(
     re.IGNORECASE,
 )
 _ASK_KINDS = {"meta", "user", "search"}
+# Any line that opens with a bracketed tag, ours or not. A tag `_ITEM_RE` does not route
+# ends the item before it instead of folding into it: the synthesis pass writes
+# `- [impression] …` lines into the same `## RAG` section as its asks (`parse_impressions`
+# reads them on its own), and until 2026-09-26 each was glued onto the `[ask:*]` above it
+# as a "wrapped continuation" — 210 of 1,030 ask inserts on the main box, and in 102 of
+# them `trigger_hygiene.compact_ask` then kept the impression's sentences and dropped the
+# question. `trigger_hygiene.plan_impression_glue` repairs the asks already written.
+_ANY_TAG_RE = re.compile(r"^[ \t]*[-*]?[ \t]*\[[A-Za-z_]+(?:[:\- ][A-Za-z_.]+)?\]")
+# The distill gate (`core/distill_gate.py`, 2026-09-26): a resolved `user` / `meta` ask is
+# closed at once but distilled only once the frozen judge has graded the closure — the
+# evict is written `distill: "pending"` and the Sleep run's clean-base batch decides.
+# `distill_gate.enabled` in server_config.json (set at boot via `set_distill_gate`).
+# Off → the old immediate distill.
+_DISTILL_GATE = True
+
+
+def set_distill_gate(enabled: bool) -> None:
+    global _DISTILL_GATE
+    _DISTILL_GATE = bool(enabled)
+
+
+def distill_gate_enabled() -> bool:
+    return _DISTILL_GATE
 # Structured content that, when it appears *before* the first ``<think>``, proves that
 # ``<think>`` is a field/reply's own reasoning (not leading meta-CoT) — see _split_think.
 # The revision field labels (VERDICT/WHY/PERSONA_TARGET/legacy PERSONA/IDEAL/LANG_DRIFT)
@@ -351,6 +374,12 @@ def _parse_items(section: str) -> list[tuple[str, Optional[str], str]]:
                 items.append(cur)
             subkind = (m.group(2) or "").lower() or None
             cur = [m.group(1).lower(), subkind, m.group(3).strip()]
+        elif _ANY_TAG_RE.match(raw):
+            # Another pass's tag ([impression]): it ends the item before it and is not
+            # routed here, so it and its own wrapped lines are dropped, never glued on.
+            if cur is not None:
+                items.append(cur)
+            cur = None
         elif cur is not None:
             cur[2] = (cur[2] + " " + raw.strip()).strip()
         # else: stray preamble before the first tagged item — ignore.
@@ -1412,6 +1441,12 @@ class ReflectionWriter:
             counts["rag"] += 1
 
         for ri, r in enumerate(parsed["resolved"]):
+            ask = (ask_index or {}).get(r["key"])
+            ask_kind = (ask.get("ask_kind") if ask else "") or ""
+            # Under the gate a distillable closure waits for the judge: the evict says
+            # so and keeps who answered, which the deferred distill needs.
+            gated = (_DISTILL_GATE and ask_kind in ("user", "meta")
+                     and bool((r.get("answer") or "").strip()))
             self._append(self.RAG_FILE, {
                 "run_id": run_id,
                 "ts": ts,
@@ -1422,14 +1457,18 @@ class ReflectionWriter:
                 "question": r["question"],
                 "answer": r["answer"],
                 "answered_in": r["answered_in"],
+                **({"ask_kind": ask_kind, "distill": "pending", "source_user": source_user}
+                   if gated else {}),
                 **chunk_meta,
             })
             counts["evict"] += 1
+            if gated:
+                counts["distill_pending"] = counts.get("distill_pending", 0) + 1
+                continue
 
             # Resolve-and-distill: the answer to a question Ava raised herself is the
             # epistemically valuable turn, but it is the (masked) user turn. Flip it
             # through Ava into a weights-bound statement, routed by the ask's kind.
-            ask = (ask_index or {}).get(r["key"])
             fact, recall = self._distill_resolved(
                 key=r["key"],
                 question=(r.get("question") or "").strip(),
@@ -1512,7 +1551,7 @@ class ReflectionWriter:
     def write_answered_resolution(
         self, *, key: str, question: str = "", answer: str = "", ask_kind: str = "",
         source_session: str = "", answered_in: str = "", run_id: str = "reflection",
-        source_user: str = "",
+        source_user: str = "", extra: Optional[dict] = None,
     ) -> dict:
         """Resolve an open ``[ask]`` the **user answered** in a thread Ava raised it in.
 
@@ -1538,6 +1577,9 @@ class ReflectionWriter:
         ts = datetime.now().isoformat()
         origin = source_origin_ts(source_session)
         origin_meta = {"origin_ts": origin} if origin else {}
+        # Under the gate the closure is written now and the distill waits for the judge
+        # (`core/distill_gate.py`); the evict keeps who answered for it.
+        gated = _DISTILL_GATE and ask_kind in ("user", "meta") and bool((answer or "").strip())
         self._append(self.RAG_FILE, {
             "run_id": run_id,
             "ts": ts,
@@ -1550,8 +1592,15 @@ class ReflectionWriter:
             "key": key,
             "question": question,
             "answer": answer,
+            **({"distill": "pending", "source_user": source_user} if gated else {}),
+            # Provenance a caller adds on top, e.g. the repair of a cut resolution
+            # (`core.resolution_repair`: `repairs` = the closure it replaces).
+            **(extra or {}),
         })
         summary["evict"] = 1
+        if gated:
+            summary["distill_pending"] = 1
+            return summary
         fact, recall = self._distill_resolved(
             key=key, question=(question or "").strip(), answer=answer,
             ask_kind=ask_kind, run_id=run_id, source_session=source_session, ts=ts,
@@ -1565,6 +1614,60 @@ class ReflectionWriter:
             if recall:
                 summary["weights_recall"] = 1
         return summary
+
+    def write_gated_distill(
+        self, *, key: str, question: str = "", answer: str = "", ask_kind: str = "",
+        source_session: str = "", source_user: str = "", closed_ts: str = "",
+        run_id: str = "distill-gate", gate: Optional[dict] = None,
+    ) -> dict:
+        """The distill a gated closure waited for (`core/distill_gate.py`): the same
+        record `write_answered_resolution` used to write at once, as the kind the gate
+        chose, plus the gate's decision in the op-log. The weights record carries the
+        closure's own ``ts`` so it joins its evict exactly. Returns the summary
+        :func:`register_consolidation_anchors` takes."""
+        summary = {"facts": [], "weights": 0, "rag": 0, "evict": 0, "weights_recall": 0}
+        if not key:
+            return summary
+        ts = closed_ts or datetime.now().isoformat()
+        origin = source_origin_ts(source_session)
+        fact, recall = self._distill_resolved(
+            key=key, question=(question or "").strip(), answer=answer, ask_kind=ask_kind,
+            run_id=run_id, source_session=source_session, ts=ts,
+            origin_meta={"origin_ts": origin} if origin else {}, chunk_meta={},
+            id_suffix=f"{run_id}-gate-{(key or '')[:12]}", source_user=source_user,
+        )
+        if fact is not None:
+            summary["facts"].append(fact)
+            summary["weights"] = 1
+            if recall:
+                summary["weights_recall"] = 1
+        self.write_gate_decision(key=key, closed_ts=closed_ts, run_id=run_id,
+                                 decision=dict(gate or {}, decision="distill",
+                                               as_=("persona" if ask_kind == "meta" else "fact")
+                                               if fact is not None else None))
+        return summary
+
+    def write_gate_decision(self, *, key: str, closed_ts: str, run_id: str,
+                            decision: dict) -> None:
+        """The gate's final word on one closure, in the op-log beside the closure it
+        is about, so a staged run's decisions merge (or are discarded) with its writes.
+        The fold ignores the op; `core/distill_gate.py` reads it."""
+        rec = {"run_id": run_id, "ts": datetime.now().isoformat(), "op": "gate",
+               "key": key, "closed_ts": closed_ts}
+        for k, v in (decision or {}).items():
+            rec["as" if k == "as_" else k] = v
+        self._append(self.RAG_FILE, rec)
+
+    def write_reset_decision(self, *, key: str, closed_ts: str, run_id: str,
+                             decision: dict) -> None:
+        """What the context-reset test (``core/reset_test.py``, P7) decided for one
+        closure — passed / failed, and what was done about it (distilled / withheld by the
+        gate, confirmed / superseded by the retro apply) — beside the closure, so a staged
+        run's decisions merge or are discarded with its writes. The fold ignores the op."""
+        rec = {"run_id": run_id, "ts": datetime.now().isoformat(), "op": "reset",
+               "key": key, "closed_ts": closed_ts}
+        rec.update(decision or {})
+        self._append(self.RAG_FILE, rec)
 
     # -- recollection (revisit re-reading) --------------------------------- #
 
@@ -1799,6 +1902,40 @@ class ReflectionWriter:
             "answer": answer,
         })
 
+    def write_reopened_ask(self, *, ask: dict, run_id: str, reason: str,
+                           closed_ts: str = "") -> bool:
+        """Put a closed ``[ask]`` back into the live set — a re-``insert`` under its own key.
+
+        For a closure that should not have happened (`core.resolution_repair`: the
+        targeted pass closed it on a half-written answer, and re-read, the conversation
+        does not answer it). Same key, content, kind and origin as the ask it reopens,
+        so the fold's per-key history carries over — ``surface_count`` /
+        ``last_surfaced_ts`` are counted from the ``surface`` ops across the whole log,
+        so the re-ask gap still applies. ``reopened`` records why and which closure it
+        undoes. Returns False for a record with no key or content.
+        """
+        key = (ask.get("key") or "").strip()
+        content = (ask.get("content") or "").strip()
+        if not key or not content:
+            return False
+        record = {
+            "run_id": run_id,
+            "ts": datetime.now().isoformat(),
+            "id": f"{run_id}-reopen-{key[:8]}",
+            "op": "insert",
+            "kind": "ask",
+            "ask_kind": ask.get("ask_kind") or "search",
+            "content": content,
+            "key": key,
+            "source_session": ask.get("source_session") or "",
+            "reopened": {"closed_ts": closed_ts, "reason": reason},
+        }
+        for field in ("origin_ts", "lookup", "seen"):
+            if ask.get(field):
+                record[field] = ask[field]
+        self._append(self.RAG_FILE, record)
+        return True
+
     def write_lookup(self, *, key: str, subject: str = "", found: bool = False,
                      title: str = "", run_id: str = "") -> None:
         """Record that an open ``[ask:search]`` was looked up (fetch-once bookkeeping).
@@ -1944,6 +2081,38 @@ class ReflectionWriter:
             counts["cues_dropped"] += len(p.get("dropped") or [])
             if new_trigger is None:
                 counts["cleared"] += 1
+        return counts
+
+    def write_impression_glue_repair(self, plan: list[dict]) -> dict:
+        """Apply ``trigger_hygiene.plan_impression_glue``: each ask the pre-fix parser
+        glued an ``[impression]`` onto is re-inserted under its OWN key with the question
+        alone — the key keeps its surfacing history, the sessions opened on it and the
+        targeted resolver's join — or, when nothing of the question survives, evicted as
+        not a question (``reason: malformed``, never counted as a closure). Append-only,
+        like the trigger purge: the prior insert stays in the log, and the record says
+        what it was. Idempotent: a repaired ask carries no marker."""
+        ts = datetime.now().isoformat()
+        run_id = f"impression-glue-{ts}"
+        counts = {"cut": 0, "recovered": 0, "evicted": 0}
+        for pi, p in enumerate(plan):
+            rec = p.get("record") or {}
+            key = p.get("key") or rec.get("key")
+            if not key:
+                continue
+            note = {"how": p.get("how"), "was": str(p.get("old") or "")[:1200]}
+            if p.get("new"):
+                record = {k: v for k, v in rec.items() if k not in _FOLD_COMPUTED_FIELDS}
+                record.update({"run_id": run_id, "ts": ts, "id": f"{run_id}-g{pi}", "op": "insert",
+                               "kind": "ask", "content": p["new"], "key": key,
+                               "impression_glue": note})
+                self._append(self.RAG_FILE, record)
+                counts["recovered" if p.get("how") == "recovered" else "cut"] += 1
+            else:
+                self._append(self.RAG_FILE, {
+                    "run_id": run_id, "ts": ts, "op": "evict", "reason": "malformed",
+                    "key": key, "question": str(p.get("old") or "")[:1200],
+                    "ask_kind": rec.get("ask_kind"), "impression_glue": note})
+                counts["evicted"] += 1
         return counts
 
     # -- reconciliation → soften (supersede) ------------------------------- #

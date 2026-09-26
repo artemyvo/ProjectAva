@@ -457,14 +457,38 @@ class ChatSidecar:
             try:
                 from core import revision_ledger
                 revision_ledger.record_verdict(
-                    self.chats_dir, source_session=source_session, exchange_index=exchange_index,
+                    self._ledger_root(), source_session=source_session, exchange_index=exchange_index,
                     record=exchanges[key], prev=(prev or None),
-                    chat_path=self.resolve_chat_path(source_session),
+                    chat_path=self._ledger_chat_path(source_session),
                     why=why, pass_info=pass_info, run_kind=run_kind, judgement_raw=judgement_raw,
+                    staged=self._is_staging(),
                 )
             except Exception as e:
                 print(f"[ledger] verdict event skipped: {e}")
         return ok
+
+    # ── the revisions ledger's home ──
+    # A reflection run builds this object on its STAGING chats dir (reflection_staging /
+    # background_staging / the checkpoint) with the live dir as `fallback_chats_dir`, and
+    # the workspace is promoted or discarded afterwards. The ledger is corpus, not
+    # workspace: it lives beside the LIVE chats dir whichever dir the verdict was staged
+    # in — the first day of the ledger was lost to exactly this (2026-09-24), every event
+    # written into staging and deleted with it.
+
+    def _is_staging(self) -> bool:
+        return (self.fallback_chats_dir is not None
+                and Path(self.fallback_chats_dir).resolve() != self.chats_dir.resolve())
+
+    def _ledger_root(self) -> Path:
+        return Path(self.fallback_chats_dir) if self._is_staging() else self.chats_dir
+
+    def _ledger_chat_path(self, source_session: str) -> Optional[Path]:
+        """The transcript to snapshot: the live one when it exists, else the staged copy."""
+        if self._is_staging():
+            live = self.resolve_chat_path(source_session, base_dir=Path(self.fallback_chats_dir))
+            if live is not None and live.exists():
+                return live
+        return self.resolve_chat_path(source_session)
 
     def write_anchor(
         self, *, source_session: str, exchange_index: int,
@@ -540,9 +564,9 @@ class ChatSidecar:
         """Provenance for the Training review's curation toggles (best-effort)."""
         try:
             from core import revision_ledger
-            revision_ledger.record_flag(self.chats_dir, kind, source_session=source_session,
+            revision_ledger.record_flag(self._ledger_root(), kind, source_session=source_session,
                                         exchange_index=exchange_index, value=value,
-                                        chat_path=self.resolve_chat_path(source_session))
+                                        chat_path=self._ledger_chat_path(source_session))
         except Exception as e:
             print(f"[ledger] {kind} event skipped: {e}")
 

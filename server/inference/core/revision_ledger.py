@@ -164,9 +164,11 @@ def exchange_snapshot(chat_path: Optional[Path], exchange_index: int) -> dict:
 def record_verdict(chats_dir: Path, *, source_session: str, exchange_index: int,
                    record: dict, prev: Optional[dict], chat_path: Optional[Path],
                    why: str = "", pass_info: Optional[dict] = None, run_kind: str = "",
-                   judgement_raw: str = "") -> bool:
+                   judgement_raw: str = "", staged: bool = False) -> bool:
     """One event per `write_verdict`. `record` is the sidecar record as written, `prev`
-    the one it replaced (None on first vetting)."""
+    the one it replaced (None on first vetting). `staged`: the verdict was written into a
+    reflection workspace that is promoted to live only if the run completes — a stopped
+    run's events stay here as judgements that were made, and this flag says so."""
     prev = prev if isinstance(prev, dict) else {}
     target = str(record.get("target") or "")
     event = {
@@ -188,6 +190,7 @@ def record_verdict(chats_dir: Path, *, source_session: str, exchange_index: int,
         "locked": bool(record.get("locked")),
         "banned": bool(record.get("banned")),
         "stage": record.get("stage"),
+        "staged": bool(staged),
         "prev": ({"verdict": prev.get("verdict"), "run_id": prev.get("run_id"),
                   "target_sha": _sha(str(prev.get("target") or "")),
                   "last_reflected": prev.get("last_reflected")} if prev else None),
@@ -351,6 +354,29 @@ def _selftest() -> None:
                               chat_path=chats / "nope.json")
         assert read_events(chats)[-1]["snapshot"] == {"exchange_index": 3}
         assert read_events(Path(td) / "other" / "chats") == []   # a different data root
+
+        # The bug of 2026-09-24: a sidecar built on a STAGING dir with the live dir as
+        # fallback must write the ledger beside the LIVE dir, snapshot the live transcript,
+        # and mark the event staged.
+        from core.chat_sidecar import ChatSidecar
+        live = Path(td) / "live" / "data" / "chats"
+        staging = Path(td) / "live" / "inference" / "data" / "hot" / "reflection_staging" / "chats"
+        live.mkdir(parents=True)
+        staging.mkdir(parents=True)
+        (live / "s9.json").write_text(json.dumps({"exchanges": [{"exchange_id": "z0", "user_prompt": "q",
+                                                                   "assistant_response": "live reply"}]}))
+        sc = ChatSidecar(staging, fallback_chats_dir=live)
+        assert sc.write_verdict(source_session="s9.json", exchange_index=0, verdict="keep", target="live reply",
+                                run_id="20260924_000000", why="mine", run_kind="reflection")
+        assert not ledger_path(staging).exists(), "ledger written into the staging workspace"
+        evs = read_events(live)
+        assert len(evs) == 1 and evs[0]["staged"] is True and evs[0]["why"] == "mine"
+        assert evs[0]["snapshot"]["assistant_response"] == "live reply"
+        # a sidecar built directly on the live dir is not staged
+        sc2 = ChatSidecar(live)
+        assert sc2.write_verdict(source_session="s9.json", exchange_index=0, verdict="keep", target="live reply",
+                                 run_id="manual")
+        assert read_events(live)[-1]["staged"] is False
     print("revision_ledger self-test: OK")
 
 

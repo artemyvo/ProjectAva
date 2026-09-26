@@ -491,14 +491,31 @@ def llm_cluster_evidence(base: list[dict], generate_fn) -> Optional[list[dict]]:
         resp = generate_fn(
             listing, load_cluster_prompt(),
             temperature=0.0, top_p=1.0,
-            max_new_tokens_setting="1024",
-            before_session="", disable_rag=True, disable_thinking=True)
+            # Sized to the listing like a map-reduce block's answer. A fixed 1024 cut a
+            # 211-observation portrait partition short of its last numbers, and
+            # `_parse_groups` then filled the tail in as singletons.
+            max_new_tokens_setting=grouping_budget(len(ordered)),
+            before_session="", disable_rag=True, disable_thinking=True,
+            # A numbered partition: the diversity guard would halt it at 128 tokens.
+            # See the `degen_stop` note on generation's reflect generate_fn.
+            degen_stop=False)
     except Exception:
         return None
     groups = _parse_groups(resp, len(ordered))
     if not groups:                                           # nothing parsed → fall back
         return None
     return [_evidence_entry([ordered[j] for j in g]) for g in groups]
+
+
+def grouping_budget(n: int) -> str:
+    """``max_new_tokens_setting`` for one ``GROUP:`` partition of *n* numbered items.
+
+    ~24 tokens per emitted group line plus headroom, bounded: enough for the worst case
+    (every item its own group) without an open-ended budget. Shared by every grouping
+    call — the flat one above, ``persona_cluster.group_block`` and ``fact_dedup``'s flat
+    path — so the cap that bounds a runaway (these calls run with the diversity guard
+    off) is always proportional to the listing it answers."""
+    return str(min(4000, max(1, int(n)) * 24 + 256))
 
 
 def _parse_groups(text: str, n: int) -> Optional[list[list[int]]]:
@@ -695,7 +712,10 @@ def screen_theme_polarity(evidence: list[dict], base: list[dict], generate_fn,
                 listing, sys_prompt,
                 temperature=0.0, top_p=1.0,
                 max_new_tokens_setting="512",
-                before_session="", disable_rag=True, disable_thinking=True)
+                before_session="", disable_rag=True, disable_thinking=True,
+                # An index line over up to 40 members can outrun the diversity guard's
+                # 128-token floor — see the `degen_stop` note on the reflect generate_fn.
+                degen_stop=False)
             idxs = _parse_oppose(resp, len(listed))
         except Exception:
             idxs = None
@@ -821,7 +841,8 @@ def screen_disposition_gates(digest: dict, generate_fn) -> dict:
             "\n".join(lines), load_gate_prompt(),
             temperature=0.0, top_p=1.0,
             max_new_tokens_setting="512",
-            before_session="", disable_rag=True, disable_thinking=True)
+            before_session="", disable_rag=True, disable_thinking=True,
+            degen_stop=False)    # an index line — see the reflect generate_fn's note
         idxs = _parse_escalates(resp, len(disps))
     except Exception:
         idxs = None
@@ -2069,6 +2090,29 @@ def _selftest() -> None:
                                   polarity=False)) == 2
     assert flat_calls["n"] == 1, flat_calls
     print("  cluster_for_digest: map-reduce routed, opt-out + failure use the old tiers ✓")
+
+    # Every numbered-answer call here runs with the diversity guard OFF and the verbatim
+    # guard left on: a GROUP / OPPOSE / ESCALATES answer sits below `_DegenStop`'s
+    # distinct-token floor by construction, and it halted each one at 128 tokens live
+    # (2026-09-24). The flat grouping's budget grows with the listing it answers.
+    guard_kw: list = []
+
+    def _kw_gen(reply):
+        def _gen(listing, system, **kw):
+            guard_kw.append(kw)
+            return reply
+        return _gen
+
+    llm_cluster_evidence(multi, _kw_gen("GROUP: 1, 2\nGROUP: 3, 4"))
+    screen_theme_polarity([_evidence_entry(multi)], multi, _kw_gen("OPPOSE: none"))
+    screen_disposition_gates({"dispositions": [{"name": "x", "do": "d", "not": "n"}]},
+                             _kw_gen("ESCALATES: none"))
+    assert len(guard_kw) == 3, guard_kw
+    assert all(kw.get("degen_stop") is False for kw in guard_kw), guard_kw
+    assert not any("stop_on_repeat" in kw for kw in guard_kw), guard_kw
+    assert guard_kw[0]["max_new_tokens_setting"] == grouping_budget(len(multi))
+    assert int(grouping_budget(211)) > 1024 and grouping_budget(10_000) == "4000"
+    print("  numbered answers: diversity guard off, verbatim guard on, sized budget ✓")
 
     # ── polarity screening ─────────────────────────────────────────────────── #
     # _parse_oppose: numbers, explicit none, missing line, range/dup filtering.

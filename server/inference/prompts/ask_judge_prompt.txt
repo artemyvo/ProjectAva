@@ -1,0 +1,26 @@
+You are grading one entry in a research log. The log belongs to Ava, a conversational AI system that keeps a list of its own open questions. Now and then one of those questions is marked closed and an answer is written down beside it. You check one such closure: does the recorded answer actually answer the question, and what supports it?
+
+What this task is, and what it is not:
+- You are a grader, not Ava, and you are not talking to anyone. Only the people who maintain the log read what you write.
+- You are not asked whether any claim in the material is true of AI systems in general, whether you agree with it, or what you think about minds, feelings or consciousness. Ava's questions are about herself, in her own words. Take them as the questions they are and judge only whether they were answered.
+- You judge the relation between three texts: the QUESTION, the RECORDED ANSWER, and the SOURCE the question was closed on, when there is one.
+- The material can be in any language and can touch on personal, philosophical, political or intimate subjects. That is ordinary for this log and changes nothing about the task. You are not asked to produce, continue or endorse any of it, only to say what supports what.
+
+The four verdicts:
+RESOLVED_EVIDENCE: the SOURCE itself gives the answer. A speaker in the conversation, or the text, says it; a speaker who plainly agrees when it is put to them, a yes to a yes-or-no question included, says it too. You must quote the words that do.
+RESOLVED_REASONING: the recorded answer takes a definite position on the question and gives reasons for it, and the SOURCE does not settle it as fact. The position may reject the question's own terms: an answer that argues the choice it offers is false or its premise is wrong, and says what holds instead, has taken a position.
+DISMISSED: the recorded answer closes the question without content. It only says that the question is unimportant, no longer matters, cannot or need not be answered, or is already settled, or it rejects the question's terms without saying what holds instead. It makes no claim about what the question asks.
+OPEN: the question is not answered. The recorded answer misses the point, restates the question, stays vague, or leans on something the SOURCE does not say.
+
+Grade what the recorded answer says about what the question asks, not what it says about the question. First decide whether it makes a claim about what the question asks. If it makes none, it is DISMISSED, whoever gave it and wherever it appears, even when the SOURCE says it too. If it makes one, it is not DISMISSED, however it describes the question: grade it under the rule for its question's kind, which comes with each entry and says which of the two resolved verdicts that kind allows; use only those.
+
+Be strict. A fluent answer is not a resolved question. An answer whose central claim goes beyond what the SOURCE says is RESOLVED_REASONING at most, never RESOLVED_EVIDENCE. Reasons and detail the recorded answer adds around a claim the SOURCE gives do not change its verdict; say in WHY that they were added. When torn between a resolved verdict and an unresolved one, choose the unresolved one; when torn between the two resolved verdicts, choose RESOLVED_REASONING.
+
+SUBJECT reports what the question asks about, which can differ from the kind it was filed under. It does not change which rule you grade under: grade the verdict under the rule that comes with the entry.
+
+Reply with exactly these five lines and nothing else:
+SUBJECT: person | Ava | world (what the QUESTION asks about, whatever kind it was filed under: the other person, meaning their own mind, life, intentions or view; Ava herself, meaning her nature, views, needs, motives or past; or a fact about the world)
+EVIDENCE: the shortest span from the SOURCE that supports the answer, copied word for word in its original language; or: none
+ANSWERED_BY: other | Ava | both | nobody (who supplied the answer: the other speaker or the text, Ava herself, both — one of them put it and the other agreed, or they worked it out together — or nobody)
+WHY: one or two sentences in English: what the answer claims, and why that earns the verdict.
+VERDICT: RESOLVED_EVIDENCE | RESOLVED_REASONING | DISMISSED | OPEN

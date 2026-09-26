@@ -1767,6 +1767,34 @@ if __name__ == "__main__":
         "false positive on normal prose"
     # Below the min-gen floor — must NOT halt even if degenerate.
     assert not detect_degeneration([5] * 64), "judged before min-gen floor"
+    # A CORRECT numbered-list answer is indistinguishable from a collapse to this
+    # detector — which is why every such evaluation (clustering, dedup, reconcile, the
+    # index screens) passes degen_stop=False; see generation's reflect generate_fn note.
+    # This is the persona-clustering answer that halted live on 2026-09-24, tokenized the
+    # digit-splitting way (one id per digit, comma, space, newline; the keyword whole): it
+    # is exactly the detector's 128-token floor long, it trips the detector there and not
+    # a token earlier, and the verbatim detector never sees it.
+    _vocab = {":": 7001, " ": 7002, ",": 7003, "\n": 7004}
+
+    def _digit_split(text: str) -> list:
+        out, i = [], 0
+        while i < len(text):
+            if text.startswith("GROUP", i):
+                out.append(7000)
+                i += len("GROUP")
+            else:
+                out.append(7100 + int(text[i]) if text[i].isdigit() else _vocab[text[i]])
+                i += 1
+        return out
+
+    _groups = _digit_split(
+        "GROUP: 1, 10, 13, 20\nGROUP: 2, 35\nGROUP: 3, 37\nGROUP: 4, 9, 16, 25, 31\n"
+        "GROUP: 5, 8, 26\nGROUP: 6, 30, 33\nGROUP: 7, 15\nGROUP: 11, 19\nGROUP: 12, 24\n"
+        "GROUP: 14, 32, 36\nGROUP: 17")
+    assert len(_groups) == _DEGEN_MIN_GEN, len(_groups)
+    assert detect_degeneration(_groups), "a GROUP partition must read as a collapse"
+    assert not detect_degeneration(_groups[:-1]), "judged before min-gen floor"
+    assert not detect_ngram_loop(_groups), "the verbatim guard must not fire on a partition"
     print("inference_backend degeneration-detector self-test: OK")
 
     # Anti-copy guard: the n-gram table + continuation mask (pure forms).

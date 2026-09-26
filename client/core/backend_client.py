@@ -349,6 +349,166 @@ class BackendClient:
             self._send({"type": "get_session", "filename": filename})
             return self._recv_until({"session_data"})
 
+    def list_revisions(self, *, verdict: str = "", run_kind: str = "", annotated: str = "",
+                       text: str = "", limit: int = 500) -> dict:
+        """The Revisions tab's list: one row per judged exchange from the revisions ledger."""
+        with self._rpc_lock:
+            self._send({"type": "list_revisions", "verdict": verdict, "run_kind": run_kind,
+                        "annotated": annotated, "text": text, "limit": limit})
+            return self._recv_until({"revisions_list"})
+
+    def get_revision(self, session: str, exchange_index: int) -> dict:
+        """One judged exchange: its verdict history, snapshot, decoded channels, annotations."""
+        with self._rpc_lock:
+            self._send({"type": "get_revision", "session": session, "exchange_index": int(exchange_index)})
+            return self._recv_until({"revision_detail"})
+
+    def annotate_revision(self, session: str, exchange_index: int, *, exchange_id=None,
+                          about_run_id=None, verdict_justified=None, why_accurate=None,
+                          tag: str = "", note: str = "", author: str = "operator") -> dict:
+        """Append a human calibration mark about the judge's reading to the ledger."""
+        with self._rpc_lock:
+            self._send({"type": "annotate_revision", "session": session,
+                        "exchange_index": int(exchange_index), "exchange_id": exchange_id,
+                        "about_run_id": about_run_id, "verdict_justified": verdict_justified,
+                        "why_accurate": why_accurate, "tag": tag, "note": note, "author": author})
+            return self._recv_until({"revision_annotated"})
+
+    # ── Ask judge tab (core/ask_judge_service.py) ──────────────────────────────
+    # A run is started and then POLLED, not streamed: it holds the GPU for ~15 minutes,
+    # and a streaming call would hold this client's RPC lock (and every other tab) as long.
+
+    def ask_judge_report(self, *, judge_key: str = "", label: str = "", kind: str = "",
+                         path: str = "", text: str = "", thinking: bool = False) -> dict:
+        """The store's judges, one judge's summary table + list rows, the op-log census."""
+        with self._rpc_lock:
+            self._send({"type": "ask_judge_report", "judge_key": judge_key, "label": label,
+                        "kind": kind, "path": path, "text": text, "thinking": bool(thinking)})
+            return self._recv_until({"ask_judge_report"}, timeout=180.0)
+
+    def ask_judge_detail(self, closure_id: str, judge_key: str = "") -> dict:
+        """One judged closure, plus every other judge's verdict on it."""
+        with self._rpc_lock:
+            self._send({"type": "ask_judge_detail", "closure_id": closure_id,
+                        "judge_key": judge_key})
+            return self._recv_until({"ask_judge_detail"})
+
+    def ask_judge_run(self, *, limit: int = 0, thinking: bool = False,
+                      rejudge: bool = False) -> dict:
+        """Start a judge run in the background on the server (returns at once)."""
+        with self._rpc_lock:
+            self._send({"type": "ask_judge_run", "limit": int(limit), "thinking": bool(thinking),
+                        "rejudge": bool(rejudge)})
+            return self._recv_until({"ask_judge_started"}, timeout=180.0)
+
+    def ask_judge_status(self, after: int = 0) -> dict:
+        """The running (or last) judge run: phase, progress, lines after *after*, report."""
+        with self._rpc_lock:
+            self._send({"type": "ask_judge_status", "after": int(after)})
+            return self._recv_until({"ask_judge_status"})
+
+    def ask_judge_stop(self) -> dict:
+        """Ask the running judge to stop after the closure in flight."""
+        with self._rpc_lock:
+            self._send({"type": "ask_judge_stop"})
+            return self._recv_until({"ask_judge_stopping"})
+
+    # ── Repair of cut resolutions (core/resolution_repair.py), same start-then-poll shape ──
+
+    def repair_plan(self) -> dict:
+        """The damaged closures, each with its dry-run result and apply record."""
+        with self._rpc_lock:
+            self._send({"type": "repair_plan"})
+            return self._recv_until({"repair_plan"}, timeout=300.0)
+
+    def repair_run(self, *, redo: bool = False) -> dict:
+        """Start the dry run in the background (re-reads each conversation; writes nothing)."""
+        with self._rpc_lock:
+            self._send({"type": "repair_run", "redo": bool(redo)})
+            return self._recv_until({"repair_started"}, timeout=60.0)
+
+    def repair_status(self, after: int = 0) -> dict:
+        with self._rpc_lock:
+            self._send({"type": "repair_status", "after": int(after)})
+            return self._recv_until({"repair_status"})
+
+    def repair_stop(self) -> dict:
+        with self._rpc_lock:
+            self._send({"type": "repair_stop"})
+            return self._recv_until({"repair_stopping"})
+
+    def repair_apply(self, ids: Optional[list] = None) -> dict:
+        """Apply the dry run's outcomes (all applicable items, or *ids*)."""
+        with self._rpc_lock:
+            self._send({"type": "repair_apply", "ids": list(ids or [])})
+            return self._recv_until({"repair_applied"}, timeout=600.0)
+
+    def gate_plan(self) -> dict:
+        """The distill gate's page: closures waiting for it, its decisions, and the retro
+        plan over the records distilled before it existed (GPU-free)."""
+        with self._rpc_lock:
+            self._send({"type": "gate_plan"})
+            return self._recv_until({"gate_plan"}, timeout=300.0)
+
+    def gate_apply(self, ids: Optional[list] = None) -> dict:
+        """Apply the retro plan (all actionable items, or the closure ids in *ids*)."""
+        with self._rpc_lock:
+            self._send({"type": "gate_apply", "ids": list(ids or [])})
+            return self._recv_until({"gate_applied"}, timeout=600.0)
+
+    # ── Context-reset test (core/reset_test_service.py), same start-then-poll shape ──
+
+    def reset_test_plan(self) -> dict:
+        """The positions the test concerns (pending / retro / decided), each with its newest
+        conversation and verdict, the summary and the rendered report (GPU-free)."""
+        with self._rpc_lock:
+            self._send({"type": "reset_test_plan"})
+            return self._recv_until({"reset_test_plan"}, timeout=300.0)
+
+    def reset_test_detail(self, closure_id: str) -> dict:
+        """Every conversation held for one closure, in full, with every verdict on each."""
+        with self._rpc_lock:
+            self._send({"type": "reset_test_detail", "closure_id": closure_id})
+            return self._recv_until({"reset_test_detail"}, timeout=120.0)
+
+    def reset_test_run(self, *, limit: int = 0, rejudge: bool = False, retry: bool = False,
+                       groups: str = "all", judge_only: bool = False) -> dict:
+        """Start a run in the background: conversations on the loaded model (none with
+        *judge_only*), then the verdicts on the clean base (returns at once)."""
+        with self._rpc_lock:
+            self._send({"type": "reset_test_run", "limit": int(limit), "rejudge": bool(rejudge),
+                        "retry": bool(retry), "groups": groups, "judge_only": bool(judge_only)})
+            return self._recv_until({"reset_test_started"}, timeout=180.0)
+
+    def reset_test_control(self, *, closure_ids: Optional[list] = None, n: int = 4,
+                           conditions: Optional[list] = None, judge_only: bool = False) -> dict:
+        """Start the capture control in the background: the test's probes under other
+        conditions, to its own store — or, with *judge_only*, only the verdicts (returns at
+        once; progress via reset_test_status)."""
+        with self._rpc_lock:
+            payload = {"type": "reset_test_control", "closure_ids": list(closure_ids or []), "n": int(n),
+                       "judge_only": bool(judge_only)}
+            if conditions:
+                payload["conditions"] = list(conditions)
+            self._send(payload)
+            return self._recv_until({"reset_test_control_started"}, timeout=180.0)
+
+    def reset_test_status(self, after: int = 0) -> dict:
+        with self._rpc_lock:
+            self._send({"type": "reset_test_status", "after": int(after)})
+            return self._recv_until({"reset_test_status"})
+
+    def reset_test_stop(self) -> dict:
+        with self._rpc_lock:
+            self._send({"type": "reset_test_stop"})
+            return self._recv_until({"reset_test_stopping"})
+
+    def reset_test_apply(self, ids: Optional[list] = None) -> dict:
+        """Apply the results to the retro records (all tested ones, or the ids in *ids*)."""
+        with self._rpc_lock:
+            self._send({"type": "reset_test_apply", "ids": list(ids or [])})
+            return self._recv_until({"reset_test_applied"}, timeout=600.0)
+
     def load_session(self, filename: str, in_place: bool = False) -> dict:
         """Adopt a past session as the active conversation.
 

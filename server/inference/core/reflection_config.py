@@ -225,6 +225,12 @@ class ReflectionRunOverrides:
     # to skip. See core.trigger_hygiene.
     trigger_purge: Optional[bool] = None
 
+    # Repair the open asks the pre-fix consolidation parser glued an [impression] onto:
+    # the question alone, recovered from the activity journal when the glue dropped it, or
+    # evicted as not a question. Pure, like the purge beside it. Default on; False skips.
+    # See core.trigger_hygiene.plan_impression_glue.
+    impression_glue: Optional[bool] = None
+
     # Fold the logged prompt deltas into PATTERNS (`data/hot/prompt/patterns.json`) inside
     # the clean-base window — the prompt-rewrite budget (PROMPT_REWRITE.md §3). Default
     # on. Reads the locator's op-log, groups same-change deltas on the clean base, weights
@@ -285,7 +291,7 @@ def overrides_to_dict(o: ReflectionRunOverrides) -> dict:
         "disable_rag_for_branch_choice", "force_persona_digest", "apply_branch_judge",
         "persona_cluster_mapreduce", "persona_polarity", "user_notes",
         "force_user_portrait", "self_notes", "force_self_portrait", "chat_facts",
-        "fact_dedup", "trigger_purge", "prompt_patterns", "skip_branching",
+        "fact_dedup", "trigger_purge", "impression_glue", "prompt_patterns", "skip_branching",
         "chunk_budget_frac", "chars_per_token_hint",
     ):
         v = getattr(o, key)
@@ -311,7 +317,7 @@ _KNOWN_OVERRIDE_KEYS: frozenset[str] = frozenset({
     "skip_branching",
     "exchange_anchors", "recollection", "user_notes", "force_user_portrait",
     "self_notes", "force_self_portrait", "chat_facts",
-    "fact_dedup", "trigger_purge", "prompt_patterns", "chunk_budget_frac",
+    "fact_dedup", "trigger_purge", "impression_glue", "prompt_patterns", "chunk_budget_frac",
     "chars_per_token_hint",
 })
 
@@ -414,6 +420,8 @@ def validate_overrides(raw: Any) -> ReflectionRunOverrides:
         o.fact_dedup = bool(raw["fact_dedup"])
     if "trigger_purge" in raw:
         o.trigger_purge = bool(raw["trigger_purge"])
+    if "impression_glue" in raw:
+        o.impression_glue = bool(raw["impression_glue"])
     if "prompt_patterns" in raw:
         o.prompt_patterns = bool(raw["prompt_patterns"])
     if "force_user_portrait" in raw:

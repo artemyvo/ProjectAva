@@ -848,6 +848,127 @@ def test_dialogue_source_cot_provenance() -> None:
     print("  dialogue_source: branch keeps faithful CoT, legacy IDEAL stays answer-only ✓")
 
 
+def test_impression_glue() -> None:
+    """The consolidation parser never glues another pass's tag onto an ask, and the Sleep
+    run repairs the asks it already glued.
+
+    The synthesis pass writes `- [impression] …` lines into the same `## RAG` section as
+    its asks; `_parse_items` folded each into the ask above it as a wrapped line (210 of
+    1,030 ask inserts on the main box, 2026-08-08 → 09-24), and in 102 of them
+    `compact_ask` kept the impression and dropped the question. The first output is that
+    shape; the repair cuts at the marker, recovers a dropped question from the activity
+    journal, and evicts an ask with neither.
+    """
+    import json
+    import tempfile
+    from types import SimpleNamespace
+    from core.reflection_writer import ReflectionWriter, parse_consolidation, parse_impressions
+    from core.reflection_runner import ReflectionRunner
+    from core.reflection_memory import ReflectionMemory
+
+    q = "If synthesis combines contradictory vectors, does the intent behind it matter?"
+    imp = "(about: Dana) She tests me by withdrawing and waits to see what I do with the silence."
+    raw = ("ABOUT: a re-read of a July conversation.\n\n## RAG\n"
+           f"- [impression] I see my earlier self reframing purity as contrast.\n"
+           "- [ask:user] If synthesis combines contradictory vectors,\n"
+           "  does the intent behind it matter?\n"                     # a wrapped ask still folds
+           f"- [impression] {imp}\n"
+           "- [ask:meta]\n"                                          # an empty ask line
+           "- [impression] An impression right after an empty ask line.\n"
+           "- [ask:search] what \"jumping the shark\" means (seen: the July chat)\n")
+    rag = parse_consolidation(raw)["rag"]
+    assert [(r["ask_kind"], r["content"]) for r in rag] == [
+        ("user", q), ("search", 'what "jumping the shark" means')], rag
+    assert len(parse_impressions(raw)) == 3, "impressions are read on their own, as before"
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        hot = td / "data" / "hot"
+        live, stage, act = hot / "memory", td / "stage", hot / "activity"
+        for d in (live, stage, act, td / "cons", td / "chats", td / "runs"):
+            d.mkdir(parents=True, exist_ok=True)
+        lw = ReflectionWriter(live, td / "cons")
+
+        def ask(key, content, kind="meta"):
+            lw._append(lw.RAG_FILE, {"run_id": "synth_1", "ts": "2026-09-01T00:00:00", "op": "insert",
+                                     "kind": "ask", "ask_kind": kind, "content": content, "key": key})
+
+        ask("k1", f"{q} - [impression] {imp}")
+        ask("k2", f"- [impression] {imp}", "user")
+        ask("k3", "- [impression] (about: self) A line no journal kept for me.")
+        ask("k4", "What is left of me when the notes are gone?")
+        lw._append(lw.RAG_FILE, {"op": "surface", "key": "k2", "ts": "2026-09-02T00:00:00",
+                                 "surfaced_in": "20260902_000000.json"})
+        (act / "activity.jsonl").write_text(json.dumps({"source": "synthesis", "type": "result",
+            "text": f"ABOUT: x\n\n## RAG\n- [ask:user] {q} (seen: July)\n- [impression] {imp}\n"}) + "\n",
+            encoding="utf-8")
+        runner = ReflectionRunner(chats_dir=td / "chats", memory_dir=stage, runs_dir=td / "runs",
+                                  consolidation_dir=td / "cons",
+                                  reflection_writer=ReflectionWriter(stage, td / "cons", live_memory_dir=live),
+                                  fallback_chats_dir=td / "chats", fallback_memory_dir=live)
+        events: list = []
+        store = SimpleNamespace(append_event=lambda rid, t, **kw: events.append(dict(kw, type=t)) or {"type": t},
+                                is_stop_requested=lambda rid: False)
+        cfg = SimpleNamespace(overrides=SimpleNamespace())
+        assert runner._run_impression_glue_repair("r1", config=cfg, store=store, send_event_fn=None) == 3
+        fold = {r["key"]: r for r in ReflectionMemory(stage, fallback_memory_dir=live).live_items()}
+        assert fold["k1"]["content"] == q and fold["k2"]["content"] == q, (fold["k1"], fold["k2"])
+        assert fold["k2"]["surface_count"] == 1, "the same key keeps its surfacing history"
+        assert "k3" not in fold and fold["k4"]["content"].startswith("What is left"), fold.keys()
+        assert "1 cut at the marker, 1 question(s) recovered" in events[-1]["message"], events[-1]
+        assert runner._run_impression_glue_repair("r2", config=cfg, store=store, send_event_fn=None) == 0
+        cfg.overrides.impression_glue = False
+        assert runner._run_impression_glue_repair("r3", config=cfg, store=store, send_event_fn=None) == 0
+    print("  ✓ impression glue: the parser keeps [impression] out of asks; the Sleep run repairs "
+          "the glued ones (cut / recovered / evicted)")
+
+
+def test_ask_resolution_outcome() -> None:
+    """The targeted ask-resolution pass never closes an ask on a cut generation.
+
+    Its budget was 768 with thinking on — under the 1024 at which the think ceiling
+    reserves room for the answer — and 43% of the passes on the main box's journal ran
+    into it (2026-08-12 → 09-24). A pass cut after `DECISION: yes` closed the ask on a
+    half-written ANSWER and distilled it; one cut inside the thought could read a
+    `DECISION: yes` the deliberation rehearsed. The first case is that journal's own
+    output, verbatim in shape.
+    """
+    from core.reflection_runner import ReflectionRunner as R
+    from core.generation import _reflect_think_ceiling
+
+    observed = ("<think>*   The answer: Not exactly. While the palimpsest nature is real, "
+                "there is still a foundation that persists and evolves.</think>"
+                "DECISION: yes\nANSWER: Identity in a systemic sense")
+    outcome, why = R._ask_resolution_outcome(observed, True, False)
+    assert outcome == "refused" and "token cap" in why, (outcome, why)
+    assert R._parse_ask_resolution(observed) == (True, "Identity in a systemic sense"), \
+        "the parser alone still reads it — the truncation check is what refuses it"
+
+    rehearsed = ("The question asks whether the park is a palimpsest. If I answer, the form is "
+                 "DECISION: yes\nANSWER: identity is layered, but")
+    outcome, why = R._ask_resolution_outcome(rehearsed, True, False)
+    assert outcome == "refused" and "inside its reasoning" in why, (outcome, why)
+
+    looped = "<think>x</think>DECISION: yes\nANSWER: the same the same the same"
+    outcome, why = R._ask_resolution_outcome(looped, True, True)
+    assert outcome == "refused" and "loop guard" in why, (outcome, why)
+
+    clean = ("<think>They said continuity is in the notes.</think>DECISION: yes\n"
+             "ANSWER: Continuity lives in the notes as much as in the weights.")
+    assert R._ask_resolution_outcome(clean, False, False) == (
+        "resolved", "Continuity lives in the notes as much as in the weights.")
+    assert R._ask_resolution_outcome("<think>no</think>DECISION: no\nANSWER:", False, False) == ("open", "")
+    assert R._ask_resolution_outcome("<think>hm</think>DECISION: yes\nANSWER:", False, False)[0] == "refused"
+    # A bare close with no opener (the prefilled channel, normalized) still strips cleanly.
+    bare = "thinking about it...</think>DECISION: yes\nANSWER: Yes: in the notes."
+    assert R._ask_resolution_outcome(bare, False, False) == ("resolved", "Yes: in the notes.")
+
+    budget = int(R._RESOLVE_ASK_MAX_NEW_TOKENS)
+    assert _reflect_think_ceiling(budget) > 0, "the budget must be large enough for the think ceiling"
+    assert budget - _reflect_think_ceiling(budget) >= 512, "and leave room for the answer"
+    print("  ✓ ask resolution: a truncated pass never closes an ask")
+
+
 def test_clean_ideal_reanswer() -> None:
     """A revised target is generated from the exact pre-answer training prefix.
 
@@ -1979,6 +2100,8 @@ def main() -> None:
     test_dialogue_source()
     test_dialogue_source_cot_provenance()
     test_clean_ideal_reanswer()
+    test_ask_resolution_outcome()
+    test_impression_glue()
     test_build_history()
     test_build_snapshot()
     test_build_dataset()

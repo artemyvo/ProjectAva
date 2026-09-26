@@ -740,6 +740,10 @@ class SleepWidget(QWidget):
         # Per-block fact dedup, for the same reason: it is the last thing a run does, on
         # the whole live [fact] store, and it too is many sequential clean-base calls.
         "fact_dedup_progress",
+        # The distill gate's line per closure, and the context-reset test's per
+        # conversation — a test conversation is minutes of silence otherwise.
+        "distill_gate",
+        "reset_test",
         "pass_error",
         "pass_warning",
         "pass_progress",

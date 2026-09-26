@@ -422,8 +422,8 @@ def forward_ids_rows(model: Any, input_ids: Sequence[int], layers: Sequence[int]
         except Exception:
             continue
     try:
-        with torch.no_grad():
-            model(input_ids=ids, attention_mask=attn)
+        with torch.inference_mode():
+            _forward_no_logits(model, ids, attn)
     finally:
         for h in hooks:
             try:
@@ -431,6 +431,49 @@ def forward_ids_rows(model: Any, input_ids: Sequence[int], layers: Sequence[int]
             except Exception:
                 pass
     return rows
+
+
+def _decoder_parent(model: Any):
+    """The module that owns the decoder stack (Gemma-4: `model.language_model`,
+    Qwen / Llama: `model.model`) — callable on its own for a text-only forward that
+    stops before the LM head."""
+    try:
+        for name, mod in model.named_modules():
+            if str(name).endswith("layers") and type(mod).__name__ == "ModuleList" and len(mod) >= 4:
+                if mod is find_decoder_layers(model):
+                    parent_name = str(name).rsplit(".", 1)[0]
+                    return model.get_submodule(parent_name)
+    except Exception:
+        return None
+    return None
+
+
+def _forward_no_logits(model: Any, ids, attn) -> None:
+    """Run the decoder over `ids` for the hooks' sake while allocating as little else as
+    possible. The default forward builds a KV cache it never reads and projects EVERY
+    position through the LM head — on a 262k vocabulary that is ~1 MB of fp32 logits per
+    token, several GB for a replayed 8k-token exchange, and it was what put the first
+    backfill run out of memory on a 31 GB card. Three attempts, most frugal first:
+    (1) the top-level forward with `logits_to_keep=1` and `use_cache=False`; (2) the
+    decoder parent alone (no LM head at all); (3) the plain forward."""
+    import torch
+    try:
+        model(input_ids=ids, attention_mask=attn, use_cache=False, logits_to_keep=1)
+        return
+    except TypeError:
+        pass
+    except torch.cuda.OutOfMemoryError:
+        raise
+    parent = _decoder_parent(model)
+    if parent is not None:
+        try:
+            parent(input_ids=ids, attention_mask=attn, use_cache=False)
+            return
+        except TypeError:
+            pass
+        except torch.cuda.OutOfMemoryError:
+            raise
+    model(input_ids=ids, attention_mask=attn)
 
 
 def forward_rows(model: Any, tokenizer: Any, text: str, layers: Sequence[int], *,

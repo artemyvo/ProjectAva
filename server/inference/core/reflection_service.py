@@ -67,6 +67,7 @@ _run_branch_exchange_sync: Callable = None
 _sync_branch_chooser_content: Callable = None
 _with_clean_base: Callable = None
 _mark_activity: Callable = None
+_fresh_session_sync: Optional[Callable] = None   # generation.fresh_session_sync (reset test)
 _SERVER_DIR = None
 _DATA_DIR = None
 _CHATS_DIR = None
@@ -81,16 +82,21 @@ def configure(*, send, executor, backend, get_rag, get_reflection_writer, get_ru
               load_server_config, make_sync_reflect_generate, run_branch_exchange_sync,
               sync_branch_chooser_content, with_clean_base, mark_activity,
               server_dir, data_dir, chats_dir, memory_dir, consolidation_dir,
-              reflection_runs_dir, prompts_dir, watchdog_mgmt_url) -> None:
+              reflection_runs_dir, prompts_dir, watchdog_mgmt_url,
+              fresh_session_sync=None) -> None:
     """Wire in the server capabilities the moved reflection-run code depends on.
 
     Called once from server startup, before the WebSocket server accepts clients.
+    *fresh_session_sync* (``generation.fresh_session_sync``) holds the context-reset test's
+    conversations in a Sleep run; without it the positions waiting for the test wait for
+    the Ask judge tab.
     """
     global _send, _executor, _backend, _get_rag, _get_reflection_writer, _get_run_store
     global _load_server_config, _make_sync_reflect_generate, _run_branch_exchange_sync
     global _sync_branch_chooser_content, _with_clean_base, _mark_activity
     global _SERVER_DIR, _DATA_DIR, _CHATS_DIR, _MEMORY_DIR, _CONSOLIDATION_DIR
-    global _REFLECTION_RUNS_DIR, _PROMPTS_DIR, _WATCHDOG_MGMT_URL
+    global _REFLECTION_RUNS_DIR, _PROMPTS_DIR, _WATCHDOG_MGMT_URL, _fresh_session_sync
+    _fresh_session_sync = fresh_session_sync
     _send = send
     _executor = executor
     _backend = backend
@@ -695,12 +701,34 @@ def _run_ingestion_phase(store, run_id: str, send_event_fn: Optional[Callable]) 
     except Exception as e:
         traceback.print_exc()
         emit("pass_error", phase="ingestion", message=f"Ingestion error: {e}")
-    # A bounded slice of the TIL fact-protocol backlog — the articles and digests already
-    # on disk with no `<stem>.facts.json` (or a superseded one). Both writing paths record
-    # the protocol at fetch/apply, so this exists only for material older than the pass and
-    # for anything a parser fix superseded; it is here rather than on its own idle job
-    # because this phase is already where the run's TIL work happens, and it is capped per
-    # run because it competes with the reflection behind it for the same GPU.
+    # The TIL protocol / recap backlogs are idle-time work while the background drain owns
+    # them (`background_reflection.til_backfill`, default on: rung 3 of its wake). They
+    # used to drain only here, 3 + 2 texts per run, which on 2026-09-24 cost a Sleep run 38
+    # minutes before its reflection began — after a night the box had spent idle — against
+    # a backlog of 90 + 97 that the slice never caught up with. Named rather than silently
+    # skipped, so an operator can see what is still waiting and who it is waiting for.
+    try:
+        from core import background_reflection
+        idle_owned = background_reflection.til_backfill_enabled()
+    except Exception:
+        idle_owned = False
+    if idle_owned:
+        try:
+            left = til_wander.backlog_counts()
+            if left.get("facts") or left.get("gist"):
+                emit("pass_progress", phase="ingestion",
+                     message=(f"TIL backlog: {left.get('facts', 0)} text(s) without a "
+                              f"protocol, {left.get('gist', 0)} without a recap — left to "
+                              f"background reflection's idle drain."))
+        except Exception:
+            traceback.print_exc()
+        emit("phase_done", phase="ingestion", message="Ingestion complete.")
+        return
+    # With rung 3 switched off this phase owns them again: a bounded slice of the protocol
+    # backlog — the texts on disk with no `<stem>.facts.json` (or a superseded one): every
+    # wander text (both wander paths defer their protocol) plus anything a parser fix
+    # superseded. Capped per run because it competes with the reflection behind it for
+    # the same GPU.
     try:
         res = til_wander.drain_facts_backlog(_TIL_FACTS_PER_RUN, run_id=run_id)
         for rec in (res.get("done") or []):
@@ -739,9 +767,10 @@ def _run_ingestion_phase(store, run_id: str, send_event_fn: Optional[Callable]) 
     emit("phase_done", phase="ingestion", message="Ingestion complete.")
 
 
-# How many un-recorded TIL texts one run's ingestion phase will write a protocol for.
-# Small on purpose: each is a full generation over a whole article, and the reflection it
-# fronts is what the run is actually for. The backlog is finite and shrinks every run.
+# How many un-recorded TIL texts one run's ingestion phase will write a protocol for —
+# only while `background_reflection.til_backfill` is OFF; on (the default), the backlog is
+# the idle drain's and this phase only reports it. Small on purpose: each is a full
+# generation over a whole article, and the reflection it fronts is what the run is for.
 _TIL_FACTS_PER_RUN = 3
 
 # The same, for recaps (`til_gist`). Smaller, and the asymmetry is deliberate: this pass
@@ -1413,6 +1442,62 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
         from core.reflection_staging import checkpoint_completed_session
         checkpoint_completed_session(_DATA_DIR, filename, run_id)
 
+    def _make_distill_gate_fn():
+        """The distill gate's entry for the clean-base batch (``core/distill_gate.py``), or None
+        when ``distill_gate.enabled`` is off. Called inside the batch, so the judge it builds
+        reads the swapped-in base (its judge key names that precision); it grades through the
+        backend directly, never the reflect generate (the critic sees only its own prompt)."""
+        from core import reflection_writer as _rw
+        if not _rw.distill_gate_enabled():
+            return None
+
+        def _gate(*, writer, consolidation_dir, memory_dirs, run_id, say, should_stop):
+            from core import ask_judge as aj
+            from core import distill_gate as dg
+            from core import reset_test as rt
+            key, judge = aj.make_judge_fn(backend=_backend, runtime=_runtime, chats_dir=_CHATS_DIR,
+                                          prompts_dir=_PROMPTS_DIR, run_id=run_id, runner="sleep")
+            # The context-reset test (P7): a position about Ava distills only once it has
+            # held in a fresh session. Its conversations were held before this window
+            # (`_make_reset_conversations_fn`); their verdicts are made here, on the same
+            # clean base. Without the judge's prompt every such position waits.
+            reset = None
+            if rt.enabled():
+                records = aj.read_jsonl(rt.store_path(_CHATS_DIR))
+                try:
+                    rkey, rjudge = rt.make_judge_fn(backend=_backend, runtime=_runtime,
+                                                    chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+                                                    run_id=run_id, runner="sleep")
+                except FileNotFoundError as e:
+                    say(f"reset test: {e} — the positions it holds wait")
+                    rkey, rjudge = None, None
+                reset = rt.make_gate_check(records=records, key=rkey, judge=rjudge)
+            return dg.run_gate(memory_dirs=memory_dirs,
+                               verdict_records=aj.read_jsonl(aj.store_path(_CHATS_DIR)),
+                               judge_key=key, judge=judge, writer=writer,
+                               consolidation_dir=consolidation_dir, run_id=run_id, say=say,
+                               should_stop=should_stop, reset=reset)
+
+        return _gate
+
+    def _make_reset_conversations_fn():
+        """The context-reset test's conversations for the positions waiting on it
+        (``core/reset_test.py``), held on the ADAPTER just before the clean-base batch —
+        or None when the test, the gate, or the per-run budget is off."""
+        from core import reflection_writer as _rw
+        from core import reset_test as rt
+        if (_fresh_session_sync is None or not _rw.distill_gate_enabled() or not rt.enabled()
+                or rt.policy()["sleep_max"] <= 0):
+            return None
+
+        def _hold(*, memory_dirs, run_id, say, should_stop):
+            return rt.sleep_conversations(
+                memory_dirs=memory_dirs, chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+                model_id=str(_runtime.model_id or ""), conversation_fn=_fresh_session_sync,
+                run_id=run_id, say=say, should_stop=should_stop)
+
+        return _hold
+
     def _consume_pending_clean_base(filename: str) -> dict:
         # Two-stage freeze — stage two: LOAD the clean-base job payloads the background
         # per-chat pass persisted for a `chat_reflected` chat, so this run's end-of-run
@@ -1492,11 +1577,14 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                 if has_checkpoint(_DATA_DIR):
                     rec = fold_checkpoint_to_live(_DATA_DIR, _PROMPTS_DIR.parent)
                     n = int(rec.get("recovered_sidecars", 0) or 0)
+                    # Usually the idle drain's work, not a failure: background reflection
+                    # commits each chat it finishes into this same checkpoint, so "from an
+                    # interrupted run" misread a productive night as a crash.
                     store.append_event(
                         run_id, "phase_done", phase="recover",
-                        message=(f"Recovered {n} completed chat(s) from an interrupted "
-                                 "reflection run." if n else
-                                 "Interrupted-run checkpoint folded (no new chats to recover)."))
+                        message=(f"Folded {n} already-reflected chat(s) from the checkpoint "
+                                 "(background reflection, or an interrupted run)." if n else
+                                 "Checkpoint folded (no new chats in it)."))
             except Exception:
                 traceback.print_exc()
             # Stale reach-out sweep: delete the chats she opened herself that nobody
@@ -1639,6 +1727,12 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                     # and delete the payload only once that phase has run.
                     consume_pending_clean_base_fn=_consume_pending_clean_base,
                     ack_pending_clean_base_fn=_ack_pending_clean_base,
+                    # The distill gate: the frozen judge decides what the closures resolved
+                    # since the last run distill into (inside the clean-base batch).
+                    distill_gate_fn=_make_distill_gate_fn(),
+                    # ...and the context-reset test's conversations for the positions about
+                    # Ava it holds (P7), on the adapter just before that batch.
+                    reset_conversations_fn=_make_reset_conversations_fn(),
                     # The runner is one stage of this lifecycle; THIS function owns the
                     # terminal status (merge / commit / persona / train still follow).
                     finalize=False,

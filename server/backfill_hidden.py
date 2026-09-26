@@ -191,7 +191,7 @@ def main(argv=None) -> int:
         return text_tok.decode(list(ids))
 
     # ── replay ──────────────────────────────────────────────────────────
-    written = failed = too_long = 0
+    written = failed = too_long = oom = 0
     n_tokens = 0
     t_start = time.monotonic()
     for n, (chat, doc, i, key) in enumerate(plan, 1):
@@ -234,20 +234,36 @@ def main(argv=None) -> int:
             n_tokens += len(gen_ids)
         except Exception as e:
             failed += 1
-            _log(f"  [{n}/{len(plan)}] {chat.name} #{i}: {type(e).__name__}: {e}")
+            is_oom = "OutOfMemory" in type(e).__name__ or "out of memory" in str(e).lower()
+            if is_oom:
+                oom += 1
+                _log(f"  [{n}/{len(plan)}] {chat.name} #{i}: CUDA out of memory at "
+                     f"{len(prefix_ids)}+{len(gen_ids)} tokens — skipped; rerun with a lower "
+                     f"--context to leave these out, or free the card")
+            else:
+                _log(f"  [{n}/{len(plan)}] {chat.name} #{i}: {type(e).__name__}: {e}")
             try:
                 backend.trim_memory()
             except Exception:
                 pass
             continue
+        if n % 5 == 0:
+            # The replayed sequences vary from hundreds to thousands of tokens; returning
+            # the freed blocks between them keeps the allocator from fragmenting upward.
+            try:
+                backend.trim_memory()
+            except Exception:
+                pass
         if n % 10 == 0 or n == len(plan):
             el = time.monotonic() - t_start
             _log(f"  [{n}/{len(plan)}] written {written}, {n_tokens} tokens, {el:.0f} s "
                  f"({n_tokens / max(el, 1e-6):.0f} tok/s); last: {chat.name} #{i} "
                  f"({len(prefix_ids)}+{len(gen_ids)} tokens, {framing})")
-    _log(f"Done: written {written}, failed {failed}, over-context {too_long}, "
-         f"{time.monotonic() - t_start:.0f} s. `python -m core.label_inventory` now counts them "
-         f"under `base`.")
+    _log(f"Done: written {written}, failed {failed} (of which out-of-memory {oom}), over-context "
+         f"{too_long}, {time.monotonic() - t_start:.0f} s. `python -m core.label_inventory` now counts "
+         f"them under `base`."
+         + (f" {oom} exchanges did not fit: rerun with --context below their length, or on the "
+            f"larger box." if oom else ""))
     try:
         backend.release(model, tokenizer)
     except Exception:

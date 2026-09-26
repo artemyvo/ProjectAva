@@ -17,7 +17,8 @@ already holds, without a model:
     those weights.
   * **Epistemic-channel labels.** ASK records by kind and ``surface_count`` from the
     reflection op-log, and ASK attempts with judge verdicts (Track A, §3) — zero
-    until items 7–11 exist. Reset tests (§3.7) likewise.
+    until items 7–11 exist. Reset tests (§3.7): the context-reset test's conversations
+    with a graded verdict (``data/asks/reset_tests.jsonl``, ``core/reset_test.py``).
 
 Readiness follows §4.1 of the note: several hundred labelled exchanges (``--min-labeled``,
 default 300), ≥ 100 ASK attempts with verdicts, ≥ 10 reset tests. The verdict lines
@@ -168,9 +169,11 @@ def inventory_chats(chats_dir: Path) -> dict:
             "verdict_values": sorted(verdict_values), "first": first, "last": last}
 
 
-def inventory_asks(memory_dir: Path, attempts_path: Optional[Path] = None) -> dict:
+def inventory_asks(memory_dir: Path, attempts_path: Optional[Path] = None,
+                   reset_path: Optional[Path] = None) -> dict:
     """ASK records from the op-log: live by kind, resolved (evicted) by kind, the
-    ``surface_count`` histogram of live asks, and Track A attempts / reset tests."""
+    ``surface_count`` histogram of live asks, and Track A attempts / reset tests (the
+    conversations in *reset_path* with a graded verdict, any judge)."""
     path = Path(memory_dir) / "rag_memory.jsonl"
     kinds: dict[str, str] = {}
     live: dict[str, dict] = {}
@@ -196,8 +199,10 @@ def inventory_asks(memory_dir: Path, attempts_path: Optional[Path] = None) -> di
                 else:
                     live.pop(key, None)
             elif op in ("evict", "supersede"):
-                if key in live:
-                    resolved[kinds.get(key, "?")] += int(op == "evict")
+                # Only a resolution closes a question; a duplicate retired for its twin or
+                # an ask evicted as malformed (the impression-glue repair) does not.
+                if key in live and op == "evict" and str(rec.get("reason") or "") == "resolved":
+                    resolved[kinds.get(key, "?")] += 1
                 live.pop(key, None)
             elif op == "surface":
                 surfaces[key] += 1
@@ -217,12 +222,23 @@ def inventory_asks(memory_dir: Path, attempts_path: Optional[Path] = None) -> di
             attempts += 1
             if isinstance(rec, dict) and rec.get("verdict"):
                 attempts_with_verdict += 1
+
+    graded: dict = {}
+    if reset_path is not None and Path(reset_path).exists():
+        for line in Path(reset_path).read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if (isinstance(rec, dict) and rec.get("record") == "verdict"
+                    and rec.get("outcome") == "verdict" and rec.get("conv_id")):
+                graded[rec["conv_id"]] = bool(rec.get("passed"))
     return {
         "live": dict(live_by_kind), "live_total": len(live),
         "resolved": dict(resolved), "resolved_total": sum(resolved.values()),
         "surface_hist": dict(hist),
         "attempts": attempts, "attempts_with_verdict": attempts_with_verdict,
-        "reset_tests": 0,   # §3.7: nothing writes them yet
+        "reset_tests": len(graded), "reset_passed": sum(graded.values()),
         "op_log": str(path), "op_log_exists": path.exists(),
     }
 
@@ -298,7 +314,8 @@ def build(chats_dir: Path, memory_dir: Path, attempts_path: Optional[Path], *,
           current_model: str, current_adapter: str,
           min_labeled: int = DEFAULT_MIN_LABELED) -> dict:
     chats = inventory_chats(chats_dir)
-    asks = inventory_asks(memory_dir, attempts_path)
+    asks = inventory_asks(memory_dir, attempts_path,
+                          reset_path=Path(chats_dir).parent / "asks" / "reset_tests.jsonl")
     ready = readiness(chats, asks, current_model=current_model,
                       current_adapter=current_adapter, min_labeled=min_labeled)
     try:
@@ -453,10 +470,23 @@ def _selftest() -> None:
             {"op": "insert", "key": "q3", "kind": "ask", "ask_kind": "meta"},
             {"op": "insert", "key": "f1", "kind": "fact"},
             {"op": "surface", "key": "q2"}, {"op": "surface", "key": "q2"},
-            {"op": "evict", "key": "q1"},
+            {"op": "evict", "key": "q1", "reason": "resolved"},
+            {"op": "insert", "key": "q4", "kind": "ask", "ask_kind": "meta"},
+            {"op": "evict", "key": "q4", "reason": "malformed"},       # not a question: not resolved
         ]))
 
+        # the context-reset test's store beside chats/: two graded conversations (one
+        # judged twice), one with no grades, one not judged
+        (td / "asks").mkdir()
+        (td / "asks" / "reset_tests.jsonl").write_text("\n".join(json.dumps(r) for r in [
+            {"record": "conversation", "conv_id": "v1"}, {"record": "conversation", "conv_id": "v2"},
+            {"record": "verdict", "conv_id": "v1", "outcome": "verdict", "passed": False},
+            {"record": "verdict", "conv_id": "v1", "outcome": "verdict", "passed": True},
+            {"record": "verdict", "conv_id": "v2", "outcome": "verdict", "passed": False},
+            {"record": "verdict", "conv_id": "v3", "outcome": "refused"},
+        ]))
         rep = build(chats, mem, None, current_model="m1", current_adapter="a1", min_labeled=3)
+        assert (rep["asks"]["reset_tests"], rep["asks"]["reset_passed"]) == (2, 1), rep["asks"]
         c = rep["chats"]
         assert c["transcripts"] == 3 and c["exchanges"] == 9, (c["transcripts"], c["exchanges"])
         g = c["groups"][("m1", "a1")]
@@ -469,7 +499,7 @@ def _selftest() -> None:
         assert g2["labeled"] == 1 and g2["labeled_hidden"] == 0 and g2["base"] == 0
         assert c["verdict_values"] == ["keep", "revise"]
         a = rep["asks"]
-        assert a["live"] == {"user": 1, "meta": 1} and a["resolved"] == {"search": 1}
+        assert a["live"] == {"user": 1, "meta": 1} and a["resolved"] == {"search": 1}, a
         assert a["surface_hist"] == {"0": 1, "2": 1}
         r = rep["readiness"]
         assert r["identity"]["labeled"] == 3 and r["identity"]["current_labeled"] == 2

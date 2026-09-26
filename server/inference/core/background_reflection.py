@@ -23,7 +23,7 @@ It is the fifth autonomous idle job (alongside ``outreach``/``synthesis``/``chec
     are checkpointed. The next NORMAL reflection run folds the checkpoint, finishes the
     chat (runs the clean-base phase over those payloads), and stamps ``reflected_at``.
 
-**A wake is a three-rung ladder, cheapest first, and it stops at the first rung with work.**
+**A wake is a four-rung ladder, and it stops at the first rung with work.**
 
   0. **Stale reach-out sweep** (GPU-free, always). Delete the chats Ava opened herself that
      nobody answered inside the window (``reachout.stale_delete_hours``, default 48 h) —
@@ -40,6 +40,18 @@ It is the fifth autonomous idle job (alongside ``outreach``/``synthesis``/``chec
   2. **Per-chat reflection** — the drain described above, and only when rung 1 is empty.
      Deliberate: a chat reflection later re-derives both sidecars anyway, so the overlap is
      accepted in exchange for corpus-wide coverage arriving first.
+  3. **TIL backfill** — the fetched texts (wander / news / lookups) still missing their
+     fact protocol or their recap, oldest first, alternating the two drains one text at a
+     time (``til_wander.drain_facts_backlog`` / ``drain_gist_backlog``). Until 2026-09-24
+     these drained only inside a Sleep run's ingestion phase, three protocols and two
+     recaps per run — and the autonomous wander defers both of its own by design — so a
+     box idle all night still handed the operator's Sleep 38 minutes of them before any
+     reflection began, against a backlog of 90 + 97 texts that grew faster than that slice
+     shrank it. Last because it is the least urgent: every chat is reflected first. A wake
+     on this rung is time-boxed (``_TIL_WAKE_BUDGET_S``): one protocol can run a quarter of
+     an hour, and an undrained wake would queue every hourly sibling behind the GPU lock
+     for the whole night. While ``background_reflection.til_backfill`` is on, Sleep's
+     ingestion leaves the backlog to this rung (``til_backfill_enabled``).
 
 Per-chat atomicity: each chat is reflected in a fresh throwaway staging dir. On success its
 deltas + frozen sidecar are APPENDED into the durable checkpoint (accumulating across wakes)
@@ -56,6 +68,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -123,6 +136,23 @@ def _backfill_enabled() -> bool:
         cfg = (_load_server_config() or {}).get("background_reflection") or {}
         if cfg.get("sidecar_backfill") is not None:
             return bool(cfg.get("sidecar_backfill"))
+    except Exception:
+        pass
+    return True
+
+
+def til_backfill_enabled() -> bool:
+    """``background_reflection.til_backfill`` (default ON) — rung 3's kill switch, and the
+    ONE reading of who owns the TIL protocol / recap backlog.
+
+    Public because the answer has two readers: this ladder (on ⇒ drain it on idle time) and
+    a Sleep run's ingestion phase (`reflection_service._run_ingestion_phase`: on ⇒ leave it
+    alone; off ⇒ its per-run slice drains it as before). One owner at a time, so a Sleep
+    run never spends its opening half hour on work the night was there to do."""
+    try:
+        cfg = (_load_server_config() or {}).get("background_reflection") or {}
+        if cfg.get("til_backfill") is not None:
+            return bool(cfg.get("til_backfill"))
     except Exception:
         pass
     return True
@@ -469,6 +499,95 @@ def _run_sidecar_backfill(backlog: list[dict], run_id: str) -> dict:
     return out
 
 
+# ── rung 3: the TIL backfill ────────────────────────────────────────────────── #
+
+# How long one wake may keep draining rung 3, checked BETWEEN texts (so a wake can overrun
+# it by one text). The protocol of a long article is the box's longest single generation —
+# 13 and 17 minutes observed on 2026-09-24 — and the first backlog on an existing box is
+# the whole fetched corpus, so a wake allowed to drain it to empty would hold the GPU lock
+# all night and queue every hourly sibling (deliberation, the assoc jobs, wander) behind
+# it. Returning after a bounded stretch lets them take the lock in turn; the job's own
+# 120 s interval brings this rung straight back.
+_TIL_WAKE_BUDGET_S = 20 * 60
+
+# The two drains, alternated one text at a time, and the journal's noun for each.
+_TIL_LANES = (("facts", "protocol"), ("gist", "recap"))
+
+
+def _run_til_backfill(run_id: str, counts: dict) -> dict:
+    """Drain the TIL protocol / recap backlogs, oldest first, one text per drain call,
+    alternating the two, until both are empty, the user returns, or the wake's budget
+    (``_TIL_WAKE_BUDGET_S``) is spent.
+
+    The drains are `til_wander`'s, i.e. exactly what a Sleep run's ingestion called, with
+    one addition: *abort* is this module's preempt flag. The shared cancel event cuts the
+    generation in flight, but every new generation clears it on entry, so the pass itself
+    has to stop at its next boundary — and a text cut that way is neither written nor
+    retired: it is simply first in line on the next wake. A text whose pass ran and wrote
+    nothing IS retired for the process by the drain (`til_wander._DRAIN_UNPRODUCTIVE`), so
+    this loop cannot spin on one; the per-wake ``seen`` set is the belt to that brace."""
+    from core import activity_log, til_wander
+
+    drains = {"facts": til_wander.drain_facts_backlog,
+              "gist": til_wander.drain_gist_backlog}
+    written = {"facts": 0, "gist": 0}
+    open_lanes = [lane for lane, _noun in _TIL_LANES if counts.get(lane)]
+    seen: set = set()
+    refused = ""
+    t0 = time.monotonic()
+
+    def _abort() -> bool:
+        return _preempt_requested
+
+    while open_lanes and not _preempt_requested:
+        for lane, noun in _TIL_LANES:
+            if lane not in open_lanes or _preempt_requested:
+                continue
+            res = drains[lane](1, run_id=run_id, abort=_abort) or {}
+            skipped = str(res.get("skipped") or "")
+            if skipped:
+                # `empty_backlog` closes the lane; `preempted` ends the wake (the while
+                # condition sees the flag); anything else is the box refusing the pass
+                # (no model, no prompt) and would refuse the next text identically.
+                open_lanes.remove(lane)
+                if skipped not in ("empty_backlog", "preempted"):
+                    refused = refused or skipped
+                continue
+            for rec in res.get("done") or []:
+                name = str(rec.get("snippet") or "?")
+                if (lane, name) in seen:
+                    open_lanes.remove(lane)     # the drain handed back a text it just did
+                    break
+                seen.add((lane, name))
+                if lane == "facts":
+                    got = int(rec.get("facts", 0) or 0)
+                    landed = got > 0
+                    detail = (f"{got} fact(s)" + (" (cut inside its reasoning)"
+                                                  if rec.get("cut") else ""))
+                else:
+                    got = int(rec.get("chars", 0) or 0)
+                    landed = got > 0 and not rec.get("rejected")
+                    detail = f"{got} chars" if landed else "unusable"
+                if landed:
+                    written[lane] += 1
+                activity_log.append(
+                    "background_reflection", "progress",
+                    f"TIL backfill: {noun} for {name} ({rec.get('kind', '?')}) — {detail}")
+        if time.monotonic() - t0 >= _TIL_WAKE_BUDGET_S:
+            break
+
+    left = til_wander.backlog_counts()
+    out = {"til_protocols": written["facts"], "til_recaps": written["gist"],
+           "til_left_protocols": left.get("facts", 0),
+           "til_left_recaps": left.get("gist", 0),
+           "status": "preempted" if _preempt_requested else "done"}
+    if refused and not (written["facts"] or written["gist"]):
+        # Same contract as rung 1: nothing landed because the box refused, so report a
+        # skip and let the scheduler retry on the next poll instead of sleeping on it.
+        out["skipped"] = f"TIL backfill refused: {refused}"
+    return out
+
+
 # ── the idle-job body ───────────────────────────────────────────────────────── #
 
 def _record_conversation_worklog(filename: str, staging) -> None:
@@ -628,7 +747,41 @@ def run_background_reflection_blocking() -> dict:
     # ── rung 2: the per-chat reflection drain.
     backlog = list_backlog()
     if not backlog:
-        return _nothing_to_do("no_unreflected_chats")
+        # ── rung 3: the TIL backfill — only once every chat is reflected, and only while
+        # the knob gives this ladder (not a Sleep run's ingestion) the backlog.
+        til = None
+        if til_backfill_enabled():
+            try:
+                from core import til_wander
+                til = til_wander.backlog_counts()
+            except Exception:
+                traceback.print_exc()
+        if not til or not (til.get("facts") or til.get("gist")):
+            return _nothing_to_do("no_unreflected_chats")
+        run_id = "bg_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        _bg_run_id = run_id
+        _preempt_requested = False
+        _background_reflection_active = True
+        try:
+            from core import activity_log
+            print(f"[background_reflection] TIL backfill: {til['facts']} text(s) without "
+                  f"a protocol, {til['gist']} without a recap", flush=True)
+            activity_log.append(
+                "background_reflection", "progress",
+                f"TIL backfill: {til['facts']} text(s) without a protocol, {til['gist']} "
+                f"without a recap (oldest first)")
+            result = _run_til_backfill(run_id, til)
+            print(f"[background_reflection] TIL backfill {result['status']} — "
+                  f"{result['til_protocols']} protocol(s), {result['til_recaps']} "
+                  f"recap(s) this wake", flush=True)
+            return {**result, "deleted": len(deleted)}
+        except Exception as e:
+            traceback.print_exc()
+            return {"skipped": f"error: {e}", "deleted": len(deleted)}
+        finally:
+            _background_reflection_active = False
+            _bg_run_id = None
+            _preempt_requested = False
 
     from core.reflection_config import (
         ReflectionRunConfig, ReflectionRunStore, validate_overrides)
@@ -690,7 +843,7 @@ def _selftest() -> None:
 
     global _CHATS_DIR, _DATA_DIR, _RUNS_DIR, _reflect_one_chat_fn, _host_busy
     global _background_reflection_active, _bg_run_id, _bg_store, _preempt_requested
-    global _stale_sweep_fn, _refresh_chats_fn, _load_server_config
+    global _stale_sweep_fn, _refresh_chats_fn, _load_server_config, _TIL_WAKE_BUDGET_S
 
     # ── gist sanitation (shared with the sidecar writer + the RAG reader) ──────── #
     prose = ("We spent the evening arguing about whether a subject is defined by its "
@@ -910,6 +1063,90 @@ def _selftest() -> None:
         assert result.get("skipped") == "backfill refused: no_prompt", result
         assert "20200101_000007.json" not in _backfill_unproductive
         _modules.run_module_blocking = _real_run_module
+
+        # ── rung 3: the TIL backfill ──────────────────────────────────────────── #
+        # Reached only when rungs 1 and 2 have nothing: drop the chat left above.
+        (chats / "20200101_000007.json").unlink()
+        assert list_backlog() == []
+        assert all(e["session"] in _backfill_unproductive for e in list_sidecar_backlog())
+        from core import til_wander as _tw
+        _real_til = (_tw.backlog_counts, _tw.drain_facts_backlog, _tw.drain_gist_backlog)
+        queue = {"facts": ["a.json", "b.json"], "gist": ["a.json"]}
+        calls: list = []
+
+        def _fake_drain(lane):
+            # til_wander's drains, faked at their contract: one text per call, oldest
+            # first, `empty_backlog` when done. What they do with *abort* inside a pass is
+            # til_wander's self-test; here it must arrive, and read False while undisturbed.
+            def _drain(limit, *, run_id="", abort=None):
+                calls.append(lane)
+                assert limit == 1 and run_id.startswith("bg_") and abort() is False
+                if not queue[lane]:
+                    return {"skipped": "empty_backlog"}
+                name = queue[lane].pop(0)
+                rec = ({"snippet": name, "kind": "wander", "facts": 3, "cut": 0}
+                       if lane == "facts" else
+                       {"snippet": name, "kind": "wander", "chars": 900,
+                        "rejected": False})
+                return {"done": [rec], "remaining": len(queue[lane])}
+            return _drain
+
+        _tw.backlog_counts = lambda: {"facts": len(queue["facts"]),
+                                      "gist": len(queue["gist"])}
+        _tw.drain_facts_backlog = _fake_drain("facts")
+        _tw.drain_gist_backlog = _fake_drain("gist")
+        result = run_background_reflection_blocking()
+        assert (result.get("til_protocols"), result.get("til_recaps")) == (2, 1), result
+        assert (result.get("til_left_protocols"), result.get("til_left_recaps")) == (0, 0)
+        # Alternating one text per call, until both lanes report empty.
+        assert calls[:3] == ["facts", "gist", "facts"], calls
+        assert not _background_reflection_active and _bg_run_id is None
+        # Nothing left anywhere: the wake honestly skips.
+        assert run_background_reflection_blocking().get("skipped") == "no_unreflected_chats"
+
+        # Time-boxed between texts: with the budget spent it returns after one round, and
+        # says what is still waiting.
+        _saved_budget, _TIL_WAKE_BUDGET_S = _TIL_WAKE_BUDGET_S, 0
+        queue.update({"facts": ["e.json", "f.json"], "gist": ["e.json", "f.json"]})
+        calls.clear()
+        result = run_background_reflection_blocking()
+        assert calls == ["facts", "gist"], calls
+        assert (result["til_protocols"], result["til_recaps"]) == (1, 1), result
+        assert (result["til_left_protocols"], result["til_left_recaps"]) == (1, 1), result
+        _TIL_WAKE_BUDGET_S = _saved_budget
+
+        # The user comes back mid-text: the pass sees abort() turn True, the drain reports
+        # the preempt, and the wake ends there with the text still queued.
+        def _preempted_drain(limit, *, run_id="", abort=None):
+            request_preempt()
+            assert abort() is True
+            return {"skipped": "preempted", "done": [], "remaining": 1}
+
+        _tw.drain_facts_backlog = _preempted_drain
+        result = run_background_reflection_blocking()
+        assert result.get("status") == "preempted" and "skipped" not in result, result
+        assert result.get("til_left_protocols") == 1, result
+        assert not _preempt_requested and not _background_reflection_active
+
+        # A drain that hands back the text it just did cannot spin the wake.
+        _tw.drain_facts_backlog = lambda limit, **kw: {
+            "done": [{"snippet": "f.json", "kind": "wander", "facts": 0}], "remaining": 1}
+        _tw.drain_gist_backlog = lambda limit, **kw: {"skipped": "empty_backlog"}
+        result = run_background_reflection_blocking()
+        assert result.get("status") == "done" and result.get("til_protocols") == 0, result
+
+        # The box refusing the pass (no model, no prompt) is a skip — retried next poll.
+        _tw.drain_facts_backlog = lambda limit, **kw: {"skipped": "no_model"}
+        result = run_background_reflection_blocking()
+        assert result.get("skipped") == "TIL backfill refused: no_model", result
+
+        # The kill switch hands the backlog back to Sleep: this ladder stops touching it.
+        _load_server_config = lambda: {"background_reflection": {"til_backfill": False}}
+        assert til_backfill_enabled() is False
+        assert run_background_reflection_blocking().get("skipped") == "no_unreflected_chats"
+        _load_server_config = None
+        assert til_backfill_enabled() is True
+        (_tw.backlog_counts, _tw.drain_facts_backlog, _tw.drain_gist_backlog) = _real_til
 
     _runtime.model = None
     _stale_sweep_fn = _refresh_chats_fn = None

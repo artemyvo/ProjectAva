@@ -466,6 +466,13 @@ def _make_generate_fn(backend, model, tokenizer, rag, context_length: int, model
         input_token_limit=None,
         prepared_prompt=None,
         on_chunk=None,
+        # The two loop guards, per call, as the server's reflect generate takes them: the
+        # protocol passes turn both off and the numbered-answer evaluations (clustering,
+        # dedup, reconcile) turn the diversity guard off. Without the parameters those
+        # calls died here on a TypeError. This CLI never enables the diversity guard, so
+        # `None` (the box default on the server) means off.
+        stop_on_repeat: bool = True,
+        degen_stop=None,
     ) -> str:
         prepared = prepared_prompt or prepare_prompt(
             content, system_prompt,
@@ -498,7 +505,8 @@ def _make_generate_fn(backend, model, tokenizer, rag, context_length: int, model
             temperature, top_p, capture_tension=False,
             repetition_penalty=REFLECT_REPETITION_PENALTY,
             no_repeat_ngram_size=REFLECT_NO_REPEAT_NGRAM,
-            stop_on_repeat=True,
+            stop_on_repeat=stop_on_repeat,
+            degen_stop=bool(degen_stop),
         )
 
         pending: list[str] = []
@@ -890,6 +898,10 @@ def main() -> None:
 
     # ── load model ──────────────────────────────────────────────────────── #
     config = _load_server_config()
+    # The distill gate, as the server reads it. The CLI has no clean base, so a closure
+    # resolved here waits for the next server Sleep run's gate.
+    from core import reflection_writer as _rw_mod
+    _rw_mod.set_distill_gate(bool((config.get("distill_gate") or {}).get("enabled", True)))
     model_id = config.get("model_id", "")
     adapter_id = config.get("adapter_id", None)
     chat_context_length = int(config.get("context_length", 32768))

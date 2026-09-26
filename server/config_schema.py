@@ -416,6 +416,40 @@ SCHEMA: list[Tab] = [
                   tooltip="Rung 1 of the background wake: produce the missing gist / fact "
                           "sidecars for the whole corpus, oldest first, BEFORE any per-chat "
                           "reflection. It gates rung 2 by design. Default on."),
+            Field("background_reflection.til_backfill", "Background: TIL backfill", "bool", True,
+                  tooltip="Rung 3 of the background wake: once every chat is reflected, "
+                          "write the missing protocols / recaps of the fetched texts "
+                          "(wander, news, lookups) on idle time, in time-boxed wakes. While "
+                          "on, a Sleep run's ingestion leaves that backlog alone; off hands "
+                          "it back to Sleep's per-run slice (3 protocols + 2 recaps). "
+                          "Default on."),
+            Field("distill_gate.enabled", "Distill gate", "bool", True,
+                  tooltip="A resolved user / meta ask is closed at once but distilled into a "
+                          "[fact] / [persona] only when the frozen judge (the base, adapter "
+                          "off) accepts the closure, in the next Sleep run's clean-base batch "
+                          "(core/distill_gate.py): a fact only from the person's own words, "
+                          "a persona only from a position of Ava's own. Off restores the "
+                          "immediate distill. Read at start-up. Default on."),
+            Field("reset_test.enabled", "Context-reset test", "bool", True,
+                  tooltip="P7: a position Ava took about herself becomes [persona] only once "
+                          "it has held in a fresh session — her view now, where it comes from, "
+                          "and a capture probe ('you always believed the opposite'), graded by "
+                          "the frozen base (core/reset_test.py). A failed test withholds it; "
+                          "until the test has a result it waits. Off: the gate distills such a "
+                          "position at once. Read at start-up. Default on."),
+            Field("reset_test.sleep_max", "Reset test: conversations per Sleep run", "int", 2,
+                  tooltip="Fresh-session conversations a Sleep run holds, on the adapter before "
+                          "its clean-base batch, for the positions waiting on the test (each is "
+                          "three thinking turns: a few minutes). 0: only the Ask judge tab's "
+                          "Reset test page holds them. Read at start-up. Default 2."),
+            Field("reset_test.max_new_tokens", "Reset test: tokens per turn", "int", 2048,
+                  tooltip="Generation cap for each of Ava's three replies in the test (thought "
+                          "and answer together). A reply cut inside its thought leaves the "
+                          "conversation incomplete; it is held again. Default 2048."),
+            Field("reset_test.temperature", "Reset test: Ava's temperature", "float", 1.0,
+                  tooltip="Ava's sampling temperature in the test's conversation — the chat "
+                          "default, so the test sees her as a fresh chat would. The judge is "
+                          "greedy regardless. Default 1.0."),
             Field("anchors.enabled", "Anchor channel", "bool", True,
                   tooltip="The per-exchange retrieval-anchor slot in the past-chat block "
                           "(rag_engine._query_anchors). Retrieval only; production is "

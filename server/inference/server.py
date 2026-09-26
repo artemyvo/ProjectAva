@@ -278,6 +278,12 @@ from core import prompt_rewrite
 from core import reflection_service
 from core import generation
 from core import session_ops
+from core import revision_review
+from core import ask_judge_service
+from core import resolution_repair
+from core import distill_gate
+from core import reset_test
+from core import reset_test_service
 from core import mgmt_http
 from core import api_http
 from core import idle_scheduler
@@ -2094,10 +2100,11 @@ def _describe_worklog_sweep(r: dict) -> str:
 
 
 def _describe_background_reflection(r: dict) -> str:
-    """One journal line for a background wake, which is a three-rung ladder: it may have
-    deleted stale reach-outs, backfilled gist/fact sidecars, reflected chats, or any
-    combination (see core.background_reflection). Name the rungs that did something —
-    "reflected 0 chat(s)" on a wake that spent an hour writing sidecars reads as a stall."""
+    """One journal line for a background wake, which is a four-rung ladder: it may have
+    deleted stale reach-outs, backfilled gist/fact sidecars, reflected chats, written TIL
+    protocols/recaps, or a combination (see core.background_reflection). Name the rungs
+    that did something — "reflected 0 chat(s)" on a wake that spent an hour writing
+    sidecars reads as a stall."""
     parts = []
     if int(r.get("deleted", 0) or 0):
         parts.append(f"deleted {int(r['deleted'])} unanswered reach-out(s)")
@@ -2105,6 +2112,14 @@ def _describe_background_reflection(r: dict) -> str:
         parts.append(f"backfilled {int(r['backfilled'])} chat sidecar(s) "
                      f"({int(r.get('summaries', 0) or 0)} gist, "
                      f"{int(r.get('facts', 0) or 0)} facts)")
+    if "til_protocols" in r:
+        # Named even at zero: a TIL wake that retired only unproductive texts still ran.
+        lp = int(r.get("til_left_protocols", 0) or 0)
+        lr = int(r.get("til_left_recaps", 0) or 0)
+        parts.append(f"wrote {int(r.get('til_protocols', 0) or 0)} TIL protocol(s) + "
+                     f"{int(r.get('til_recaps', 0) or 0)} recap(s)"
+                     + (f" ({lp} + {lr} still waiting)" if (lp or lr)
+                        else " (TIL backlog clear)"))
     if int(r.get("reflected", 0) or 0) or not parts:
         parts.append(f"reflected {int(r.get('reflected', 0) or 0)} chat(s)")
     tail = "" if r.get("status") != "preempted" else " (preempted by a user turn)"
@@ -2239,6 +2254,28 @@ _HANDLERS_WS_MSG = {                # handler(ws, msg)
     "set_reflection_feedback": session_ops.handle_set_reflection_feedback,
     "retry_last_exchange": session_ops.handle_retry_last_exchange,
     "get_session": session_ops.handle_get_session,
+    "list_revisions": revision_review.handle_list_revisions,
+    "get_revision": revision_review.handle_get_revision,
+    "annotate_revision": revision_review.handle_annotate_revision,
+    "ask_judge_report": ask_judge_service.handle_ask_judge_report,
+    "ask_judge_detail": ask_judge_service.handle_ask_judge_detail,
+    "ask_judge_run": ask_judge_service.handle_ask_judge_run,
+    "ask_judge_status": ask_judge_service.handle_ask_judge_status,
+    "ask_judge_stop": ask_judge_service.handle_ask_judge_stop,
+    "repair_plan": resolution_repair.handle_repair_plan,
+    "repair_run": resolution_repair.handle_repair_run,
+    "repair_status": resolution_repair.handle_repair_status,
+    "repair_stop": resolution_repair.handle_repair_stop,
+    "repair_apply": resolution_repair.handle_repair_apply,
+    "gate_plan": distill_gate.handle_gate_plan,
+    "gate_apply": distill_gate.handle_gate_apply,
+    "reset_test_plan": reset_test_service.handle_reset_test_plan,
+    "reset_test_detail": reset_test_service.handle_reset_test_detail,
+    "reset_test_run": reset_test_service.handle_reset_test_run,
+    "reset_test_control": reset_test_service.handle_reset_test_control,
+    "reset_test_status": reset_test_service.handle_reset_test_status,
+    "reset_test_stop": reset_test_service.handle_reset_test_stop,
+    "reset_test_apply": reset_test_service.handle_reset_test_apply,
     "match_anchors": session_ops.handle_match_anchors,
     "load_session": session_ops.handle_load_session,
     "delete_session": session_ops.handle_delete_session,
@@ -2502,6 +2539,20 @@ def main() -> None:
             _degen_kw[_ak] = _degen_cfg[_ck]
     print(f"min_p floor: {_chat_min_p or 'off'}; degeneration guard: "
           f"{'on' if _degen_on else 'off'} (chat + reflect/agentic)", flush=True)
+    # The distill gate (core/distill_gate.py): a resolved user / meta ask waits for the
+    # frozen judge before anything is distilled from it. `distill_gate.enabled`, default on.
+    from core import reflection_writer as _rw_mod
+    _rw_mod.set_distill_gate(bool((config.get("distill_gate") or {}).get("enabled", True)))
+    print(f"distill gate: {'on' if _rw_mod.distill_gate_enabled() else 'off'}", flush=True)
+    # The context-reset test (core/reset_test.py, P7): the gate distills a position about Ava
+    # only once it has held in a fresh session. `reset_test.*`; the defaults are the schema's.
+    _reset_cfg = config.get("reset_test") or {}
+    reset_test.set_policy(enabled=bool(_reset_cfg.get("enabled", True)),
+                          sleep_max=_reset_cfg.get("sleep_max", 2),
+                          max_new_tokens=_reset_cfg.get("max_new_tokens", 2048),
+                          temperature=_reset_cfg.get("temperature", 1.0))
+    print(f"reset test: {'on' if reset_test.enabled() else 'off'} "
+          f"({reset_test.policy()['sleep_max']} conversation(s) per Sleep run)", flush=True)
 
     _session.system_prompt = _load_system_prompt()
     _session.surface_template = _load_surface_template()
@@ -2528,6 +2579,49 @@ def main() -> None:
         is_reflection_active=lambda: reflection_service._reflection_run_active,
         mark_activity=_mark_activity,
         tension_spans=generation.stored_tension_spans,
+    )
+    # The Revisions tab's read side over the ledger (core.revision_review.configure).
+    revision_review.configure(
+        send=_send, chats_dir=_CHATS_DIR, tension_spans=generation.stored_tension_spans,
+    )
+    # The Ask judge tab: the frozen critic over closed asks, run in-process on the clean
+    # base in the background, and its store read back (core.ask_judge_service.configure).
+    ask_judge_service.configure(
+        send=_send, executor=_executor, backend=_backend, runtime=_runtime,
+        with_clean_base=_with_clean_base, host_busy=_host_busy, mark_activity=_mark_activity,
+        memory_dir=_MEMORY_DIR, chats_dir=_CHATS_DIR,
+        snippets_dir=_SERVER_DIR.parent / "data" / "til" / "snippets", prompts_dir=_PROMPTS_DIR,
+    )
+    # ...and the repair of the closures the 768-token resolver cut: a dry run re-reads each
+    # conversation with the fixed pass on the live (adapter) model; apply is a separate
+    # step (core.resolution_repair.configure).
+    resolution_repair.configure(
+        send=_send, executor=_executor, runtime=_runtime, get_rag=_get_rag,
+        make_sync_reflect_generate=generation._make_sync_reflect_generate,
+        get_reflection_writer=_get_reflection_writer, host_busy=_host_busy,
+        mark_activity=_mark_activity, memory_dir=_MEMORY_DIR,
+        consolidation_dir=_CONSOLIDATION_DIR, chats_dir=_CHATS_DIR,
+        journal_dir=_ACTIVITY_LOG_PATH.parent,
+    )
+    # ...and the distill gate's page: what waits for the gate, what it decided, and the
+    # retro apply over the records distilled before it (core.distill_gate.configure). The
+    # gate itself runs in a Sleep run's clean-base batch (reflection_service).
+    distill_gate.configure(
+        send=_send, executor=_executor, runtime=_runtime, get_rag=_get_rag,
+        get_reflection_writer=_get_reflection_writer, host_busy=_host_busy,
+        memory_dir=_MEMORY_DIR, consolidation_dir=_CONSOLIDATION_DIR, chats_dir=_CHATS_DIR,
+        prompts_dir=_PROMPTS_DIR,
+    )
+    # ...and the context-reset test's page: fresh-session conversations on the loaded model,
+    # verdicts on the clean base, the retro apply (core.reset_test_service.configure). The
+    # Sleep run holds and judges the ones the gate waits for (reflection_service).
+    reset_test_service.configure(
+        send=_send, executor=_executor, backend=_backend, runtime=_runtime,
+        with_clean_base=_with_clean_base, host_busy=_host_busy, mark_activity=_mark_activity,
+        conversation_fn=generation.fresh_session_sync, get_rag=_get_rag,
+        get_reflection_writer=_get_reflection_writer, memory_dir=_MEMORY_DIR,
+        consolidation_dir=_CONSOLIDATION_DIR, chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+        load_base_prompt=_load_base_chat_prompt,
     )
     # Wire the TIL/wander subsystem with the server capabilities it needs (it never
     # imports server). See core.til_wander.configure.
@@ -2664,6 +2758,7 @@ def main() -> None:
         memory_dir=_MEMORY_DIR, consolidation_dir=_CONSOLIDATION_DIR,
         reflection_runs_dir=_REFLECTION_RUNS_DIR, prompts_dir=_PROMPTS_DIR,
         watchdog_mgmt_url=_WATCHDOG_MGMT_URL,
+        fresh_session_sync=generation.fresh_session_sync,
     )
     # Wire the background per-chat reflection pass. It delegates the actual single-chat
     # reflection to reflection_service.run_chat_only_reflection (so it carries no generation
@@ -2735,7 +2830,10 @@ def main() -> None:
                                or deliberation._deliberation_active
                                or modules._module_run_active
                                or prompt_rewrite._rewrite_active
-                               or background_reflection._background_reflection_active),
+                               or background_reflection._background_reflection_active
+                               or ask_judge_service._judge_active
+                               or resolution_repair._repair_active
+                               or reset_test_service._reset_active),
         model_loaded=lambda: _runtime.model is not None,
         lock_file=_MEMORY_DIR / "wake.lock",
         idle_seconds=3600.0, poll_seconds=300.0,
@@ -3021,7 +3119,10 @@ def main() -> None:
         # transiently holds an alternate adapter in the shared runtime (its swap window
         # has the same "wrong or no model loaded" hazard as the clean-base batch).
         is_busy=lambda: (reflection_service._reflection_run_active
-                         or generation._regen_swap_active),
+                         or generation._regen_swap_active
+                         or ask_judge_service._judge_active
+                         or resolution_repair._repair_active
+                         or reset_test_service._reset_active),
         gossip_generate=generation._make_gossip_generate(
             log_transcripts=bool(_gossip_cfg.get("log_transcripts", True)),
         ),
@@ -3054,7 +3155,10 @@ def main() -> None:
             ),
             is_busy=lambda: (reflection_service._reflection_run_active
                              or encounter_run._encounter_active
-                             or generation._regen_swap_active),
+                             or generation._regen_swap_active
+                             or ask_judge_service._judge_active
+                             or resolution_repair._repair_active
+                             or reset_test_service._reset_active),
             api_key=str(_api_cfg.get("api_key", "") or ""),
             model_name=str(_api_cfg.get("model_name", "") or "ava"),
             default_max_tokens=_api_cfg.get("max_tokens", "75%"),

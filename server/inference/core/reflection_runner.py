@@ -608,6 +608,8 @@ class ReflectionRunner:
         consume_pending_clean_base_fn: Optional[Callable] = None,
         ack_pending_clean_base_fn: Optional[Callable] = None,
         embed_fn: Optional[Callable] = None,
+        distill_gate_fn: Optional[Callable] = None,
+        reset_conversations_fn: Optional[Callable] = None,
         finalize: bool = True,
     ) -> str:
         """Execute consolidation, judgement/re-answer, and optionally branch.
@@ -706,6 +708,11 @@ class ReflectionRunner:
             pass's subject blocking (CPU, so it is unaffected by the clean-base swap it
             runs inside). Absent ⇒ dedup falls back to lexical blocking, which on a real
             corpus finds almost nothing — see ``core.fact_dedup``.
+
+        *reset_conversations_fn* fn(memory_dirs=, run_id=, say=, should_stop=) -> tally: the
+            context-reset test's conversations (``core.reset_test.sleep_conversations``),
+            run on the ADAPTER just before the clean-base batch, so the distill gate can
+            judge them inside it (P7). None when the test or the gate is off.
         """
         run_id = config.run_id
         store.update_status(run_id, status="running")
@@ -1176,6 +1183,23 @@ class ReflectionRunner:
                     and not store.is_stop_requested(run_id)):
                 self._run_trigger_purge(run_id, config=config, store=store,
                                         send_event_fn=send_event_fn)
+                # 3c-bis. The asks the pre-fix parser glued an [impression] onto: the
+                #     question alone, or evicted when nothing of it is left. Same shape as
+                #     the purge — pure, over the live fold, staged with the run.
+                self._run_impression_glue_repair(run_id, config=config, store=store,
+                                                 send_event_fn=send_event_fn)
+
+            # 3d. The context-reset test's conversations (P7, core/reset_test.py). A position
+            #     Ava took about herself distills only once it has held in a fresh session;
+            #     that session is Ava as she is, so it runs HERE, on the adapter, before the
+            #     window below swaps it out — and the distill gate judges it in there. Only
+            #     the positions already waiting for the test (their closure judged in an
+            #     earlier run); capped per run (`reset_test.sleep_max`).
+            if (reset_conversations_fn is not None and clean_base_ctx is not None
+                    and not dry_run and not consolidation_only and not config.revisit
+                    and not config.chat_only and not store.is_stop_requested(run_id)):
+                self._run_reset_conversations(run_id, reset_conversations_fn=reset_conversations_fn,
+                                              store=store, send_event_fn=send_event_fn)
 
             # 4. Clean-base batch (phase two) — swap the adapter OFF ONCE per run and run
             #    every evaluation that must see the FROZEN base inside that single reload.
@@ -1208,14 +1232,25 @@ class ReflectionRunner:
             #     of a third store; like dedup it depends on nothing this run produced
             #     beyond the deltas it just logged, and runs after them so those count.
             run_prompt_patterns = getattr(config.overrides, "prompt_patterns", None) is not False
+            # (f) the distill gate — the closures resolved under it (this run's, and the
+            #     background drain's folded in at run start) wait for the frozen judge
+            #     before anything is distilled from them (`core/distill_gate.py`). First in
+            #     the batch, so the facts it distills are there for placement and dedup.
+            run_distill_gate = bool(distill_gate_fn is not None and not dry_run
+                                    and not getattr(config, "revisit", False))
             if (clean_base_ctx is not None
                     and (run_branch_judge or run_fact_placement or run_digest_cluster
-                         or user_plans or self_plan or run_fact_dedup or run_prompt_patterns)
+                         or user_plans or self_plan or run_fact_dedup or run_prompt_patterns
+                         or run_distill_gate)
                     and not store.is_stop_requested(run_id)):
                 def _clean_base_batch():
                     nonlocal digest_evidence, user_evidence, self_evidence
                     overrides = 0
-                    if run_branch_judge:
+                    if run_distill_gate:
+                        self._run_clean_base_distill_gate(
+                            run_id, distill_gate_fn=distill_gate_fn, store=store,
+                            send_event_fn=send_event_fn)
+                    if run_branch_judge and not store.is_stop_requested(run_id):
                         overrides = self._run_clean_base_judge(
                             judge_jobs, persona_digest, run_id,
                             config=config, generate_fn=generate_fn,
@@ -1825,6 +1860,20 @@ class ReflectionRunner:
 
     # ── targeted [ask]-loop close ──────────────────────────────────────────── #
 
+    # The pass's budget. It thinks (the reflect generate's default), so this must cover a
+    # whole deliberation PLUS the DECISION/ANSWER block. It was 768, and 768 is below the
+    # 1024 at which `_reflect_think_ceiling` reserves room for the answer, so nothing kept
+    # the thought from spending all of it. Measured on the main box's journal (191 passes,
+    # 2026-08-12 → 09-24): a pass that finished ran ~610 tokens at the median and ~745 at
+    # p90, i.e. the natural length sits AT the old cap — and 83 passes (43%) ran into it:
+    # 46 cut inside the thought, 36 cut after `DECISION: yes`, whose half-written ANSWER
+    # ("Identity in a systemic sense") closed the ask and was distilled into a
+    # `[persona]` / `[fact]` record (34 of the 120 answered closures in the op-log). The
+    # frozen ask judge found them as OPEN. 4096 is ~5× the median, and the think ceiling
+    # now closes the thought with ≥1229 tokens left for the answer; a truncated pass is
+    # refused outright below.
+    _RESOLVE_ASK_MAX_NEW_TOKENS = "4096"
+
     # Small system instruction for the per-thread ask-resolution pass. The transcript +
     # question are supplied in the content; this only frames the judgement.
     _RESOLVE_ASK_SYSTEM = (
@@ -1861,6 +1910,70 @@ class ReflectionRunner:
         return "\n".join(lines)
 
     @staticmethod
+    def _ask_resolution_content(question: str, who: str, transcript: str) -> str:
+        """The resolution pass's user turn: the question, the whole conversation, the form."""
+        return (
+            f"You raised a question of your own and brought it into this "
+            f"conversation with {who}:\n\n  {question}\n\n"
+            f"Here is the whole conversation:\n\n{transcript}\n\n"
+            f"Decide, honestly, whether this conversation actually answered your "
+            f"question — whether you learned what you wanted to know. Answer in "
+            f"exactly this form:\n\n"
+            f"DECISION: yes            (or: no)\n"
+            f"ANSWER: <if yes, state plainly, in your own words, what you now know — "
+            f"the answer to your question.>"
+        )
+
+    @classmethod
+    def _resolve_ask_on_thread(cls, generate_fn: Callable, question: str, who: str,
+                               transcript: str, filename: str) -> tuple[str, str]:
+        """One targeted resolution pass → :meth:`_ask_resolution_outcome`'s pair.
+
+        The pass itself — prompt, sampling, budget, truncation refusal — in one place, so
+        the repair of the closures the 768-token pass cut (`core.resolution_repair`)
+        re-reads a conversation exactly as this runner now does. Raises what the
+        generate raises; the caller decides what a failed call means."""
+        raw = generate_fn(
+            cls._ask_resolution_content(question, who, transcript), cls._RESOLVE_ASK_SYSTEM,
+            temperature=0.3, top_p=0.9,
+            max_new_tokens_setting=cls._RESOLVE_ASK_MAX_NEW_TOKENS,
+            before_session=filename, disable_rag=True,
+            rag_include_chat=False,
+        )
+        return cls._ask_resolution_outcome(
+            raw, getattr(generate_fn, "last_truncated", None),
+            getattr(generate_fn, "last_loop", None))
+
+    @staticmethod
+    def _ask_resolution_outcome(raw: str, truncated, looped=None) -> tuple[str, str]:
+        """Decide what one resolution pass's output may do, before anything is written:
+        ``("resolved", answer)`` / ``("open", "")`` / ``("refused", reason)``.
+
+        **A truncated generation is never a resolution.** The ANSWER is the last field, so
+        a pass that hit its cap (or the loop guard) was cut inside it — or inside the
+        thought, where gemma's prefilled channel arrives as untagged prose and a
+        ``DECISION: yes`` the deliberation rehearsed would parse as the decision
+        (`reasoning_text.truncated_before_answer`). Either way nothing complete was
+        written, and before this check a cut ANSWER closed the ask and was distilled as
+        persona / fact. Refused, the ask simply stays open. A reasoning marker left in the
+        answer is refused for the same reason: it would be distilled verbatim.
+        """
+        from core import reasoning_text
+        if truncated:
+            if reasoning_text.truncated_before_answer(raw or "", True):
+                return "refused", "cut off inside its reasoning, before any answer"
+            return "refused", (("halted by the loop guard" if looped else "hit the token cap")
+                               + " before the answer was complete")
+        answered, answer = ReflectionRunner._parse_ask_resolution(raw)
+        if not answered:
+            return "open", ""
+        if not answer.strip():
+            return "refused", "said yes but wrote no answer"
+        if reasoning_text.has_reasoning_leak(answer):
+            return "refused", "a reasoning marker leaked into the answer"
+        return "resolved", answer
+
+    @staticmethod
     def _parse_ask_resolution(text: str) -> tuple[bool, str]:
         """Parse the DECISION/ANSWER block → (answered, answer), reasoning-safe.
 
@@ -1869,11 +1982,9 @@ class ReflectionRunner:
         unrecognized line, so a truncated generation reads as 'not answered' (leaving the
         ask open) rather than a spurious resolve.
         """
-        text = text or ""
-        text = re.sub(r"<think>.*?</think>", "\n", text, flags=re.DOTALL | re.IGNORECASE)
-        idx = text.lower().find("<think>")
-        if idx != -1:
-            text = text[:idx]
+        from core import reasoning_text
+        # The shared stripper (every shape a normalizer can leave, not only a tagged block).
+        text = reasoning_text.answer_after_think(text or "")
         answered = False
         m = re.search(r"^\s*DECISION\s*:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE)
         if m and m.group(1).strip().lower().startswith(
@@ -1957,31 +2068,24 @@ class ReflectionRunner:
             ask_kind = ask.get("ask_kind") or ""
             if not key or not question:
                 continue
-            content = (
-                f"You raised a question of your own and brought it into this "
-                f"conversation with {who}:\n\n  {question}\n\n"
-                f"Here is the whole conversation:\n\n{transcript}\n\n"
-                f"Decide, honestly, whether this conversation actually answered your "
-                f"question — whether you learned what you wanted to know. Answer in "
-                f"exactly this form:\n\n"
-                f"DECISION: yes            (or: no)\n"
-                f"ANSWER: <if yes, state plainly, in your own words, what you now know — "
-                f"the answer to your question.>"
-            )
             try:
-                raw = generate_fn(
-                    content, self._RESOLVE_ASK_SYSTEM,
-                    temperature=0.3, top_p=0.9, max_new_tokens_setting="768",
-                    before_session=filename, disable_rag=True,
-                    rag_include_chat=False,
-                )
+                outcome, answer = self._resolve_ask_on_thread(
+                    generate_fn, question, who, transcript, filename)
             except Exception as e:
                 self._emit(store, send_event_fn, run_id, "pass_warning",
                            phase="ask_resolution", session=filename,
                            message=f"Ask-resolution generate error (skipped): {e}")
                 continue
-            answered, answer = self._parse_ask_resolution(raw)
-            if not answered:
+            if outcome == "refused":
+                # Nothing is lost: the ask stays open for a later pass (consolidation's
+                # OPEN QUESTIONS, a revisit) instead of closing on a half-written answer.
+                self._emit(store, send_event_fn, run_id, "pass_warning",
+                           phase="ask_resolution", session=filename,
+                           question=question, ask_kind=ask_kind,
+                           message=f"Ask-resolution refused ({answer}); left open: "
+                                   f"{question[:70]}")
+                continue
+            if outcome != "resolved":
                 self._emit(store, send_event_fn, run_id, "ask_unresolved",
                            phase="ask_resolution", session=filename,
                            question=question, ask_kind=ask_kind,
@@ -2011,7 +2115,10 @@ class ReflectionRunner:
                        phase="ask_resolution", session=filename,
                        question=question, ask_kind=ask_kind, answer=answer,
                        distilled=bool(summary.get("weights")),
-                       message=f"Resolved: {question[:70]}")
+                       distill_pending=bool(summary.get("distill_pending")),
+                       message=(f"Resolved: {question[:70]}"
+                                + (" (the distill waits for the gate)"
+                                   if summary.get("distill_pending") else "")))
         # An eviction changes live membership, so rebuild the reflection RAG index once
         # (only if something resolved) — makes the closed ask stop surfacing for this
         # run's later sessions and its revision pass.
@@ -5107,6 +5214,72 @@ class ReflectionRunner:
         )
         return counts.get("purged", 0)
 
+    def _run_impression_glue_repair(self, run_id, *, config, store, send_event_fn):
+        """Repair the open asks the pre-fix consolidation parser glued an ``[impression]``
+        onto (``trigger_hygiene.plan_impression_glue``). The synthesis pass writes
+        impressions into the same ``## RAG`` section as its asks, and each was folded into
+        the ask above it; for about half, ``compact_ask`` then kept the impression and
+        dropped the question. Cut at the marker, or — when nothing of the question is
+        left — recovered from the pass's raw output in the activity journal (the line
+        above the impression), else evicted as not a question. Model-free; writes through
+        ``self._writer`` (staging), re-inserting under the same key. Opt out with
+        ``overrides.impression_glue=False``. Idempotent: nothing to do once repaired."""
+        if getattr(config.overrides, "impression_glue", None) is False:
+            return 0
+        from core import trigger_hygiene
+        try:
+            mem = ReflectionMemory(
+                self._memory_dir, fallback_memory_dir=self._fallback_memory_dir)
+            live = mem.live_items()
+            plan = trigger_hygiene.plan_impression_glue(live)
+            if any(p["how"] == "unrecoverable" for p in plan):
+                plan = trigger_hygiene.plan_impression_glue(live, self._journal_rag_sections())
+        except Exception as e:
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="impression_glue",
+                       message=f"Impression-glue repair skipped (memory unreadable): {e}")
+            return 0
+        if not plan:
+            return 0
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="impression_glue",
+                   message=f"Impression-glue repair — {len(plan)} ask(s) carry an [impression]…")
+        try:
+            counts = self._writer.write_impression_glue_repair(plan)
+        except Exception as e:
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="impression_glue",
+                       message=f"Impression-glue repair write failed (skipped): {e}")
+            return 0
+        self._emit(
+            store, send_event_fn, run_id, "phase_done", phase="impression_glue",
+            message=(f"Impression-glue repair — {counts.get('cut', 0)} cut at the marker, "
+                     f"{counts.get('recovered', 0)} question(s) recovered from the journal, "
+                     f"{counts.get('evicted', 0)} evicted as not a question."),
+            text="\n".join(f"{p['how']}: {str(p['old'])[:110]}\n  → {p['new'] or '(evicted)'}"
+                           for p in plan))
+        return sum(counts.values())
+
+    def _journal_rag_sections(self) -> list:
+        """The ``## RAG`` sections of the synthesis outputs the activity journal kept
+        (``data/hot/activity/activity*.jsonl`` beside the live memory dir) that carry an
+        ``[impression]`` — where a question the glue dropped can still be read."""
+        live = self._fallback_memory_dir or self._memory_dir
+        journal = Path(live).parent / "activity"
+        out: list = []
+        for f in sorted(journal.glob("activity*.jsonl")):
+            try:
+                with f.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        if "[impression]" not in line or "## RAG" not in line:
+                            continue
+                        try:
+                            body = str(json.loads(line).get("text") or "")
+                        except Exception:
+                            continue
+                        if "## RAG" in body:
+                            out.append(body.split("## RAG", 1)[1])
+            except OSError:
+                continue
+        return out
+
     def _run_clean_base_prompt_patterns(self, run_id, *, config, generate_fn, store,
                                         send_event_fn):
         """Fold the logged prompt deltas into patterns — the prompt-rewrite BUDGET
@@ -5328,6 +5501,59 @@ class ReflectionRunner:
         self._emit(store, send_event_fn, run_id, "phase_done", phase="fact_placement",
                    message=f"Fact placement done — {placed}/{len(facts)} fact(s) hosted")
         return placed
+
+    def _run_clean_base_distill_gate(self, run_id: str, *, distill_gate_fn: Callable,
+                                     store: ReflectionRunStore,
+                                     send_event_fn: Optional[Callable]) -> None:
+        """The distill gate (``core/distill_gate.py``), inside the clean base: judge each
+        closure that waits for it and distill or withhold it through this run's writer, so
+        its records and decisions are staged with the rest of the run. *distill_gate_fn*
+        (from ``reflection_service``) builds the judge on the swapped-in base."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="distill_gate",
+                   message="Distill gate (clean base) — the closures waiting for the judge…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "distill_gate", message=text)
+
+        try:
+            tally = distill_gate_fn(
+                writer=self._writer, consolidation_dir=self._consolidation_dir,
+                memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say,
+                should_stop=lambda: store.is_stop_requested(run_id)) or {}
+        except Exception as e:  # noqa: BLE001 — the gate failing leaves its closures pending
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="distill_gate",
+                       message=f"Distill gate error (closures stay pending): {e}")
+            return
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "nothing waited"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="distill_gate",
+                   message=f"Distill gate done — {done}")
+
+    def _run_reset_conversations(self, run_id: str, *, reset_conversations_fn: Callable,
+                                 store: ReflectionRunStore,
+                                 send_event_fn: Optional[Callable]) -> None:
+        """The context-reset test's conversations (``core/reset_test.py``), on the adapter,
+        before the clean-base batch. They go to the test's own store (an instrument record,
+        like the ask judge's verdicts), not to this run's staging; what the gate decides
+        from them is staged. A failure leaves the positions waiting."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="reset_test",
+                   message="Reset test — fresh-session conversations for the positions waiting on it…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "reset_test", message=text)
+
+        try:
+            tally = reset_conversations_fn(
+                memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say,
+                should_stop=lambda: store.is_stop_requested(run_id)) or {}
+        except Exception as e:  # noqa: BLE001 — the positions keep waiting for the test
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="reset_test",
+                       message=f"Reset test conversations error (the positions keep waiting): {e}")
+            return
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "none waited"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="reset_test",
+                   message=f"Reset test conversations done — {done}")
 
     def _place_fact(self, fact: dict, host: dict) -> bool:
         """Snapshot *host* onto the fact anchor as ``source_exchange`` (a re-register that

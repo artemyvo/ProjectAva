@@ -190,6 +190,76 @@ def plan_trigger_purge(items: list[dict]) -> list[dict]:
     return plan
 
 
+# ── asks the pre-fix parser glued an [impression] onto ────────────────────────────
+#
+# The synthesis pass writes `- [impression] …` lines into the same `## RAG` section as its
+# asks, and until 2026-09-26 `reflection_writer._parse_items` folded each into the ask
+# above it as a wrapped line. 210 of 1,030 ask inserts on the main box carry one; in 102
+# `compact_ask` then kept the impression's sentences and dropped the question, so the
+# "question" raised to the person was an impression. The parser is fixed; this repairs
+# the asks already written — cut at the marker, or, when nothing of the question is left,
+# recovered from the pass's raw output in the activity journal (the `[ask:*]` line right
+# above the impression). An ask whose question cannot be recovered is not a question:
+# the caller evicts it (the impression itself was written on its own all along).
+
+_GLUED_IMPRESSION_RE = re.compile(r"(?:^|\s)[-*]?\s*\[impression\]", re.IGNORECASE)
+_ASK_LINE_RE = re.compile(r"^[ \t]*[-*]?[ \t]*\[ask(?:[:\- ][A-Za-z_.]+)?\][ \t]*(.*)$",
+                          re.IGNORECASE)
+_ASK_ANNOTATION_RE = re.compile(r"\((?:seen|lookup)\s*:?[^)]*\)", re.IGNORECASE)
+
+
+def split_glued_impression(content: Optional[str]) -> tuple:
+    """``(question, impression)`` of an ask with an ``[impression]`` glued on; the
+    question alone (and ``""``) when there is none. Whitespace is collapsed."""
+    text = " ".join(str(content or "").split())
+    m = _GLUED_IMPRESSION_RE.search(text)
+    if not m:
+        return text, ""
+    return text[:m.start()].rstrip(" -*").strip(), text[m.end():].strip()
+
+
+def question_before(sections: list, impression: str) -> str:
+    """The question of the ``[ask:*]`` line right above *impression* in a pass's raw
+    ``## RAG`` section, or ``""``. *sections* are those raw sections (the activity
+    journal's synthesis outputs); matched on the impression's opening words."""
+    head = " ".join(str(impression or "").split())[:60]
+    if len(head) < 20:
+        return ""
+    for sec in sections:
+        lines = [ln for ln in str(sec or "").splitlines() if ln.strip()]
+        for i, ln in enumerate(lines):
+            if i and head in " ".join(ln.split()):
+                m = _ASK_LINE_RE.match(lines[i - 1])
+                if m:
+                    q = " ".join(_ASK_ANNOTATION_RE.sub(" ", m.group(1)).split())
+                    if q:
+                        return q
+    return ""
+
+
+def plan_impression_glue(items: list[dict], sections: Optional[list] = None) -> list[dict]:
+    """The live asks carrying a glued ``[impression]``, each with what it becomes:
+    ``new`` = the question (compacted like any ask) — cut at the marker (``how: cut``) or
+    recovered from *sections* (``recovered``) — or ``None`` when nothing of the question
+    is left (``unrecoverable``: the caller evicts it). Pure; idempotent, since a repaired
+    ask carries no marker."""
+    plan: list[dict] = []
+    for rec in items:
+        if rec.get("kind") != "ask":
+            continue
+        content = str(rec.get("content") or "")
+        if "[impression]" not in content.lower():
+            continue
+        question, impression = split_glued_impression(content)
+        how = "cut"
+        if not question:
+            question = question_before(sections or [], impression)
+            how = "recovered" if question else "unrecoverable"
+        plan.append({"key": rec.get("key"), "record": rec, "old": content,
+                     "new": compact_ask(question) if question else None, "how": how})
+    return plan
+
+
 def summarize(plan: list[dict]) -> list[dict]:
     """Client-facing view of a purge plan; drops the raw records."""
     return [{
@@ -290,6 +360,27 @@ def _selftest() -> None:
     got = compact_ask(runon, max_chars=100)
     assert got.endswith("чем это закончилось?"), got
     assert len(got) <= 100 and not got.startswith(" ")
+
+    # Asks the pre-fix parser glued an [impression] onto.
+    q = "If synthesis combines contradictory vectors, does the intent behind it matter?"
+    imp = "(about: Dana) She tests me by withdrawing and waits to see what I do with the silence."
+    assert split_glued_impression(f"{q} - [impression] {imp}") == (q, imp)
+    assert split_glued_impression(f"- [impression] {imp}") == ("", imp)
+    assert split_glued_impression(q) == (q, "")
+    raw = f"ABOUT: x\n\n## RAG\n- [ask:user] {q} (seen: the July chat)\n- [impression] {imp}\n"
+    assert question_before([raw], imp) == q, question_before([raw], imp)
+    assert question_before([raw], "(about: Dana) An impression nobody wrote down anywhere.") == ""
+    items = [
+        {"kind": "ask", "key": "k1", "content": f"{q} - [impression] {imp}"},
+        {"kind": "ask", "key": "k2", "content": f"- [impression] {imp}"},
+        {"kind": "ask", "key": "k3", "content": "- [impression] (about: self) A line no journal kept for me."},
+        {"kind": "ask", "key": "k4", "content": q},
+        {"kind": "fact", "key": "k5", "content": f"x - [impression] {imp}"},
+    ]
+    plan = plan_impression_glue(items, [raw])
+    assert [(p["key"], p["how"], p["new"]) for p in plan] == [
+        ("k1", "cut", q), ("k2", "recovered", q), ("k3", "unrecoverable", None)], plan
+    assert plan_impression_glue([{"kind": "ask", "key": "k1", "content": q}], [raw]) == []   # idempotent
 
     print("trigger_hygiene self-test OK")
 

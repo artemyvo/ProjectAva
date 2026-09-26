@@ -13,6 +13,8 @@ from PyQt6.QtCore import QTimer, Qt
 
 from ui.chat_widget import ChatWidget
 from ui.chat_review_widget import ChatReviewWidget
+from ui.revisions_widget import RevisionsWidget
+from ui.ask_judge_widget import AskJudgeWidget
 from ui.sleep_widget import SleepWidget
 from ui.prompt_widget import PromptWidget
 from ui.activity_widget import ActivityWidget
@@ -77,6 +79,8 @@ class MainWindow(QMainWindow):
         self.facts_widget = FactsWidget(self.chat_widget, self)
         self.migrate_widget = MigrateWidget(self.chat_widget, self)
         self.training_review_widget = TrainingReviewWidget(self.chat_widget, self)
+        self.revisions_widget = RevisionsWidget(self.chat_widget, self)
+        self.ask_judge_widget = AskJudgeWidget(self.chat_widget, self)
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self.chat_widget, "Chat")
@@ -93,6 +97,8 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self.facts_widget, "Facts")
         self._tabs.addTab(self.migrate_widget, "Migrate")
         self._tabs.addTab(self.training_review_widget, "Training review")
+        self._tabs.addTab(self.revisions_widget, "Revisions")
+        self._tabs.addTab(self.ask_judge_widget, "Ask judge")
         self.setCentralWidget(self._tabs)
 
         self._tabs.currentChanged.connect(self._on_tab_changed)
@@ -168,6 +174,10 @@ class MainWindow(QMainWindow):
             self.facts_widget.refresh_items()
         elif self._tabs.widget(index) == self.training_review_widget:
             self.training_review_widget.refresh()
+        elif self._tabs.widget(index) == self.revisions_widget:
+            self.revisions_widget.refresh()
+        elif self._tabs.widget(index) == self.ask_judge_widget:
+            self.ask_judge_widget.refresh()
 
     # ---------------------------------------------------------------- #
     # Font management                                                   #
@@ -182,6 +192,8 @@ class MainWindow(QMainWindow):
         font = self._make_text_font()
         self.chat_widget.update_fonts(font)
         self.chat_review_widget.update_fonts(font)
+        self.revisions_widget.update_fonts(font)
+        self.ask_judge_widget.update_fonts(font)
         self.sleep_widget.update_fonts(font)
         self.prompt_widget.update_fonts(font)
         self.encounter_widget.update_fonts(font)

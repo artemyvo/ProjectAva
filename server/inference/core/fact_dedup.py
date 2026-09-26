@@ -55,7 +55,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from core.persona_cluster import DEFAULT_BLOCK_SIZE as _PERSONA_BLOCK_SIZE
-from core.reflection_digest import _parse_groups   # generic numbered-item partition parser
+from core.reflection_digest import (   # the generic numbered-item partition + its budget
+    _parse_groups,
+    grouping_budget,
+)
 
 # A survivor's merged trigger fuses this many distinct recall cues at most, so the
 # fact's single embedding vector can't be smeared across an unbounded topic set.
@@ -253,8 +256,11 @@ def cluster_facts(facts: list[dict], generate_fn: Callable, *,
         resp = generate_fn(
             _listing(ordered), load_dedup_prompt(),
             temperature=0.0, top_p=1.0,
-            max_new_tokens_setting="1024",
-            before_session="", disable_rag=True, disable_thinking=True)
+            max_new_tokens_setting=grouping_budget(len(ordered)),
+            before_session="", disable_rag=True, disable_thinking=True,
+            # A numbered partition, like every block `group_block` runs — the diversity
+            # guard would halt it at 128 tokens (see the reflect generate_fn's note).
+            degen_stop=False)
     except Exception:
         return None
     groups = _parse_groups(resp, len(ordered))
@@ -405,12 +411,19 @@ def _selftest() -> None:
     # At or below the threshold it stays the single flat call it always was.
     flat_calls: list[int] = []
 
+    flat_kw: list[dict] = []
+
     def flat_generate(listing, system, **kw):
         flat_calls.append(len(listing.splitlines()))
+        flat_kw.append(kw)
         return "GROUP: 1\nGROUP: 2\nGROUP: 3\nGROUP: 4"
 
     cluster_facts(facts, flat_generate)
     assert len(flat_calls) == 1, f"small corpus should be one call, got {len(flat_calls)}"
+    # A numbered partition: the diversity guard off (it halts one at 128 tokens), the
+    # verbatim guard on, the budget sized to the listing — as in every group_block call.
+    assert flat_kw[0].get("degen_stop") is False, flat_kw
+    assert "stop_on_repeat" not in flat_kw[0], flat_kw
 
     # Below-threshold input is a no-op.
     assert cluster_facts(facts[:1], fake_generate) is None

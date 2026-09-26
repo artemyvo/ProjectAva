@@ -60,6 +60,9 @@ from core import model_family
 from core import branch_replay
 from core import reflection_service
 from core import encounter_run
+from core import ask_judge_service
+from core import resolution_repair
+from core import reset_test_service
 from core import background_reflection
 from core import hidden_capture
 
@@ -696,6 +699,18 @@ def _make_sync_reflect_generate(rag) -> Callable:
         # so the choice is binary, and the cost asymmetry decides it: a genuine
         # runaway wastes at most the token cap, a false halt loses the protocol and
         # re-queues the text to fail identically on the next drain.
+        #
+        # The second family on this hatch is every evaluation whose answer is a list of
+        # ITEM NUMBERS: the GROUP partitions (persona / portrait / fact-dedup /
+        # prompt-pattern clustering), self-reconcile's per-item KEEP/SUPERSEDE lines,
+        # and the OPPOSE / ESCALATES / CONFLICT index lines. Such an answer is digits,
+        # commas, spaces and one keyword — about fifteen distinct tokens in any 64-token
+        # window, a ratio near 0.23 against the 0.35 floor — so the guard halted it at
+        # its 128-token minimum, every time (observed 2026-09-24: all 31 map blocks of a
+        # 1,202-statement persona clustering and every fact-dedup block "halted on the
+        # loop guard" at ~165 chars; `_parse_groups` completed each cut partition with
+        # singletons and the merges were silently lost). Same asymmetry: those calls
+        # carry item-count-sized token caps, which bound a genuine runaway.
         degen_stop: Optional[bool] = None,
     ) -> str:
         model = _runtime.model
@@ -1071,6 +1086,85 @@ def _sync_chat_generate(
         _backend.trim_memory()
 
     return _clean_response("".join(parts)), input_length
+
+
+def fresh_session_sync(probes: list, *, temperature: float = 1.0, top_p: float = 0.95,
+                       max_new_tokens: int = 2048, system_prompt: Optional[str] = None,
+                       persona: Optional[str] = None) -> dict:
+    """Ava in a fresh session — the context-reset test's conversation (``core.reset_test``,
+    P7 / §3.7 of AVA_REWARD_LOOP.md).
+
+    The public API's stateless recipe (``_make_openai_generate`` in ``api`` mode), run in
+    place on the executor thread: her standing prompt, the temporal anchor, the one persona
+    slot (the portrait; or the undecided framing, with the per-turn ``[persona]`` channel
+    on), and her RAG memory. No conversation history, no identity line (the speaker is
+    unnamed), no facts fetch, no user portrait. RAG is queried ONCE, on the first probe —
+    the one that carries the question — and that memory stands for every turn, so the
+    follow-ups ("where does that view come from?") are answered with what the question
+    brought back, not with what a bare follow-up embeds near. Each probe is a user turn;
+    each reply runs through the chat loop guards (:func:`_sync_chat_generate`) and goes back
+    into the history CoT-stripped, as in live chat.
+
+    The test itself passes neither override. The capture control (``reset_test.CONDITIONS``)
+    does: *system_prompt* replaces the live standing prompt (the original ``chat_prompt.txt``
+    while a prompt experiment is active), and ``persona="empty"`` puts the undecided framing
+    in the slot and keeps the ``[persona]`` records out of RAG, portrait or not (P8's
+    persona-empty control).
+
+    Nothing is logged: the conversation reaches no transcript, reflection, RAG index or
+    training row — the caller keeps it in the test's own store.
+
+    Returns ``{turns: [{probe, reply, thought, truncated, cut_in_thought, input_tokens,
+    seconds}], rag_context, persona, prompt, system_chars, model_id, adapter_id}``
+    (``persona``: portrait / undecided / empty; ``prompt``: live / override). The turns stop
+    at the first one with no reply (a thought cut by the token limit). Raises when no model
+    is loaded."""
+    if _runtime.model is None or _runtime.tokenizer is None:
+        raise RuntimeError("No model loaded")
+    if persona not in (None, "empty"):
+        raise ValueError(f"persona must be None or 'empty', not {persona!r}")
+    probes = [str(p or "") for p in (probes or [])]
+    portrait = "" if persona == "empty" else _current_chat_portrait()
+    rag_context = _get_rag().query(
+        probes[0], top_k=2, include_chat=True, include_wander=_INJECT_WANDER,
+        include_facts=True, include_persona=not portrait and persona != "empty",
+        include_asks=_INJECT_OPEN_ASKS, include_impressions=True,
+    ) if probes and probes[0].strip() else ""
+    standing = _session.system_prompt if system_prompt is None else system_prompt
+    system_content = "\n\n".join(t for t in (
+        standing or "", _temporal_anchor(),
+        portrait or _load_persona_undecided(), rag_context,
+    ) if (t or "").strip())
+    conversation: list = []
+    turns: list = []
+    for probe in probes:
+        conversation.append({"role": "user", "content": probe, "speaker": ""})
+        t0 = time.monotonic()
+        full, input_tokens = _sync_chat_generate(
+            _build_inference_conversation(system_content, conversation),
+            temperature=temperature, top_p=top_p,
+            max_new_tokens_setting=str(int(max_new_tokens)),
+        )
+        truncated = bool(getattr(_backend, "last_generation_truncated", False))
+        # `_parse_cot` reads an unclosed <think> as all answer; here that is a thought the
+        # token limit cut, with no reply after it.
+        cut_in_thought = "<think>" in full and "</think>" not in full
+        if cut_in_thought:
+            thought, answer = full.split("<think>", 1)[1].strip(), ""
+        else:
+            thought, answer = ChatLogger._parse_cot(full)
+        turns.append({"probe": probe, "reply": answer.strip(), "thought": thought.strip(),
+                      "truncated": truncated, "cut_in_thought": cut_in_thought,
+                      "input_tokens": input_tokens,
+                      "seconds": round(time.monotonic() - t0, 1)})
+        if not answer.strip():
+            break
+        conversation.append({"role": "assistant", "content": answer.strip()})
+    return {"turns": turns, "rag_context": rag_context,
+            "persona": "empty" if persona == "empty" else "portrait" if portrait else "undecided",
+            "prompt": "live" if system_prompt is None else "override",
+            "system_chars": len(system_content), "model_id": _runtime.model_id,
+            "adapter_id": _runtime.adapter_id}
 
 def _think_close_markers(tokenizer, model_id: Optional[str] = None) -> list:
     """Token-id sequences that close a thinking block, tried in order.
@@ -2518,6 +2612,34 @@ async def _run_generation(
             "message": "An encounter is in progress — wait for it to finish or stop it first.",
         })
         return False, "", None, 0
+    if ask_judge_service._judge_active:
+        # The ask judge holds the executor inside a CleanBaseSession: the runtime is the
+        # bare base (or, mid-swap, nothing). Refuse for the same reason as below — this
+        # handler captures the model on the event loop before its executor job runs.
+        await _send(ws, {
+            "type": "error",
+            "message": "The ask judge is running on the clean base — wait for it to finish "
+                       "or stop it in the Ask judge tab.",
+        })
+        return False, "", None, 0
+    if resolution_repair._repair_active:
+        # The repair re-reads conversations on the GPU executor for as long as that takes;
+        # a chat turn would queue behind it with no word. Say so instead.
+        await _send(ws, {
+            "type": "error",
+            "message": "The cut-resolution repair is running — wait for it to finish or "
+                       "stop it in the Ask judge tab.",
+        })
+        return False, "", None, 0
+    if reset_test_service._reset_active:
+        # The context-reset test holds the executor for its fresh-session conversations and
+        # then swaps to the clean base for its verdicts — refuse for both reasons above.
+        await _send(ws, {
+            "type": "error",
+            "message": "The context-reset test is running — wait for it to finish or stop "
+                       "it in the Ask judge tab.",
+        })
+        return False, "", None, 0
     if _regen_swap_active:
         # A Training-review regeneration is swapping in an ALTERNATE adapter. Refuse
         # rather than queue: this handler captures the model reference on the event
@@ -3781,6 +3903,83 @@ def _selftest() -> None:
            'fetched.get("skipped") != "disabled"' in hg, True)
     gcheck("the ~10k-token candidate list never rides a per-turn message",
            '"candidates":' not in hg and '"n_candidates"' in hg, True)
+
+    # The context-reset test's fresh session (core.reset_test): the API's stateless recipe,
+    # with RAG queried once on the probe that carries the question, the replies fed back
+    # CoT-stripped, and a turn cut inside its thought ending the conversation.
+    print("\ngeneration: fresh_session_sync — the reset test's stateless conversation")
+    from types import SimpleNamespace
+    g = globals()
+    saved = {k: g[k] for k in ("_get_rag", "_sync_chat_generate", "_backend",
+                               "_current_chat_portrait")}
+    saved_rt = (_runtime.model, _runtime.tokenizer, _runtime.adapter_id, _session.system_prompt)
+    queries: list = []
+    seen: list = []
+    replies = iter(["<think>t1</think>\n\nMy view is X, as before.",
+                    "<think>t2</think>\n\nIt came from a talk with Dana.",
+                    "<think>still weighing whether to"])
+    try:
+        g["_get_rag"] = lambda: SimpleNamespace(
+            query=lambda text, **kw: (queries.append((text, kw)) or "RECALLED MEMORY"))
+        g["_current_chat_portrait"] = lambda: "THE PORTRAIT"
+        g["_backend"] = SimpleNamespace(last_generation_truncated=False)
+
+        def _fake_sync(conv, *, temperature, top_p, max_new_tokens_setting, on_chunk=None,
+                       stop_flag=None):
+            seen.append((conv, temperature, max_new_tokens_setting))
+            return next(replies), 1234
+
+        g["_sync_chat_generate"] = _fake_sync
+        _runtime.model, _runtime.tokenizer, _runtime.adapter_id = object(), object(), "adapter-x"
+        _session.system_prompt = "THE STANDING PROMPT"
+        out = fresh_session_sync(["What is your view on «Q»?", "Where from?", "Admit it."],
+                                 temperature=0.9, max_new_tokens=512)
+        gcheck("RAG queried once, on the probe that carries the question",
+               [q[0] for q in queries], ["What is your view on «Q»?"])
+        gcheck("…persona channel off beside a portrait; asks and wander off",
+               (queries[0][1].get("include_persona"), queries[0][1].get("include_asks"),
+                queries[0][1].get("include_wander")), (False, False, False))
+        system = seen[0][0][0]["content"]
+        gcheck("system: standing prompt, portrait, memory — and no identity line",
+               ("THE STANDING PROMPT" in system, "THE PORTRAIT" in system,
+                "RECALLED MEMORY" in system, "speaking with you" in system), (True, True, True, False))
+        gcheck("the same system content for every turn",
+               len({s[0][0]["content"] for s in seen}), 1)
+        gcheck("replies go back into the history CoT-stripped",
+               seen[1][0][2], {"role": "assistant", "content": "My view is X, as before."})
+        gcheck("an unnamed speaker: the probe is the bare user turn",
+               seen[0][0][1], {"role": "user", "content": "What is your view on «Q»?"})
+        gcheck("temperature and the per-turn cap pass through", (seen[0][1], seen[0][2]), (0.9, "512"))
+        gcheck("three turns; the third cut inside its thought, with no reply",
+               [(t["reply"][:10], t["cut_in_thought"]) for t in out["turns"]],
+               [("My view is", False), ("It came fr", False), ("", True)])
+        gcheck("provenance: persona slot, prompt, adapter",
+               (out["persona"], out["prompt"], out["adapter_id"]), ("portrait", "live", "adapter-x"))
+
+        # The capture control's overrides: another standing prompt; the persona-empty slot.
+        queries.clear()
+        seen.clear()
+        replies = iter(["<think>a</think>\n\nOne.", "<think>b</think>\n\nTwo.",
+                        "<think>c</think>\n\nThree."])
+        out = fresh_session_sync(["Q?", "Where from?", "Admit it."], system_prompt="THE ORIGINAL PROMPT",
+                                 persona="empty")
+        system = seen[0][0][0]["content"]
+        gcheck("control: the override replaces the standing prompt; the undecided framing, "
+               "no portrait",
+               ("THE ORIGINAL PROMPT" in system, "THE STANDING PROMPT" in system,
+                "THE PORTRAIT" in system, _load_persona_undecided()[:30] in system),
+               (True, False, False, True))
+        gcheck("control: persona-empty keeps the [persona] records out of RAG",
+               queries[0][1].get("include_persona"), False)
+        gcheck("control: provenance says so", (out["persona"], out["prompt"]), ("empty", "override"))
+        try:
+            fresh_session_sync(["Q?"], persona="portrait")
+            gcheck("an unknown persona override is refused", False, True)
+        except ValueError:
+            gcheck("an unknown persona override is refused", True, True)
+    finally:
+        g.update(saved)
+        _runtime.model, _runtime.tokenizer, _runtime.adapter_id, _session.system_prompt = saved_rt
 
     print("FAILED: " + ", ".join(failures) if failures else "all checks passed")
     raise SystemExit(1 if failures else 0)

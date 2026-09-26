@@ -58,6 +58,7 @@ from core.reflection_digest import (      # the grouping primitives this reuses 
     _evidence_entry,
     _parse_groups,
     _weighted_recurrence,
+    grouping_budget,
     load_cluster_prompt,
 )
 
@@ -128,15 +129,20 @@ def group_block(items: list[dict], generate_fn: Callable,
         return [[items[0]]]
     system = prompt if prompt is not None else load_cluster_prompt()
     render = listing_fn if listing_fn is not None else _listing
-    # ~24 tokens per emitted GROUP line plus headroom, bounded — enough for the
-    # worst case (every statement its own group) without an open-ended budget.
-    max_new = str(min(4000, len(items) * 24 + 256))
     try:
         resp = generate_fn(
             render(items), system,
             temperature=0.0, top_p=1.0,
-            max_new_tokens_setting=max_new,
-            before_session="", disable_rag=True, disable_thinking=True)
+            max_new_tokens_setting=grouping_budget(len(items)),
+            before_session="", disable_rag=True, disable_thinking=True,
+            # The diversity guard (Layer 2, `_DegenStop`) OFF. A correct answer here is
+            # `GROUP: 1, 10, 13, 20` lines — digits, commas, spaces and one keyword, far
+            # below the guard's distinct-token floor — so it halted every block at its
+            # 128-token minimum and the unlisted tail came back as singletons. The
+            # budget above bounds a genuine runaway; the verbatim guard stays on (a
+            # partition never repeats a 12-token span unless it is looping). Full
+            # rationale: the `degen_stop` note on generation's reflect generate_fn.
+            degen_stop=False)
     except Exception:
         return None
     groups = _parse_groups(resp, len(items))
@@ -352,6 +358,21 @@ def _selftest() -> None:
     assert weights == sorted(weights, reverse=True), weights
     print(f"map-reduce: 90 → {stats['map_themes']} (map) → {len(ev)} themes "
           f"in {stats['calls']} calls, rounds={stats['rounds']}")
+
+    # The grouping call's guards: a numbered partition runs with the diversity guard OFF
+    # (it halted every block at 128 tokens live, 2026-09-24) and the verbatim guard left
+    # on, under a budget sized to the block.
+    seen_kw: list = []
+
+    def kw_generate(listing, system, **kw):
+        seen_kw.append(kw)
+        return fake_generate(listing, system)
+
+    assert group_block(base[:12], kw_generate)
+    assert seen_kw and seen_kw[0].get("degen_stop") is False, seen_kw
+    assert "stop_on_repeat" not in seen_kw[0], "the verbatim guard must stay on"
+    assert seen_kw[0]["max_new_tokens_setting"] == grouping_budget(12), seen_kw
+    print("guards: diversity off, verbatim on, block-sized budget")
 
     # Determinism: same input, same fake model, same partition.
     again = run_map_reduce(base, fake_generate, block_size=12)["evidence"]

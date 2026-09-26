@@ -172,7 +172,12 @@ def judge_items(items: list[dict], digest_text: str, generate_fn: Callable,
                 _listing(batch), system,
                 temperature=0.0, top_p=1.0,
                 max_new_tokens_setting=max_new,
-                before_session="", disable_rag=True, disable_thinking=True)
+                before_session="", disable_rag=True, disable_thinking=True,
+                # `<n>: KEEP` lines are the least diverse answer the box asks for: the
+                # diversity guard would halt a batch at 128 tokens (~25 decisions) and
+                # every later item would default to KEEP. See the reflect generate_fn's
+                # `degen_stop` note; `max_new` above bounds a genuine runaway.
+                degen_stop=False)
         except Exception:
             resp = ""
         local = _parse_decisions(resp, len(batch))
@@ -271,6 +276,8 @@ def _selftest() -> None:
 
     def fake_generate(listing, system, **kw):
         assert "Warm, direct" in system, "digest not injected into prompt"
+        # `<n>: KEEP` lines sit below the diversity guard's floor by construction.
+        assert kw.get("degen_stop") is False, kw
         # Supersede the outgrown "guarded" persona (item 4) and the now-false
         # "beginner" fact (item 1); keep the rest.
         return ("1: SUPERSEDE - he's advanced now\n"

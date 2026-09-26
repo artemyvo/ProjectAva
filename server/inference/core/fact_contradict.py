@@ -189,7 +189,8 @@ def find_conflicts(facts: list[dict], generate_fn: Callable) -> Optional[list[li
             _listing(facts), load_contradict_prompt(),
             temperature=0.0, top_p=1.0,
             max_new_tokens_setting="512",
-            before_session="", disable_rag=True, disable_thinking=True)
+            before_session="", disable_rag=True, disable_thinking=True,
+            degen_stop=False)    # CONFLICT index lines — see the reflect generate_fn's note
     except Exception:
         return None
     return _parse_conflicts(resp, len(facts))
@@ -315,6 +316,7 @@ def _selftest() -> None:
     # Fake judge: the two skill facts (whatever their local numbers) conflict.
     def fake_generate(listing, system, **kw):
         assert "beginner" in listing or "experienced" in listing or "coffee" in listing
+        assert kw.get("degen_stop") is False, kw      # CONFLICT index lines
         if "beginner" in listing and "experienced" in listing:
             return "CONFLICT: 1, 2"
         return "NONE"
