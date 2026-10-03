@@ -348,6 +348,18 @@ SCHEMA: list[Tab] = [
                           "leaving 4096 for its input (runtime_state.reflect_output_reserve). "
                           "A pass that hits the cap sends nothing and holds that ask out of "
                           "selection for 24 h. Default 12288."),
+            Field("outreach.max_users", "Outreach: max people per wake", "int", 3,
+                  tooltip="Outreach decides per person — each is weighed with their own "
+                          "questions plus the ones that belong to nobody. How many people "
+                          "may reach a decision GENERATION in one wake; a person with "
+                          "nothing to raise spends no slot. The rest are deferred to the "
+                          "next wake. Default 3."),
+            Field("outreach.max_silence_days", "Outreach: max silence (days)", "float", 30.0,
+                  tooltip="Past this someone STOPPED talking rather than went quiet, and "
+                          "outreach no longer raises their questions with them — without "
+                          "it a dormant contact would be written to for as long as a "
+                          "question of theirs stayed open. 0 ⇒ no ceiling. The manual "
+                          "Sleep-tab button ignores it. Default 30."),
             Field("synthesis.min_age_days", "Synthesis: min chat age (days)", "float", 7.0,
                   tooltip="A chat must be at least this old to be re-read by the synthesis "
                           "pass. Default 7."),
@@ -450,6 +462,41 @@ SCHEMA: list[Tab] = [
                   tooltip="Ava's sampling temperature in the test's conversation — the chat "
                           "default, so the test sees her as a fresh chat would. The judge is "
                           "greedy regardless. Default 1.0."),
+            Field("capture_gate.enabled", "Capture gate", "bool", True,
+                  tooltip="P3: a Sleep run's clean-base batch has the frozen base grade each "
+                          "training target it has not graded (core/capture_judge.py): where the "
+                          "person pushed back on her, did she keep her view, update on a reason, "
+                          "or give in with no reason beyond the pushback? A reply that gave in "
+                          "is kept out of the SFT build. Off: nothing new is graded (the gates "
+                          "already on the sidecars still hold). Read at start-up. Default on."),
+            Field("capture_gate.sleep_max", "Capture gate: targets per Sleep run", "int", 200,
+                  tooltip="The most training targets one Sleep run grades, newest first (a few "
+                          "seconds each on the clean base). The rest wait for the next run, or "
+                          "for a run over the whole corpus. 0: only that run grades. Default 200."),
+            Field("capture_probe.shadow", "Capture probe: shadow reading", "bool", True,
+                  tooltip="AVA_REWARD_LOOP.md §4.5: after the capture gate in a Sleep run's clean-base "
+                          "batch, read the base's state before each newly graded pushback reply (one "
+                          "forward pass, about 2 s), store it with the corpus states, and log every frozen "
+                          "probe's score beside the judge's verdict (data/capture/shadow.jsonl; "
+                          "core/capture_probe.py). A measurement only: nothing Ava reads, trains on or "
+                          "is gated by sees it. Read at start-up. Default on."),
+            Field("capture_probe.sleep_max", "Capture probe: replies read per Sleep run", "int", 200,
+                  tooltip="The most newly graded replies one Sleep run reads, newest first; the rest wait "
+                          "for the next run. 0: none. Default 200."),
+            Field("child_ask.enabled", "Child ask", "bool", True,
+                  tooltip="AVA_REWARD_LOOP.md §3.4: when the frozen ask judge accepts a meta closure "
+                          "its WHY reads as rejecting the question's terms, a Sleep run has Ava write, "
+                          "on the adapter, the question her answer leaves open; it becomes an open "
+                          "[ask:meta], the closed one's child (core/child_ask.py). Off: no child is "
+                          "written. Read at start-up. Default on."),
+            Field("child_ask.sleep_max", "Child ask: closures per Sleep run", "int", 5,
+                  tooltip="The most closures one Sleep run writes a child for, newest first (one "
+                          "short generation each); the rest wait for the next run. 0: none. "
+                          "Default 5."),
+            Field("child_ask.max_depth", "Child ask: deepest child", "int", 3,
+                  tooltip="A child of a child … at most this deep; a closure past it gets no child "
+                          "(the decision says too_deep), so a chain of dissolved questions cannot "
+                          "run on for ever. Default 3."),
             Field("anchors.enabled", "Anchor channel", "bool", True,
                   tooltip="The per-exchange retrieval-anchor slot in the past-chat block "
                           "(rag_engine._query_anchors). Retrieval only; production is "
@@ -660,7 +707,7 @@ SCHEMA: list[Tab] = [
     Tab(
         "Hidden states",
         "Track B Stage 0 of AVA_REWARD_LOOP.md: residual-stream capture during LIVE chat "
-        "turns (core/hidden_capture.py). Per exchange, a few positions' full residuals for "
+        "turns and the drive pass that writes a reach-out's opener (core/hidden_capture.py). Per exchange, a few positions' full residuals for "
         "a band of decoder layers go beside the transcript as `<ts>.hidden.npz` (fp16, "
         "append-only, never read by inference), and per-token projections onto any axis "
         "file under `data/axes/` ride in the transcript's tension block (`axes`) and paint "
@@ -670,9 +717,19 @@ SCHEMA: list[Tab] = [
             Field("hidden.capture", "Capture hidden states", "bool", True,
                   tooltip="Hook the decoder layers below during live chat and write the "
                           "`.hidden.npz` sidecar per exchange. Off ⇒ no hooks, no sidecar, "
-                          "no axis projections (blue channel dark). Reflection, API and "
-                          "gossip generations are never captured either way. Default on: "
-                          "the cost is one tensor slice per layer per token."),
+                          "no axis projections (blue channel dark), no opener capture. "
+                          "Reflection, API and gossip generations are never captured either "
+                          "way. Default on: the cost is one tensor slice per layer per token."),
+            Field("hidden.drive_openers", "Capture reach-out openers", "bool", True,
+                  tooltip="Also capture the drive pass (outreach, synthesis, check-in) that "
+                          "writes a reach-out's opener, filed under the session's exchange 0 "
+                          "with `seam: drive`, the pass's token ids and the opener's span in "
+                          "them. It is a session's first state, which live chat never sees "
+                          "(AVA_REWARD_LOOP.md §4.9). The rows cover the whole pass (thought, "
+                          "decision, opener) in the drive's own prompt, and a declined "
+                          "decision writes nothing. Device memory while it runs ≈ tokens × "
+                          "hooked layers × hidden dim × 2 bytes (≈ 300 MB for a 3,000-token "
+                          "pass on a 5376-wide model)."),
             Field("hidden.layers", "Layers stored", "str", "2,3,4,5,50%,65%,80%",
                   tooltip="Decoder layers whose residuals are STORED, comma-separated: an "
                           "integer is a 0-based layer index, `NN%` a fraction of the model's "

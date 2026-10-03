@@ -11,9 +11,13 @@ its exact generated token series in the transcript's `tension.token_ids` and not
 else. This replays each of them teacher-forced — the prompt rebuilt the way the live
 turn built it (the stored `system_content`, the CoT-stripped history, the user turn,
 the family's chat template and think prefill), then the stored generated ids appended
-raw — and reduces the generated positions exactly as the live hook does
+raw — and reads the positions the live hook reads, reduced as it reduces them
 (`reduce_capture`: residuals at step 0 / paragraph breaks / last token for the stored
-layer band, plus per-token projections onto every axis under `data/axes/`). The result
+layer band, plus per-token projections onto every axis under `data/axes/`). Live row t
+is the state token t is generated from: the prompt's last token at step 0, then each
+generated token but the last. Groups written before 2026-10-02 read one token late (row t
+on generated token t); they carry no `alignment` in their meta, the fixed ones say
+`live`, and the two are never pooled (`core/capture_probe.backfill_positions`). The result
 is appended to the transcript's `.hidden.npz` under a **variant** group,
 ``<exchange_id>~base`` by default, beside any live capture: the live one is under the
 weights that wrote the reply, this one under the bare base, which is the one set of
@@ -49,34 +53,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def _persona_empty_system(prompts_dir: Path) -> str:
-    parts = []
-    for name in ("chat_prompt.txt", "persona_undecided_prompt.txt"):
-        p = prompts_dir / name
-        if p.exists():
-            parts.append(p.read_text(encoding="utf-8").strip())
-    return "\n\n".join(x for x in parts if x)
-
-
-def _conversation(doc: dict, index: int, fallback_system: str) -> tuple:
-    """(conversation, framing) as the live turn assembled it: the exchange's exact
-    system content, the prior exchanges CoT-stripped, the user turn."""
-    exs = doc.get("exchanges") or []
-    ex = exs[index]
-    system = str(ex.get("system_content") or "")
-    framing = "replay"
-    if not system:
-        system, framing = fallback_system, "fallback"
-    conv = [{"role": "system", "content": system}] if system else []
-    for prev in exs[:index]:
-        if not isinstance(prev, dict):
-            continue
-        conv.append({"role": "user", "content": str(prev.get("user_prompt") or "")})
-        conv.append({"role": "assistant", "content": str(prev.get("assistant_response") or "")})
-    conv.append({"role": "user", "content": str(ex.get("user_prompt") or "")})
-    return conv, framing
 
 
 def main(argv=None) -> int:
@@ -185,7 +161,7 @@ def main(argv=None) -> int:
     _log(f"Loaded in {time.monotonic() - t0:.0f} s; {spec['n_layers']} layers, storing "
          f"{store_layers or 'none'}, axes {[a.name for a in spec['axes']] or 'none'}. "
          f"{backend.memory_status()}")
-    fallback_system = _persona_empty_system(_SERVER_DIR / "inference" / "prompts")
+    fallback_system = hc.persona_empty_system(_SERVER_DIR / "inference" / "prompts")
 
     def _decode(ids):
         return text_tok.decode(list(ids))
@@ -198,7 +174,7 @@ def main(argv=None) -> int:
         ex = doc["exchanges"][i]
         gen_ids = [int(t) for t in ex["tension"]["token_ids"]]
         try:
-            conv, framing = _conversation(doc, i, fallback_system)
+            conv, framing = hc.replay_conversation(doc, i, fallback_system)
             prompt = build_inference_prompt(tokenizer, conv, **fam.template_kwargs) + fam.think_prefill
             # Mirror stream_generate's tokenization (default special-token handling).
             prefix_ids = [int(t) for t in text_tok(prompt)["input_ids"]]
@@ -212,8 +188,14 @@ def main(argv=None) -> int:
             _log(f"  [{n}/{len(plan)}] {chat.name} #{i}: {total} tokens > context {args.context}, skipped")
             continue
         try:
-            rows = hc.forward_ids_rows(model, prefix_ids + gen_ids, hook_layers,
-                                       all_positions=True, from_position=len(prefix_ids))
+            # The live hook keeps, for step t, the state token t is generated FROM: the
+            # prompt's last position at step 0, the (t-1)-th generated token after it. Read
+            # those positions, from the prompt's last token through the second-to-last
+            # generated one, so backfill row t is live row t under other weights. Groups
+            # written before 2026-10-02 read from the first generated token on, one token
+            # late; their meta has no `alignment` (core/capture_probe.LEGACY_ALIGNMENT).
+            rows = hc.forward_ids_rows(model, prefix_ids + gen_ids[:-1], hook_layers,
+                                       all_positions=True, from_position=len(prefix_ids) - 1)
             per_layer = {l: [m[t] for t in range(m.shape[0])] for l, m in rows.items()
                          if m.shape[0] == len(gen_ids)}
             cap = hc.reduce_capture(gen_ids, per_layer, _decode, store_layers=store_layers,
@@ -224,7 +206,7 @@ def main(argv=None) -> int:
                 continue
             p = hc.write_sidecar(chat, key, cap, model_id=model_id, adapter_id=adapter_id,
                                  layer_spec=spec["layer_spec"], variant=variant,
-                                 extra_meta={"framing": framing, "backfill": True,
+                                 extra_meta={"framing": framing, "backfill": True, "alignment": "live",
                                              "prefix_tokens": len(prefix_ids),
                                              "history_exchanges": i})
             if p is None:

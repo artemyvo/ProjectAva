@@ -30,6 +30,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPalette
 
 from core.backend_client import BackendClient
+from ui import theme
 
 
 _DEFAULT_SERVER_URL = "ws://localhost:8765"
@@ -940,7 +941,7 @@ class ChatWidget(QWidget):
         self.lbl_anchor_matches.setWordWrap(True)
         self.lbl_anchor_matches.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.lbl_anchor_matches.setStyleSheet("color: palette(mid);")
+        self.lbl_anchor_matches.setStyleSheet(f"color: {theme.MUTED};")
         anchor_row.addWidget(self.lbl_anchor_matches, 1)
         input_layout.addLayout(anchor_row)
 
@@ -1978,6 +1979,12 @@ class ChatWidget(QWidget):
         while no pain series arrives (no axis captured yet), so its absence is visible
         rather than a silent zero. `spans` defaults to the last live reply's; the Chat
         review tab passes a stored exchange's.
+
+        Then ``step 0`` when the server sent one (`spans["step0"]`): the state BEFORE the
+        reply — the first token's tension (0–1) and the relief / pain axes at the prompt's
+        last position, in σ (z-scores, not display strengths). Pain is read validly there:
+        per token over a reply it tracks body and affect words (AVA_REWARD_LOOP.md §4.8
+        Controls). A diagnostic, painted nowhere else.
         """
         if spans is None:
             spans = self._client.last_status.get("tension_spans") or {}
@@ -2007,6 +2014,19 @@ class ChatWidget(QWidget):
                 fmt = QTextCharFormat()
                 fmt.setForeground(colour)
                 cursor.insertText("—" if value is None else f"{value:.2f}", fmt)
+                cursor.insertText(" ", neutral)
+        step0 = spans.get("step0") or {}
+        if step0:
+            cursor.insertText("  step 0 ", neutral)
+            for key, unit, colour in (("tension", "", self._channel_qcolor(1.0, 0.0, 0.0)),
+                                      ("relief", "σ", self._channel_qcolor(0.0, 1.0, 0.0)),
+                                      ("pain", "σ", self._channel_qcolor(0.0, 0.0, 1.0))):
+                if step0.get(key) is None:
+                    continue
+                fmt = QTextCharFormat()
+                fmt.setForeground(colour)
+                value = float(step0[key])
+                cursor.insertText(f"{value:.2f}" if not unit else f"{value:+.2f}{unit}", fmt)
                 cursor.insertText(" ", neutral)
 
     def _append_tension_chip(self, cursor: QTextCursor) -> None:

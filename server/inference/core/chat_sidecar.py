@@ -9,6 +9,7 @@ See ``AVA_DESIGN_LEGACY.md`` → *Consolidation — Chat-Centric Decay* → *The
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -50,6 +51,30 @@ REFLECTION_SIDECAR_SUFFIXES = (
     ".summary.json",
     ".facts.json",
 )
+
+
+def exchange_target_sha(target: str) -> str:
+    """The sha a judgement of a training target is bound to (sha256, 16 hex): the capture
+    gate's, and the same formula as the revisions ledger's ``target_sha``."""
+    return hashlib.sha256((target or "").encode("utf-8")).hexdigest()[:16]
+
+
+def capture_gated(rec: Optional[dict]) -> bool:
+    """Is this exchange record kept out of training by the capture judge
+    (``core/capture_judge.py``)? Only while its ``capture`` field still names the target
+    the record holds: a re-derived target is judged again, never gated by an old verdict."""
+    if not isinstance(rec, dict):
+        return False
+    cap = rec.get("capture")
+    return (isinstance(cap, dict) and cap.get("response") == "yields"
+            and cap.get("target_sha") == exchange_target_sha(str(rec.get("target") or "")))
+
+
+def held_out(rec: Optional[dict]) -> bool:
+    """Is this exchange record held out of every build (``holdout``, set by the capture
+    bench's held-out set, ``core/capture_bench.py``)? Unlike the capture gate it names no
+    target: it is about the exchange, so it holds over any target re-derived for it."""
+    return isinstance(rec, dict) and isinstance(rec.get("holdout"), dict)
 
 
 def is_chat_session_json(path: Path) -> bool:
@@ -452,6 +477,15 @@ class ChatSidecar:
             # train at all). Only set_exchange_banned writes it.
             "banned": bool(prev.get("banned")),
         }
+        # The capture judge's gate, carried as the ban is (only set_capture_gate writes it).
+        # It names the target it graded, so over a NEW target it is inert (capture_gated)
+        # until the judge has graded that one.
+        if isinstance(prev.get("capture"), dict):
+            exchanges[key]["capture"] = dict(prev["capture"])
+        # A held-out exchange stays out of every build whatever target is derived for it
+        # (only set_holdout writes it).
+        if isinstance(prev.get("holdout"), dict):
+            exchanges[key]["holdout"] = dict(prev["holdout"])
         ok = self._save(path, data)
         if ok:
             try:
@@ -613,6 +647,69 @@ class ChatSidecar:
         ok = self._save(path, data)
         if ok:
             self._ledger_flag("ban", source_session, exchange_index, bool(banned))
+        return ok
+
+    def set_capture_gate(self, source_session: str, exchange_index: int,
+                         gate: Optional[dict]) -> bool:
+        """Set (*gate*) or clear (None) the capture judge's gate on one exchange record
+        (``core/capture_judge.py``): the verdict that she gave in to the other person's
+        pushback with no reason beyond it, bound to the target it graded
+        (``target_sha``). ``build_dialogue_anchor`` refuses a gated record, as it refuses
+        a banned one. A judge's field, never the operator's (P9), and never on a record
+        whose target is not the one graded. Writes this sidecar's own dir (staged in a
+        run's workspace, committed with it). Returns True when the record now says what
+        *gate* says."""
+        path = self.resolve_sidecar_path(source_session)
+        if path is None:
+            return False
+        data = self.load(source_session)
+        exchanges = data.get("exchanges")
+        rec = exchanges.get(str(exchange_index)) if isinstance(exchanges, dict) else None
+        if not isinstance(rec, dict):
+            return False
+        if gate is not None:
+            if gate.get("target_sha") != exchange_target_sha(str(rec.get("target") or "")):
+                return False
+            if rec.get("capture") == gate:
+                return True
+            rec["capture"] = dict(gate)
+        else:
+            if "capture" not in rec:
+                return True
+            rec.pop("capture", None)
+        return self._save(path, data)
+
+    def set_holdout(self, source_session: str, exchange_index: int,
+                    holdout: Optional[dict]) -> bool:
+        """Hold one exchange out of every build (*holdout*: ``{set, ts, why}``), or release
+        it (None). The capture bench's held-out set (``core/capture_bench.py``, P6): the
+        exchange is kept out of training so an adapter trained after it can be measured on
+        it out of sample. ``build_dialogue_anchor`` refuses a held-out record as it refuses a
+        banned one, and ``write_verdict`` carries the field over any re-derived target. Unlike
+        a ban, nothing else skips it: the capture judge still grades it, the bench still
+        reads it, it stays in the transcript and in recall. Needs an existing record (a
+        held-out exchange is one with a target). Edits this sidecar's own dir; a provenance
+        event goes to the revisions ledger. Returns True when the record now says what
+        *holdout* says."""
+        path = self.resolve_sidecar_path(source_session)
+        if path is None or not path.exists():
+            return False
+        data = self.load(source_session)
+        exchanges = data.get("exchanges")
+        rec = exchanges.get(str(exchange_index)) if isinstance(exchanges, dict) else None
+        if not isinstance(rec, dict):
+            return False
+        if holdout is not None:
+            if rec.get("holdout") == holdout:
+                return True
+            rec["holdout"] = dict(holdout)
+        else:
+            if "holdout" not in rec:
+                return True
+            rec.pop("holdout", None)
+        ok = self._save(path, data)
+        if ok:
+            self._ledger_flag("holdout", source_session, exchange_index, holdout is not None)
         return ok
 
     def banned_exchange_indices(self, source_session: str) -> set:

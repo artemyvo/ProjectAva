@@ -35,6 +35,7 @@ from PyQt6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 # The Debug tab's dedup worker, reused rather than restated: both tabs drive the same
 # `dedup_facts` RPC, and a second copy is a second thing to keep in step with it.
 from ui.debug_widget import DedupFactsWorker
+from ui import theme
 
 if TYPE_CHECKING:
     from ui.chat_widget import ChatWidget
@@ -480,13 +481,14 @@ class OutreachWorker(QThread):
     done = pyqtSignal(dict)            # terminal outreach_done
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, client: "BackendClient", parent=None) -> None:
+    def __init__(self, client: "BackendClient", user=None, parent=None) -> None:
         super().__init__(parent)
         self._client = client
+        self._user = user
 
     def run(self) -> None:
         try:
-            for kind, msg in self._client.outreach_now():
+            for kind, msg in self._client.outreach_now(user=self._user):
                 if kind == "outreach_question":
                     self.question.emit(msg)
                 elif kind == "outreach_prompt":
@@ -1057,7 +1059,7 @@ class SleepWidget(QWidget):
         # nothing, so this is the run's heartbeat.
         self._lbl_stats = QLabel("")
         self._lbl_stats.setWordWrap(True)
-        self._lbl_stats.setStyleSheet("color: palette(mid);")
+        self._lbl_stats.setStyleSheet(f"color: {theme.MUTED};")
         self._lbl_stats.setVisible(False)
         right_layout.addWidget(self._lbl_stats)
 
@@ -2009,15 +2011,20 @@ class SleepWidget(QWidget):
             )
             return
 
+        # Whose outreach this is. The autonomous job decides per person; the button runs one
+        # of those decisions, for whoever the Chat tab says is at the keyboard (as Check In
+        # does). Left blank there, the server falls back to the active session's speaker.
+        target = self._chat_widget._current_user()
+
         self._outreach_stream_open = False
         self._outreach_reasoning_header = False
         self._append_section_header("Reach Out — Ava-initiated outreach decision (debug)")
         self._append_text(
-            "[outreach] Asking Ava whether she wants to raise one of her open "
-            "questions right now…\n")
+            f"[outreach] Asking Ava whether she wants to raise one of her open "
+            f"questions with {target or 'the current user'} right now…\n")
         self._lbl_status.setText("Deciding whether to reach out…")
 
-        worker = OutreachWorker(client, parent=self)
+        worker = OutreachWorker(client, user=target or None, parent=self)
         worker.question.connect(self._on_outreach_question)
         worker.prompt_debug.connect(self._on_outreach_prompt)
         worker.chunk.connect(self._on_outreach_chunk)
@@ -3255,10 +3262,10 @@ class SleepWidget(QWidget):
     # the dependency run both ways (chat_widget already reaches into this tab), and the
     # contract this shares with it is the server's segment `kind`, not a Python symbol.
     _PROMPT_DEBUG_COLORS = {
-        "system": QColor(38, 88, 190),
-        "rag": QColor(20, 125, 60),
-        "user": QColor(190, 40, 40),
-        "assistant": QColor(140, 140, 140),
+        "system": QColor(120, 160, 255),
+        "rag": QColor(90, 200, 120),
+        "user": QColor(255, 110, 110),
+        "assistant": QColor(100, 100, 100),
     }
 
     def _append_prompt_debug(self, title: str, msg: dict) -> None:
@@ -3275,7 +3282,7 @@ class SleepWidget(QWidget):
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         rule = QTextCharFormat()
-        rule.setForeground(QColor(150, 150, 150))
+        rule.setForeground(QColor(theme.MUTED))
         # The header carries what the segments cannot: an absent RAG segment is ambiguous
         # between "retrieved nothing" and "never asked", and that is the first thing to
         # establish when retrieval is what's under suspicion.
@@ -3297,7 +3304,7 @@ class SleepWidget(QWidget):
             if not text.strip():
                 continue
             color = self._PROMPT_DEBUG_COLORS.get(
-                str(seg.get("kind", "")), QColor(90, 90, 90))
+                str(seg.get("kind", "")), QColor(theme.MUTED))
             label = QTextCharFormat()
             label.setForeground(color)
             label.setFontWeight(QFont.Weight.Bold)

@@ -53,8 +53,10 @@ from ui.chat_review_widget import ChatReviewWidget
 _SOURCE_LABELS = {
     "chat": "Chats (input)",
     "til": "Articles + news digests (input)",
+    "ask": "Open questions (input)",
+    "child": "Closures awaiting a child ask (input)",
 }
-_SOURCE_NOUNS = {"chat": "chat", "til": "text"}
+_SOURCE_NOUNS = {"chat": "chat", "til": "text", "ask": "question", "child": "closure"}
 
 
 class ModulesListWorker(QThread):
@@ -116,7 +118,7 @@ class SimulateWorker(QThread):
     error_occurred = pyqtSignal(str)
 
     def __init__(self, client, *, module: str, filename: str, prompt: str,
-                 temperature: float, top_p: float, parent=None) -> None:
+                 temperature: float, top_p: float, weights: str = "adapter", parent=None) -> None:
         super().__init__(parent)
         self._client = client
         self._module = module
@@ -124,12 +126,13 @@ class SimulateWorker(QThread):
         self._prompt = prompt
         self._temperature = temperature
         self._top_p = top_p
+        self._weights = weights
 
     def run(self) -> None:
         try:
             for kind, msg in self._client.run_module(
                     self._module, self._filename, prompt=self._prompt,
-                    temperature=self._temperature, top_p=self._top_p):
+                    temperature=self._temperature, top_p=self._top_p, weights=self._weights):
                 if kind == "module_stage":
                     self.stage.emit(msg)
                 elif kind == "module_chunk":
@@ -218,6 +221,17 @@ class ModulesWidget(QWidget):
         self._spn_temp.setValue(0.7)
         self._spn_temp.setToolTip("Sampling temperature for the simulated pass.")
         top.addWidget(self._spn_temp)
+        top.addSpacing(12)
+        top.addWidget(QLabel("Weights:"))
+        # The same pass on the bare base: the server swaps the adapter model out for the
+        # base and back (two full model loads), everything else equal.
+        self._cmb_weights = QComboBox()
+        self._cmb_weights.addItem("loaded adapter", "adapter")
+        self._cmb_weights.addItem("bare base (swap)", "base")
+        self._cmb_weights.setToolTip(
+            "Which model runs the pass. \"bare base\" swaps the adapter out for the base and "
+            "back: two full model loads, a few minutes, the box busy meanwhile.")
+        top.addWidget(self._cmb_weights)
         top.addStretch()
         right_layout.addLayout(top)
 
@@ -420,7 +434,14 @@ class ModulesWidget(QWidget):
         mod = self._current_module()
         self._lbl_prompt.setText(
             f"Prompt — {mod.get('prompt_file', '(none)')}" if mod else "Prompt")
-        self._render_injectables(mod.get("injectables") or [])
+        self._render_injectables(mod.get("injectables") or [], mod.get("input_note") or "")
+        # A module that samples each part itself (ask_attempt's temperature grid) ignores
+        # the run's temperature; a knob that changes nothing is not offered.
+        own = bool(mod.get("own_sampling"))
+        self._spn_temp.setEnabled(not own)
+        self._spn_temp.setToolTip(
+            "This module sets each part's temperature itself." if own
+            else "Sampling temperature for the simulated pass.")
         # The input list belongs to the module's SOURCE, so switching to a module that
         # reads something else swaps the list under it (and fetches it if this is the
         # first time that lane has been asked for).
@@ -437,10 +458,12 @@ class ModulesWidget(QWidget):
             self._prompt_dirty = False
         self._update_buttons()
 
-    def _render_injectables(self, injectables: list) -> None:
+    def _render_injectables(self, injectables: list, input_note: str = "") -> None:
         if injectables:
             names = ", ".join(str(i) for i in injectables)
             self._lbl_inject.setText(f"Injected context: {names}")
+        elif input_note:
+            self._lbl_inject.setText(f"Injected context: nothing. {input_note}")
         else:
             self._lbl_inject.setText(
                 "Injected context: nothing — the pass sees this prompt and the input "
@@ -521,6 +544,7 @@ class ModulesWidget(QWidget):
             prompt=self._txt_prompt.toPlainText(),
             temperature=float(self._spn_temp.value()),
             top_p=0.95,
+            weights=str(self._cmb_weights.currentData() or "adapter"),
         )
         worker.stage.connect(self._on_stage)
         worker.chunk.connect(self._on_chunk)
@@ -543,6 +567,9 @@ class ModulesWidget(QWidget):
             self._lbl.setText(f"Modules — generating ({info.get('module')}){where}…")
         elif stage == "parsed":
             self._lbl.setText(f"Modules — parsed {info.get('count')} item(s).")
+        elif stage == "swapping":
+            self._lbl.setText("Modules — swapping the adapter out for the bare base "
+                              "(two full model loads)…")
 
     def _at_bottom(self) -> bool:
         sb = self._txt_result.verticalScrollBar()
@@ -595,7 +622,8 @@ class ModulesWidget(QWidget):
         count = msg.get("count")
         token_scope = "last part · " if parts > 1 else ""
         lines = [
-            f"MODULE   {msg.get('module')}",
+            f"MODULE   {msg.get('module')}"
+            + (f"  on {msg.get('weights')}" if msg.get("weights") else ""),
             # The unit is per lane — a transcript is measured in exchanges, an article in
             # characters — and the server says which, so this renderer stays lane-blind.
             # `exchanges` is the historical alias, read when talking to an older server.

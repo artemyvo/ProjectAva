@@ -38,6 +38,7 @@ from core.chat_sidecar import (
     ChatSidecar, facts_path_for, iter_chat_json_files, is_chat_session_json,
     sidecar_path_for, summary_path_for,
 )
+from core.reflection_source import is_narrator_speaker
 # The one definition of how a wander row identifies itself in the training render
 # (``source_session == "wander:<ts>"``); the review payload builder owns it.
 from core.training_review import WANDER_PREFIX
@@ -305,8 +306,11 @@ async def handle_list_sessions(ws) -> None:
         else:
             first_message = exchanges[0].get("user_prompt", "") if exchanges else ""
         user = (data.get("user") or "").strip()
-        if not user and exchanges:
-            user = (exchanges[0].get("speaker") or "").strip()
+        if not user:
+            # First speaker that names someone — never the "(initiative)" stage direction
+            # an unanswered Ava-initiated session opens on.
+            user = next((sp for sp in ((ex.get("speaker") or "").strip() for ex in exchanges)
+                         if sp and not is_narrator_speaker(sp)), "")
         sessions.append({
             "filename": path.name,
             "timestamp": data.get("timestamp", ""),

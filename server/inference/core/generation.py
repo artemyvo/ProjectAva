@@ -63,6 +63,7 @@ from core import encounter_run
 from core import ask_judge_service
 from core import resolution_repair
 from core import reset_test_service
+from core import capture_judge_service
 from core import background_reflection
 from core import hidden_capture
 
@@ -688,6 +689,11 @@ def _make_sync_reflect_generate(rag) -> Callable:
         force_think: bool = True,   # see the note above prepare_prompt
         stop_after_think: bool = False,
         stop_on_repeat: bool = True,   # see the note at the stream_generate call
+        # Hidden-state capture of THIS pass, left on `generate_fn.last_hidden_capture` for
+        # the caller to file. Only a drive's opener pass asks (outreach, synthesis,
+        # check-in → `hidden_capture.write_opener_capture`): its opener becomes a chat's
+        # exchange 0, the one background generation with an exchange to be keyed by.
+        capture_hidden: bool = False,
         # None ⇒ the box default (`_DEGEN_KW`, i.e. Layer 2 on unless configured off).
         # False ⇒ Layer 2 OFF for this call — the protocol passes' escape hatch: their
         # correct output is a fixed-template [fact] list whose lines share a long
@@ -776,10 +782,18 @@ def _make_sync_reflect_generate(rag) -> Callable:
 
         fam = model_family.family_for(_runtime.model_id or "")
         parts: list[str] = []
+        generate_fn.last_hidden_capture = None
+        hidden_spec = None
+        if capture_hidden:
+            try:
+                hidden_spec = hidden_capture.capture_spec(model, _runtime.model_id or "", _AXES_DIR)
+            except Exception as e:
+                print(f"[hidden] capture spec failed: {e}")
         _cancel_event.clear()
         gen = _backend.stream_generate(
             model, tokenizer, prompt, max_new_tokens, context_length,
             temperature, top_p, capture_tension=False,
+            capture_hidden=hidden_spec,
             repetition_penalty=REFLECT_REPETITION_PENALTY,
             no_repeat_ngram_size=REFLECT_NO_REPEAT_NGRAM,
             # Verbatim loop guard — halts once the last 12 generated tokens recur 4 times
@@ -880,6 +894,13 @@ def _make_sync_reflect_generate(rag) -> Callable:
             gen.close()
             _backend.trim_memory()
 
+        if hidden_spec is not None and getattr(_backend, "last_hidden_capture", None):
+            generate_fn.last_hidden_capture = {
+                "capture": _backend.last_hidden_capture,
+                "layer_spec": str(hidden_spec.get("layer_spec") or ""),
+                "model_id": _runtime.model_id or "",
+                "adapter_id": _runtime.adapter_id,
+            }
         # Surface whether this pass hit the token cap (vs. ended on EOS) so the
         # reflection runner can flag/retry a likely-truncated revision generation.
         generate_fn.last_truncated = getattr(_backend, "last_generation_truncated", None)
@@ -911,6 +932,7 @@ def _make_sync_reflect_generate(rag) -> Callable:
                               max_new_tokens=max_new_tokens, input_tokens=input_length)
         return result
     generate_fn.prepare_prompt = prepare_prompt
+    generate_fn.last_hidden_capture = None
     return generate_fn
 
 def _make_agentic_generate() -> Callable:
@@ -1272,6 +1294,12 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict],
     answer split so the answer's baseline includes the thinking that preceded it.
     pain is the per-token axis projection when the capture provides one (`signals["pain"]`,
     AVA_REWARD_LOOP.md §4.8), else absent.
+
+    ``step0`` (when there is anything to say) is the state BEFORE the reply: the first
+    token's tension (1 − margin) and each axis's projection at row 0 — the prompt's last
+    position, the state the first token is generated from. That is where the pain axis
+    was gated and holds (§4.8 Controls: harm to the model, not hostility at others or
+    body words); per token over a reply it reads vocabulary. A diagnostic line only.
     """
     if not signals:
         return None
@@ -1306,7 +1334,30 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict],
     n = len(token_ids)
     answer = _token_spans(text_tok, token_ids[lo:], margins[lo:],
                           _cut(relief, lo, n), _cut(pain, lo, n))
-    return {"cot": cot, "answer": answer}
+    out = {"cot": cot, "answer": answer}
+    step0 = _step0_reading(signals, len(token_ids))
+    if step0:
+        out["step0"] = step0
+    return out
+
+
+def _step0_reading(signals: dict, n_tokens: int) -> Optional[dict]:
+    """``{"tension": 1 − margin[0], "<axis>": z at row 0, …}`` — see `_compute_tension_spans`.
+    An axis series counts only when it is aligned with the token series."""
+    out: dict = {}
+    margins = signals.get("margins") or []
+    try:
+        if margins:
+            out["tension"] = round(1.0 - float(margins[0]), 4)
+        axes = dict(signals.get("axes") or {})
+        if signals.get("pain") is not None:
+            axes.setdefault("pain", signals["pain"])
+        for name, series in sorted(axes.items()):
+            if series is not None and len(series) == n_tokens and n_tokens:
+                out[name] = round(float(series[0]), 3)
+    except (TypeError, ValueError):
+        return None
+    return out or None
 
 # Text-only tokenizers loaded by id for decoding STORED token series (Chat review),
 # keyed by the model id recorded in the transcript's tension block. None is cached
@@ -2590,7 +2641,8 @@ async def _run_generation(
     capture_tension: when True, summarize per-token signals into a tension block;
         the block is attached to the `done` payload and returned to the caller so
         chat-side rendering and chat logging both see the same numbers.
-    capture_hidden: a `hidden_capture.capture_spec` (live chat only) — decoder-layer
+    capture_hidden: a `hidden_capture.capture_spec` (live chat; the reflect factory's
+        drive-opener passes take theirs through `capture_hidden=True`) — decoder-layer
         residuals + per-token axis projections; the projections join the tension block
         (`axes`) and the spans (blue channel), the residuals are left on
         `_backend.last_hidden_capture` for the caller to write beside the transcript.
@@ -2638,6 +2690,15 @@ async def _run_generation(
             "type": "error",
             "message": "The context-reset test is running — wait for it to finish or stop "
                        "it in the Ask judge tab.",
+        })
+        return False, "", None, 0
+    if capture_judge_service._capture_active:
+        # The capture judge grades the corpus inside a CleanBaseSession: same hazard as the
+        # ask judge above.
+        await _send(ws, {
+            "type": "error",
+            "message": "The capture judge is running on the clean base — wait for it to "
+                       "finish or stop it.",
         })
         return False, "", None, 0
     if _regen_swap_active:
@@ -3980,6 +4041,16 @@ def _selftest() -> None:
     finally:
         g.update(saved)
         _runtime.model, _runtime.tokenizer, _runtime.adapter_id, _session.system_prompt = saved_rt
+
+    # The step-0 diagnostic: the first token's tension and each aligned axis at row 0.
+    check("step0: tension + aligned axes",
+          _step0_reading({"margins": [0.75, 1.0, 1.0], "axes": {"pain": [-1.2, 0.0, 3.0],
+                                                                 "relief": [2.5, 0.1, 0.2]}}, 3)
+          == {"tension": 0.25, "pain": -1.2, "relief": 2.5})
+    check("step0: a misaligned axis is left out",
+          _step0_reading({"margins": [1.0, 1.0], "axes": {"pain": [0.3]}}, 2) == {"tension": 0.0})
+    check("step0: a live `pain` series counts", _step0_reading({"pain": [0.5, 0.1]}, 2) == {"pain": 0.5})
+    check("step0: nothing to say", _step0_reading({}, 0) is None)
 
     print("FAILED: " + ", ".join(failures) if failures else "all checks passed")
     raise SystemExit(1 if failures else 0)

@@ -14,6 +14,16 @@
       "log": "wipe.log",
       "sync": true,
       "description": "Destructive disaster recovery: delete regenerable state, repoint the base model."
+    },
+    "backfill_hidden": {
+      "cmd": ["backfill_hidden.py"],
+      "log": "backfill_hidden.log",
+      "description": "Teacher-forced replay of stored exchanges into `.hidden.npz` variant groups (base by default; args e.g. [\"--limit\", \"100\"])."
+    },
+    "axis_controls": {
+      "cmd": ["axis_controls.py"],
+      "log": "axis_controls.log",
+      "description": "Hostility and vocabulary controls for the stored axes (base by default; [\"--with-adapter\"] for the adapter). Report under data/axes/controls/."
     }
   }
 }

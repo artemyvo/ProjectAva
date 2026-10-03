@@ -1658,6 +1658,13 @@ class ReflectionWriter:
             rec["as" if k == "as_" else k] = v
         self._append(self.RAG_FILE, rec)
 
+    def write_child_record(self, rec: dict) -> None:
+        """One record of the child ask (``core/child_ask.py``): the child's ``insert`` (an
+        open meta ask linked to its parent, ``child_of``) or the ``child`` op beside the
+        parent's closure. In the op-log, so a staged run's children merge, or are discarded,
+        with its other writes. The fold ignores the ``child`` op."""
+        self._append(self.RAG_FILE, dict(rec))
+
     def write_reset_decision(self, *, key: str, closed_ts: str, run_id: str,
                              decision: dict) -> None:
         """What the context-reset test (``core/reset_test.py``, P7) decided for one
@@ -2117,7 +2124,7 @@ class ReflectionWriter:
 
     # -- reconciliation → soften (supersede) ------------------------------- #
 
-    def write_supersede(self, supersessions: list[dict]) -> dict:
+    def write_supersede(self, supersessions: list[dict], *, run_id: Optional[str] = None) -> dict:
         """Soften live ``[fact]``/``[persona]`` RAG items (self-reconciliation's *apply*).
 
         For each item, append a ``supersede`` op to ``rag_memory.jsonl`` keyed by its
@@ -2131,10 +2138,11 @@ class ReflectionWriter:
 
         Unlike :meth:`write_dedup` (redundancy — a survivor absorbs the losers), a
         supersession removes an item because it no longer fits *who she has become*:
-        there is no survivor, and nothing is merged.
+        there is no survivor, and nothing is merged. *run_id* names the pass that wrote
+        it (default: a reconciliation stamp).
         """
         ts = datetime.now().isoformat()
-        run_id = f"reconcile-{ts}"
+        run_id = run_id or f"reconcile-{ts}"
         counts = {"superseded": 0}
         for s in supersessions:
             key = (s.get("key") or "").strip()
@@ -2150,6 +2158,23 @@ class ReflectionWriter:
                 "content": (s.get("content") or "").strip(),
             })
             counts["superseded"] += 1
+        return counts
+
+    def write_restore(self, inserts: list[dict], *, run_id: Optional[str] = None,
+                      reason: str = "") -> dict:
+        """Undo :meth:`write_supersede` for recall: re-append each item's last ``insert``
+        record — the fold is last-op-wins, so the item is live again — stamped with this
+        pass's ``run_id`` and ``ts`` and a ``restored`` reason. The ledger half is
+        ``ConsolidationLedger.reactivate``."""
+        ts = datetime.now().isoformat()
+        run_id = run_id or f"restore-{ts}"
+        counts = {"restored": 0}
+        for rec in inserts:
+            if not isinstance(rec, dict) or rec.get("op") != "insert" or not rec.get("key"):
+                continue
+            self._append(self.RAG_FILE, {**rec, "run_id": run_id, "ts": ts,
+                                         "restored": reason or "restored"})
+            counts["restored"] += 1
         return counts
 
     # -- revision → SFT pair ----------------------------------------------- #

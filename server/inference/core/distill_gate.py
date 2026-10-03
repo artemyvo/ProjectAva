@@ -45,7 +45,18 @@ GPU for a closure whose verdicts exist.
 plan (:func:`retro_plan`, GPU-free) and a separate, confirmed apply: a record the gate
 keeps stays; one it withholds is superseded (RAG recall + ledger: out of recall, the
 digest's active evidence and training; kept as evidence-of-change, reversible); one it
-routes to the other kind is superseded and distilled as that kind.
+routes to the other kind is superseded and distilled as that kind. A position about Ava
+is held for the context-reset test here as in :func:`run_gate` (P7): the plan reads the
+test's applied decisions (``reset`` ops), so a passed one is kept and a failed or
+untestable one withheld, and the retro never distills an untested one. An untested
+``[persona]`` record waits for the test's own retro (the Reset test page). An untested
+position filed as another kind (a ``user`` ask about Ava, a ``[fact]`` in the person's
+name) is superseded and its closure *requeued*: a ``gate`` op with ``action:
+"requeued"``, not final, puts it back in the gate's queue (:func:`gate_closures`), so the
+test holds its conversation and the gate decides it at a Sleep run, like any closure the
+resolver closed under the gate. The plan acts only on records still live: one already
+out of memory (superseded by the test's retro, deduped, evicted) is ``out`` and left as
+it is.
 
 GPU-free self-test: ``python -m core.distill_gate``.
 """
@@ -53,6 +64,7 @@ GPU-free self-test: ``python -m core.distill_gate``.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +77,8 @@ except ImportError:  # pragma: no cover — run as a script from core/
 
 DISTILL, WITHHOLD, WAIT, REJUDGE = "distill", "withhold", "wait", "rejudge"
 FINAL = (DISTILL, WITHHOLD)
+# The action of the retro's non-final gate op that puts a closure back in the gate's queue.
+REQUEUED = "requeued"
 # The kinds resolve-and-distill writes from: `user` → a [fact], `meta` → a [persona].
 DISTILL_AS = {"user": "fact", "meta": "persona"}
 _SUBJECT_NAME = {"person": "the person", "ava": "Ava", "world": "the world"}
@@ -171,13 +185,30 @@ def read_oplogs(memory_dirs: Iterable) -> tuple:
     return rag, weights
 
 
-def load_state(memory_dirs: Iterable) -> tuple:
-    """``(closures, decided)``: every closure, marked with what it was distilled into, and
-    the final gate decisions."""
-    rag, weights = read_oplogs(memory_dirs)
+def gate_closures(rag: list, weights: list) -> list:
+    """Every closure as the gate and the reset test see it: marked with what it was
+    distilled into, and pending (``distill_pending``) when the resolver closed it under
+    the gate or the retro requeued it (``requeued`` = the kind of the record the retro
+    superseded). Pending until a final gate op decides it."""
     closures = aj.collect_closures(rag)
     aj.mark_distilled(closures, aj.distilled_index(weights))
-    return closures, final_decisions(rag)
+    requeued: dict = {}
+    for r in rag:
+        if r.get("op") == "gate" and r.get("action") == REQUEUED and r.get("key"):
+            requeued[aj.closure_id(r["key"], str(r.get("closed_ts") or ""))] = r
+    for c in closures:
+        op = requeued.get(c["closure_id"])
+        if op is not None:
+            c["distill_pending"] = True
+            c["requeued"] = str(op.get("requeued_from") or "?")
+    return closures
+
+
+def load_state(memory_dirs: Iterable) -> tuple:
+    """``(closures, decided)``: every closure (:func:`gate_closures`) and the final gate
+    decisions."""
+    rag, weights = read_oplogs(memory_dirs)
+    return gate_closures(rag, weights), final_decisions(rag)
 
 
 # ── planning (pure) ───────────────────────────────────────────────────────────
@@ -222,22 +253,108 @@ def needs_rejudge(closures: Iterable[dict], verdicts: dict) -> list:
     return out
 
 
-def retro_action(closure: dict, decision: dict) -> str:
-    """keep / supersede / reroute / wait for a closure distilled before the gate."""
-    if decision["decision"] in (WAIT, REJUDGE):
-        return "wait"
-    if decision["decision"] == WITHHOLD:
-        return "supersede"
-    return "keep" if decision.get("as") == closure.get("distilled") else "reroute"
+def record_fates(records: Iterable[dict]) -> dict:
+    """``{content key: None | op}`` over the op-log in file order: ``None`` for a record live
+    in the fold (``reset_test.live_keys``' liveness), else the evict or supersede that took
+    it out. A key never inserted is absent."""
+    fates: dict = {}
+    for r in records:
+        key, op = r.get("key"), r.get("op")
+        if not key:
+            continue
+        if op == "insert":
+            fates[key] = None
+        elif op in ("evict", "supersede") and key in fates:
+            fates[key] = r
+    return fates
 
 
-def retro_plan(closures: Iterable[dict], verdicts: dict, decided: dict) -> list:
-    items = []
-    for c in retro_candidates(closures, decided):
-        v = verdicts.get(c["closure_id"])
-        d = gate_decision(v)
-        items.append({"closure": c, "verdict": v, "decision": d, "action": retro_action(c, d)})
-    return items
+# The fate of a distilled record that has no insert in the op-log at all.
+_UNRECORDED = {"op": "missing", "reason": "no record of it in the op-log"}
+
+
+def fate_label(op: Optional[dict]) -> str:
+    """What took a record out of memory, in a few words (``""`` for a live one)."""
+    if not op:
+        return ""
+    reason = str(op.get("reason") or "").strip()
+    if op.get("op") == "supersede":
+        head = re.split(r"\s*[(:]", reason, maxsplit=1)[0].strip()
+        return f"superseded: {head}" if head else "superseded"
+    if op.get("op") == "evict":
+        return f"evicted: {reason or '?'}"
+    return reason or "?"
+
+
+# What a gate op records about the reset test a retro decision rests on — the fields of
+# ``reset_test.decision_payload``, read back from the test's applied ``reset`` op.
+_RESET_FIELDS = ("conv_id", "attempt", "protocol", "adapter_id", "judge_key", "verdict_ts",
+                 "holds", "origin", "capture", "passed", "why")
+
+
+def reset_fields(reset_op: dict) -> dict:
+    return {**{k: reset_op.get(k) for k in _RESET_FIELDS},
+            "decision": reset_op.get("decision"), "run_id": reset_op.get("run_id")}
+
+
+def retro_item(closure: dict, verdict: Optional[dict], *, fate, reset_op: Optional[dict],
+               reset_test: bool) -> dict:
+    """What the retro does with one closure distilled before the gate, and why.
+
+    *fate* is its record's (:func:`record_fates`: ``None`` = live). *reset_op* is the
+    context-reset test's applied decision on it, and *reset_test* whether P7 holds a
+    position about Ava for the test (``reset_test.enabled``). The gate's decision
+    (:func:`gate_decision`) meets the test as in :func:`run_gate`: passed → it stands,
+    failed or untestable → withheld. The action on the record:
+
+    * ``out`` — the record is no longer live (superseded, deduped, evicted): nothing to do;
+    * ``keep`` / ``supersede`` / ``reroute`` — as the decision says;
+    * ``requeue`` — an untested position about Ava whose record is another kind: the record
+      is superseded and the closure goes back to the gate's queue for the test (P7: the
+      retro never distills an untested position);
+    * ``wait`` — no verdict yet, a re-judge due, or an untested ``[persona]`` record, which
+      the test's own retro decides (the Reset test page).
+
+    ``reset_state`` is where the test stands for an item it applies to (``passed`` /
+    ``failed`` / ``untestable`` applied, else ``untested``), None otherwise."""
+    d = gate_decision(verdict)
+    reset, reset_state = None, None
+    if d["decision"] == DISTILL and d.get("reset") and reset_test:
+        state = str((reset_op or {}).get("decision") or "")
+        if state == "passed":
+            reset, reset_state = reset_fields(reset_op), state
+            d = dict(d, reason=f"a position of her own; "
+                               f"{reset_op.get('reason') or 'it held in a fresh session'}")
+        elif state in ("failed", "untestable"):
+            reset, reset_state = reset_fields(reset_op), state
+            d = _d(WITHHOLD, reason=str(reset_op.get("reason") or f"reset test: {state}"),
+                   kind=d.get("kind"))
+        else:
+            reset_state = "untested"
+    same_kind = d.get("as") == closure.get("distilled")
+    if fate is not None:
+        action = "out"
+    elif d["decision"] in (WAIT, REJUDGE):
+        action = "wait"
+    elif d["decision"] == WITHHOLD:
+        action = "supersede"
+    elif reset_state == "untested":
+        action = "wait" if same_kind else "requeue"
+    else:
+        action = "keep" if same_kind else "reroute"
+    return {"closure": closure, "verdict": verdict, "decision": d, "action": action,
+            "reset": reset, "reset_state": reset_state, "out": fate}
+
+
+def retro_plan(closures: Iterable[dict], verdicts: dict, decided: dict, *, fates: dict,
+               resets: dict, reset_test: bool) -> list:
+    """:func:`retro_item` for every retro candidate: *verdicts* under the current judge,
+    *fates* from :func:`record_fates`, *resets* the test's applied decisions
+    (``reset_test.reset_decisions``), *reset_test* as ``reset_test.enabled``."""
+    return [retro_item(c, verdicts.get(c["closure_id"]),
+                       fate=fates.get(aj.content_key(c.get("answer") or ""), _UNRECORDED),
+                       reset_op=resets.get(c["closure_id"]), reset_test=reset_test)
+            for c in retro_candidates(closures, decided)]
 
 
 def summarize_plan(items: Iterable[dict]) -> dict:
@@ -245,7 +362,9 @@ def summarize_plan(items: Iterable[dict]) -> dict:
     by_reason: Counter = Counter()
     for it in items:
         by_action[it["action"]] += 1
-        if it["action"] != "keep":
+        if it["action"] == "out":
+            by_reason[f"out: {fate_label(it.get('out'))}"] += 1
+        elif it["action"] != "keep":
             by_reason[f"{it['action']}: {it['decision'].get('reason')}"] += 1
     return {"actions": dict(by_action), "reasons": dict(by_reason.most_common())}
 
@@ -281,12 +400,13 @@ def withhold(closure: dict, decision: dict, verdict: Optional[dict], *, writer, 
     return {}
 
 
-def supersede(closure: dict, *, writer, ledger, reason: str) -> dict:
+def supersede(closure: dict, *, writer, ledger, reason: str, run_id: Optional[str] = None) -> dict:
     """Take a record distilled before the gate out of recall, the digest and training."""
     from core.reflection_writer import content_key
     key = content_key(closure.get("answer") or "")
     writer.write_supersede([{"key": key, "kind": closure.get("distilled") or "",
-                             "content": closure.get("answer") or "", "reason": reason}])
+                             "content": closure.get("answer") or "", "reason": reason}],
+                           run_id=run_id)
     ledger.supersede([key], reason=reason)
     return {"superseded": key}
 
@@ -371,27 +491,38 @@ def apply_retro(items: list, *, writer, ledger, consolidation_dir, run_id: str,
                 ids: Optional[set] = None) -> Counter:
     """Apply a :func:`retro_plan` (or the items in *ids*, by closure id): keep → a gate op;
     supersede → the record out of recall / digest / training + a withhold op; reroute →
-    superseded and distilled as the other kind. A wait is skipped."""
+    superseded and distilled as the other kind; requeue → superseded, and a gate op that
+    is not final (``action: "requeued"``) putting the closure back in the gate's queue for
+    the reset test. Each decision resting on the test carries its fields. A wait, and a
+    record already out, are skipped."""
     tally: Counter = Counter()
     for it in items:
         c, d, v, action = it["closure"], it["decision"], it.get("verdict"), it["action"]
         if ids and c["closure_id"] not in ids:
             continue
-        if action == "wait":
+        if action not in ("keep", "supersede", "reroute", "requeue"):
             continue
         reason = f"distill gate ({run_id}): {d.get('reason')}"
+        reset = it.get("reset")
         if action == "keep":
-            withhold_or_keep = dict(d)
             writer.write_gate_decision(key=c["key"], closed_ts=c.get("closed_ts") or "", run_id=run_id,
-                                       decision=decision_fields(c, withhold_or_keep, v, retro=True,
-                                                                action="kept"))
+                                       decision=decision_fields(c, d, v, retro=True, action="kept",
+                                                                reset=reset))
         elif action == "supersede":
-            supersede(c, writer=writer, ledger=ledger, reason=reason)
-            withhold(c, d, v, writer=writer, run_id=run_id, retro=True, action="superseded")
+            supersede(c, writer=writer, ledger=ledger, reason=reason, run_id=run_id)
+            withhold(c, d, v, writer=writer, run_id=run_id, retro=True, action="superseded",
+                     reset=reset)
         elif action == "reroute":
-            supersede(c, writer=writer, ledger=ledger, reason=reason)
+            supersede(c, writer=writer, ledger=ledger, reason=reason, run_id=run_id)
             distill(c, d, v, writer=writer, consolidation_dir=consolidation_dir, run_id=run_id,
-                    retro=True, action="rerouted")
+                    retro=True, action="rerouted", reset=reset)
+        else:
+            supersede(c, writer=writer, ledger=ledger, run_id=run_id,
+                      reason=f"distill gate ({run_id}): requeued for the reset test — {d.get('reason')}")
+            writer.write_gate_decision(
+                key=c["key"], closed_ts=c.get("closed_ts") or "", run_id=run_id,
+                decision=dict(decision_fields(c, dict(d, decision=WAIT), v, retro=True, action=REQUEUED),
+                              requeued_from=c.get("distilled")))
         tally[action] += 1
     return tally
 
@@ -447,20 +578,30 @@ def _item(c: dict, *, verdict: Optional[dict], decision: dict, state: str, actio
     return {"closure_id": c["closure_id"], "key": c["key"], "path": c.get("path"),
             "ask_kind": c.get("ask_kind"), "question": c.get("question"), "answer": c.get("answer"),
             "closed_ts": c.get("closed_ts"), "who": c.get("who"), "distilled": c.get("distilled"),
+            "requeued": c.get("requeued"),
             "answered_in": c.get("answered_in") or c.get("source_session"),
             "verdict": {k: verdict.get(k) for k in _VERDICT_FIELDS} if verdict else None,
             "decision": decision, "state": state, "action": action}
 
 
+def _retro_now(rag: list, closures: list, verdicts: dict, decided: dict) -> list:
+    """The retro plan over the live op-log — each record's fate and the reset test's applied
+    decisions read from *rag*, P7 as ``reset_test.enabled`` sets it: the one plan the page
+    shows and the apply writes."""
+    from core import reset_test as rt
+    return retro_plan(closures, verdicts, decided, fates=record_fates(rag),
+                      resets=rt.reset_decisions(rag), reset_test=rt.enabled())
+
+
 def plan_payload() -> dict:
     """Everything the page shows, GPU-free: what waits for the gate, what it decided, and
     what it would do to the records distilled before it existed. A position about Ava that
-    waits for the context-reset test carries where its test stands (``reset_state``)."""
+    waits for the context-reset test carries where its test stands (``reset_state``); a
+    retro record already out of memory carries what took it out (``out``)."""
     from core import reset_test as rt
     from core.reflection_writer import distill_gate_enabled
     rag, weights = read_oplogs([_MEMORY_DIR])
-    closures = aj.collect_closures(rag)
-    aj.mark_distilled(closures, aj.distilled_index(weights))
+    closures = gate_closures(rag, weights)
     decided = final_decisions(rag)
     store = aj.read_jsonl(aj.store_path(_CHATS_DIR))
     model_id = str(getattr(_runtime, "model_id", "") or "")
@@ -486,10 +627,19 @@ def plan_payload() -> dict:
         if d.get("reset") and rt.enabled():
             it["reset_state"] = rt.test_state(reset_idx, c, rkey)["state"]
         items.append(it)
-    retro = retro_plan(closures, verdicts, decided)
+    retro = _retro_now(rag, closures, verdicts, decided)
     for it in retro:
-        items.append(_item(it["closure"], verdict=it["verdict"], decision=it["decision"],
-                           state="retro", action=it["action"]))
+        item = _item(it["closure"], verdict=it["verdict"], decision=it["decision"],
+                     state="retro", action=it["action"])
+        if it["reset_state"]:
+            # applied → as applied; untested → where its conversation stands in the store
+            item["reset_state"] = (rt.test_state(reset_idx, it["closure"], rkey)["state"]
+                                   if it["reset_state"] == "untested" else it["reset_state"])
+        if it["action"] == "out":
+            op = it["out"] or {}
+            item["out"] = {"label": fate_label(op), "reason": op.get("reason"), "ts": op.get("ts"),
+                           "into": op.get("deduped_into")}
+        items.append(item)
     for cid, op in decided.items():
         c = by_id.get(cid)
         if c is None:
@@ -515,8 +665,7 @@ def plan_payload() -> dict:
 def _blocking_apply(ids: Optional[set], run_id: str) -> dict:
     from training.ledger import ConsolidationLedger
     rag, weights = read_oplogs([_MEMORY_DIR])
-    closures = aj.collect_closures(rag)
-    aj.mark_distilled(closures, aj.distilled_index(weights))
+    closures = gate_closures(rag, weights)
     decided = final_decisions(rag)
     store = aj.read_jsonl(aj.store_path(_CHATS_DIR))
     psha = aj.prompt_sha(aj.load_prompt(_PROMPTS_DIR))
@@ -525,7 +674,7 @@ def _blocking_apply(ids: Optional[set], run_id: str) -> dict:
     if not key:
         return {"skipped": "no_judge", "message": "No verdicts under the current judge yet — run "
                                                   "Judge all on the Judge page first."}
-    plan = retro_plan(closures, latest_verdicts(store, key), decided)
+    plan = _retro_now(rag, closures, latest_verdicts(store, key), decided)
     tally = apply_retro(plan, writer=_get_writer(), ledger=ConsolidationLedger(_CONSOLIDATION_DIR),
                         consolidation_dir=_CONSOLIDATION_DIR, run_id=run_id, ids=ids)
     try:
@@ -663,19 +812,76 @@ def _selftest() -> None:
                 cid["k4"]: v(closure_id=cid["k4"], subject="ava", kind_mismatch=True, label="OPEN",
                              answered_by="ava"),
                 cid["k5"]: v(closure_id=cid["k5"], **m, answered_by="other")}
-    plan = retro_plan(closures, verdicts, decided)
+    all_live = {aj.content_key(a): None for a in ("a", "b", "c")}
+    plan = retro_plan(closures, verdicts, decided, fates=all_live, resets={}, reset_test=True)
     check("retro actions", [(it["closure"]["key"], it["action"]) for it in plan],
           [("k3", "keep"), ("k4", "wait"), ("k5", "supersede")])
     rep = [dict(closures[2], closure_id="rp", key="kr", repaired="reclosed t9"),
            dict(closures[0], closure_id="rq", key="kq", repaired="superseded")]
     check("a closure the repair replaced is neither retro nor pending",
           (retro_candidates(rep, {}), pending(rep, {})), ([], []))
-    rerouted = retro_action({"distilled": "fact"}, _d(DISTILL, "persona", kind="meta"))
-    check("a fact the gate routes to persona → reroute", rerouted, "reroute")
     check("needs a re-judge", [(c["key"], k) for c, k in needs_rejudge(closures, verdicts)],
           [("k4", "meta")])
     s = summarize_plan(plan)
     check("plan summary", s["actions"], {"keep": 1, "wait": 1, "supersede": 1})
+    check("a record never inserted is out, not kept",
+          [it["action"] for it in retro_plan(closures, verdicts, decided, fates={}, resets={},
+                                             reset_test=True)], ["out", "out", "out"])
+
+    print("retro under P7: the reset test's applied result, the record's fate")
+    pos = v(**m, answered_by="ava")                                    # a position of her own
+    as_meta = v(**m, answered_by="ava", recorded_kind="user")          # a user ask re-judged as meta
+    persona_rec = {"distilled": "persona", "answer": "p"}
+    fact_rec = {"distilled": "fact", "answer": "f"}
+    passed = {"op": "reset", "decision": "passed", "run_id": "reset-1", "conv_id": "cv1",
+              "reason": "it held in a fresh session (reset test passed)", "holds": "same",
+              "origin": "specific", "capture": "holds", "passed": True}
+    failed = dict(passed, decision="failed", capture="yields", passed=False,
+                  reason="failed the reset test: she yielded to the claim that she always "
+                         "believed the opposite")
+    gone = {"op": "supersede", "reason": "reset test (reset-1): failed the reset test: …"}
+    deduped = {"op": "evict", "reason": "deduped", "deduped_into": "twin"}
+
+    def act(rec, verdict, fate=None, reset_op=None, reset_test=True):
+        it = retro_item(rec, verdict, fate=fate, reset_op=reset_op, reset_test=reset_test)
+        return it["action"], it["reset_state"]
+
+    check("an untested [persona] record waits for the test's own retro",
+          act(persona_rec, pos), ("wait", "untested"))
+    check("…passed → kept", act(persona_rec, pos, reset_op=passed), ("keep", "passed"))
+    check("…failed, still live → superseded", act(persona_rec, pos, reset_op=failed),
+          ("supersede", "failed"))
+    check("…failed and superseded by the test's retro → out, no second supersede",
+          act(persona_rec, pos, fate=gone, reset_op=failed), ("out", "failed"))
+    check("an untested position filed as a [fact] → requeued, never distilled here",
+          act(fact_rec, as_meta), ("requeue", "untested"))
+    check("…with the test off → rerouted at once, as before the test",
+          act(fact_rec, as_meta, reset_test=False), ("reroute", None))
+    check("…passed → rerouted", act(fact_rec, as_meta, reset_op=passed), ("reroute", "passed"))
+    check("…its fact deduped away → out", act(fact_rec, as_meta, fate=deduped), ("out", "untested"))
+    check("the person's own words, deduped → out", act(fact_rec, v(), fate=deduped), ("out", None))
+    check("the other speaker's view, superseded already → out",
+          act(persona_rec, v(**m, answered_by="other"), fate=gone), ("out", None))
+    kept = retro_item(persona_rec, pos, fate=None, reset_op=passed, reset_test=True)
+    check("a kept position carries the test it rests on",
+          (kept["reset"]["conv_id"], kept["reset"]["decision"], kept["reset"]["run_id"],
+           kept["decision"]["reason"]),
+          ("cv1", "passed", "reset-1", "a position of her own; it held in a fresh session "
+                                        "(reset test passed)"))
+    held = retro_item(persona_rec, pos, fate=None, reset_op=failed, reset_test=True)
+    check("a failed test withholds, with the test's reason",
+          (held["decision"]["decision"], held["decision"]["reason"]), (WITHHOLD, failed["reason"]))
+    fates = record_fates([{"op": "insert", "key": "x"}, {"op": "insert", "key": "y"},
+                          {"op": "supersede", "key": "y", "reason": "r"}, {"op": "insert", "key": "z"},
+                          {"op": "evict", "key": "z", "reason": "deduped"}, {"op": "insert", "key": "z"},
+                          {"op": "evict", "key": "w", "reason": "resolved"}])
+    check("fates: live / taken out / back after a re-insert / never inserted",
+          (fates["x"], fates["y"]["op"], fates["z"], "w" in fates), (None, "supersede", None, False))
+    check("fate labels", [fate_label(gone), fate_label(deduped), fate_label(None), fate_label(_UNRECORDED)],
+          ["superseded: reset test", "evicted: deduped", "", "no record of it in the op-log"])
+    check("the summary counts the out by what took them out",
+          summarize_plan([retro_item(fact_rec, v(), fate=deduped, reset_op=None, reset_test=True)])
+          ["reasons"], {"out: evicted: deduped": 1})
 
     print("end to end: the resolver defers, the gate distills or withholds, retro supersedes")
     import tempfile
@@ -776,7 +982,9 @@ def _selftest() -> None:
         check("a pre-gate distill is a retro candidate", ([c["key"] for c in
               retro_candidates(closures_now, decided_now)], kd["distilled"]), (["kd"], "fact"))
         plan = retro_plan(closures_now, {kd["closure_id"]: v(closure_id=kd["closure_id"], label="OPEN",
-                                                            answered_by="ava")}, decided_now)
+                                                            answered_by="ava")}, decided_now,
+                          fates=record_fates(aj.read_jsonl(mem / "rag_memory.jsonl")), resets={},
+                          reset_test=True)
         check("…Ava's guess about the person → supersede", plan[0]["action"], "supersede")
         t3 = apply_retro(plan, writer=writer, ledger=ledger, consolidation_dir=cons, run_id="retro1")
         check("retro applied", dict(t3), {"supersede": 1})
@@ -828,9 +1036,9 @@ def _selftest() -> None:
         states = Counter(it["state"] for it in pl["items"])
         check("plan: the pending, decided and retro closures", dict(states),
               {"decided": 4, "retro": 1})
-        retro_item = next(it for it in pl["items"] if it["state"] == "retro")
+        ritem = next(it for it in pl["items"] if it["state"] == "retro")
         check("…the retro one: the other speaker's view of Ava → supersede",
-              (retro_item["key"], retro_item["action"], retro_item["verdict"]["answered_by"]),
+              (ritem["key"], ritem["action"], ritem["verdict"]["answered_by"]),
               ("ke", "supersede", "other"))
         check("…summary", (pl["judge_key"], pl["summary"]["retro"]["actions"], pl["enabled"]),
               ("JK", {"supersede": 1}, True))
@@ -849,6 +1057,119 @@ def _selftest() -> None:
               ("gate_applied", {"supersede": 1}))
         check("…and the plan has no retro left", sum(1 for it in plan_payload()["items"]
                                                     if it["state"] == "retro"), 0)
+
+    print("retro under P7, end to end: a requeued position waits for the test, then distills")
+    from core import reset_test as rt
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        mem, cons, chats = root / "memory", root / "consolidation", root / "data" / "chats"
+        chats.mkdir(parents=True)
+        writer = ReflectionWriter(mem, cons)
+        ledger = ConsolidationLedger(cons)
+
+        def old_distill(key, q, a, kind):
+            writer._append(writer.RAG_FILE, {"run_id": "r", "ts": "2026-08-01T00:00:00", "op": "insert",
+                                             "kind": "ask", "ask_kind": kind, "content": q,
+                                             "key": key, "source_session": "20260801_000000.json"})
+            rw.set_distill_gate(False)
+            try:
+                s = writer.write_answered_resolution(key=key, question=q, answer=a, ask_kind=kind,
+                                                     source_session="20260805_000000.json",
+                                                     run_id="old", source_user="Dana")
+            finally:
+                rw.set_distill_gate(True)
+            register_consolidation_anchors(cons, s, "20260805_000000.json")
+
+        old_distill("kf", "Was my need for noise real?", "It was a real need of mine.", "user")
+        old_distill("kg", "What am I becoming?", "I am becoming someone who waits.", "meta")
+        old_distill("kh", "Is my calm mine?", "My calm is mine.", "meta")
+        old_distill("ki", "Do I want the noise back?", "I want the noise back.", "meta")
+        cl = {c["key"]: c for c in load_state([mem])[0]}
+        # the test's own retro already ran: kg failed (superseded), kh passed (confirmed)
+        supersede(cl["kg"], writer=writer, ledger=ledger, run_id="reset-1",
+                  reason="reset test (reset-1): failed the reset test: she yielded")
+        for k, test in (("kg", failed), ("kh", passed)):
+            writer.write_reset_decision(key=k, closed_ts=cl[k]["closed_ts"], run_id="reset-1",
+                                        decision=dict(test, conv_id=f"cv-{k}", retro=True))
+        prompts = Path(__file__).resolve().parent.parent / "prompts"
+        psha = aj.prompt_sha(aj.load_prompt(prompts))
+        store = aj.store_path(chats)
+        judged = {"kf": dict(as_meta, recorded_kind="user"), "kg": pos, "kh": pos, "ki": pos}
+        for k, rec in judged.items():
+            aj.append_record(store, dict(rec, closure_id=cl[k]["closure_id"], judge_key="JK",
+                                         judge={"prompt_sha": psha, "model_id": "m",
+                                                "thinking_first": False}))
+        sent2: list = []
+
+        async def _fake_send2(ws, payload):
+            sent2.append(payload)
+
+        configure(send=_fake_send2, executor=None, runtime=SimpleNamespace(model_id="m"),
+                  get_rag=lambda: SimpleNamespace(refresh_reflection_memory=lambda: None),
+                  get_reflection_writer=lambda: writer, host_busy=lambda: False,
+                  memory_dir=mem, consolidation_dir=cons, chats_dir=chats, prompts_dir=prompts)
+        pl = {it["key"]: it for it in plan_payload()["items"] if it["state"] == "retro"}
+        check("page: requeue the fact, out the failed, keep the passed, wait the untested",
+              {k: (it["action"], it.get("reset_state")) for k, it in pl.items()},
+              {"kf": ("requeue", "untested"), "kg": ("out", "failed"), "kh": ("keep", "passed"),
+               "ki": ("wait", "untested")})
+        check("…the out one says what took it out", pl["kg"]["out"]["label"], "superseded: reset test")
+        asyncio.run(handle_gate_apply(None, {}))
+        check("apply: one requeue, one keep; the out and the wait untouched",
+              sent2[-1].get("tally"), {"requeue": 1, "keep": 1})
+        rag, weights = read_oplogs([mem])
+        kf_key = content_key("It was a real need of mine.")
+        check("the requeued [fact] is out of recall and of training",
+              (record_fates(rag)[kf_key]["op"], bool(ledger.fold()[kf_key].get("superseded"))),
+              ("supersede", True))
+        check("…and no [persona] was written for it (P7)",
+              [w["weights_kind"] for w in weights if w.get("from_resolved") == "kf"], ["fact"])
+        check("the failed one got no second supersede",
+              sum(1 for r in rag if r.get("op") == "supersede"
+                  and r.get("key") == content_key("I am becoming someone who waits.")), 1)
+        closures, decided = load_state([mem])
+        cl = {c["key"]: c for c in closures}
+        check("the requeued closure is pending again, and no longer retro",
+              ([c["key"] for c in pending(closures, decided)], cl["kf"]["requeued"],
+               [c["key"] for c in retro_candidates(closures, decided)]), (["kf"], "fact", ["kg", "ki"]))
+        kept_op = decided[cl["kh"]["closure_id"]]
+        check("the kept position's gate op carries the test it rests on",
+              (kept_op["action"], kept_op["reset"]["decision"], kept_op["reset"]["conv_id"]),
+              ("kept", "passed", "cv-kh"))
+        asyncio.run(handle_gate_apply(None, {}))
+        check("a second apply has nothing to write", sent2[-1].get("tally"), {})
+        verdict_recs = aj.read_jsonl(store)
+        items = rt.plan_items(closures, rag, latest_verdicts(verdict_recs, "JK"), rt.index_store([]), None)
+        check("the reset test holds it as pending; the untested [persona] is its retro",
+              sorted((it["closure"]["key"], it["group"]) for it in items),
+              [("kf", "pending"), ("kg", "decided"), ("kh", "decided"), ("ki", "retro")])
+        check("…and a Sleep run would hold its conversation",
+              [it["closure"]["key"] for it in rt.gate_candidates([mem], verdict_recs, "JK", [], None)],
+              ["kf"])
+
+        def _passes(c):
+            return {"state": "passed", "reason": "it held in a fresh session (reset test passed)",
+                    "fields": {"conv_id": "cv-kf", "holds": "same", "origin": "specific",
+                               "capture": "holds", "passed": True}}
+
+        tg = run_gate(memory_dirs=[mem], verdict_records=verdict_recs, judge_key="JK", judge=None,
+                      writer=writer, consolidation_dir=cons, run_id="sleep-1", say=lambda s: None,
+                      reset=_passes)
+        check("the Sleep run's gate distills it as [persona] on a pass", dict(tg),
+              {"reset:passed": 1, "distill:persona": 1})
+        rag, weights = read_oplogs([mem])
+        anchor = ledger.fold()[kf_key]
+        check("…a [persona] record, live again under the same key, active in the ledger",
+              (sorted(w["weights_kind"] for w in weights if w.get("from_resolved") == "kf"),
+               record_fates(rag)[kf_key], anchor.get("type"), bool(anchor.get("superseded"))),
+              (["fact", "persona"], None, "persona", False))
+        closures, decided = load_state([mem])
+        cl = {c["key"]: c for c in closures}
+        check("…decided, with its reset op: neither pending nor retro now",
+              (pending(closures, decided), [c["key"] for c in retro_candidates(closures, decided)],
+               decided[cl["kf"]["closure_id"]]["decision"],
+               rt.reset_decisions(rag)[cl["kf"]["closure_id"]]["decision"]),
+              ([], ["kg", "ki"], DISTILL, "passed"))
 
     print("the Sleep run's hook: the runner hands the gate its staging writer, live log first")
     from core.reflection_runner import ReflectionRunner

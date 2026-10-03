@@ -23,17 +23,19 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit, QTextEdit, QFormLayout, QHBoxLayout, QVBoxLayout, QGroupBox,
 )
 
+from ui import theme
+
 try:  # type-only; avoids a hard import cycle at runtime
     from core.backend_client import BackendClient
 except Exception:  # pragma: no cover
     BackendClient = object  # type: ignore
 
 
-# Speaker colors for the transcript. Kept readable on both light and dark themes.
-_AVA_COLOR = "#3b7dd8"
-_COUNTERPART_COLOR = "#b5651d"
-_SYSTEM_COLOR = "#888888"
-_ERROR_COLOR = "#c0392b"
+# Speaker colors for the transcript, on the dark theme's text-field base.
+_AVA_COLOR = theme.LINK
+_COUNTERPART_COLOR = theme.WARNING
+_SYSTEM_COLOR = theme.MUTED
+_ERROR_COLOR = theme.ERROR
 
 
 class EncounterPollWorker(QThread):

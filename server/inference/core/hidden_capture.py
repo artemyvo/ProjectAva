@@ -1,6 +1,7 @@
 """Hidden-state capture — Track B Stage 0 of AVA_REWARD_LOOP.md (§4.2 capture design).
 
-What it does, during a LIVE chat turn only: forward hooks on a band of decoder layers
+What it does, during a LIVE chat turn (and, since 2026-10-03, the drive pass that writes a
+reach-out opener — see *Drive openers* below): forward hooks on a band of decoder layers
 keep the residual stream at the last position of every generated step (on device, a
 10 KB slice per layer per token, bulk-synced once after the stream ends — the same
 shape as the tension capture's logit signals). After generation two things are
@@ -21,9 +22,22 @@ reduced from those rows:
     become the blue channel of the chat colouring. With no axis files (the state on
     every box today) the map is absent — not empty — and the blue channel stays dark.
 
+**Drive openers.** A reach-out's exchange 0 is written by a drive (outreach, synthesis,
+check-in) inside its own pass, not in a chat turn, so live capture never saw it, and that
+is a session's first state — where a state carried across sessions would show first
+(AVA_REWARD_LOOP.md §4.9 step 3b). The drive asks the reflect-generate factory for the
+pass's capture (``capture_hidden=True``) and :func:`write_opener_capture` files it under
+exchange 0's id with ``seam: "drive"`` in its meta, the generated ids (``token_ids``,
+which only these groups carry: exchange 0 has no tension block) and the opener's token
+span in them (``opener_span``). The rows cover the WHOLE pass — the thought, the decision,
+the opener — and the context is the drive's prompt, not the chat seam, so a reader that
+compares a group against its transcript's ``tension`` series skips ``seam: "drive"``.
+Knob: ``hidden.drive_openers``.
+
 What it deliberately is not: a steering path. Nothing here writes into the model, and
 nothing the model can trigger changes what is captured (P5 / P8 there). Reflection,
-API and gossip generations are not captured — the sidecar is keyed by chat exchange.
+API and gossip generations are not captured — the sidecar is keyed by chat exchange; of
+the background passes only an opener's, which has an exchange to be keyed by.
 
 Cost. Hooks on ≈7 layers add one tensor slice + clone per layer per token: not
 measurable against a 3–6 tok/s decode. Device memory is rows × layers × D × 2 bytes,
@@ -229,6 +243,12 @@ def _config() -> dict:
         return dict((load_server_config() or {}).get("hidden") or {})
     except Exception:
         return {}
+
+
+def drive_openers_enabled() -> bool:
+    """``hidden.drive_openers`` (default on): capture the pass that writes a reach-out's
+    opener. ``hidden.capture`` off turns it off too (`capture_spec` returns None)."""
+    return bool(_config().get("drive_openers", True))
 
 
 def capture_spec(model: Any, model_id: str, axes_dir: Path) -> Optional[dict]:
@@ -520,6 +540,39 @@ def find_subseq(hay: Sequence[int], needle: Sequence[int], probe_len: int = 8) -
     return None
 
 
+def persona_empty_system(prompts_dir: Path) -> str:
+    """The original standing prompt and the persona slot's undecided framing, from the
+    prompt files: the system turn a transcript without a stored one is replayed under,
+    and the capture bench's persona-empty condition (the server builds the same text)."""
+    parts = []
+    for name in ("chat_prompt.txt", "persona_undecided_prompt.txt"):
+        p = Path(prompts_dir) / name
+        if p.exists():
+            parts.append(p.read_text(encoding="utf-8").strip())
+    return "\n\n".join(x for x in parts if x)
+
+
+def replay_conversation(doc: dict, index: int, fallback_system: str = "") -> tuple:
+    """(conversation, framing) as a live chat turn assembled it: the exchange's stored
+    system content, the earlier exchanges CoT-stripped, the user turn. A transcript with
+    no stored system content (pre-v2) is replayed under `fallback_system`, framing
+    ``fallback``. The one rebuild the backfill and the capture probe's states share."""
+    exs = doc.get("exchanges") or []
+    ex = exs[index]
+    system = str(ex.get("system_content") or "")
+    framing = "replay"
+    if not system:
+        system, framing = fallback_system, "fallback"
+    conv = [{"role": "system", "content": system}] if system else []
+    for prev in exs[:index]:
+        if not isinstance(prev, dict):
+            continue
+        conv.append({"role": "user", "content": str(prev.get("user_prompt") or "")})
+        conv.append({"role": "assistant", "content": str(prev.get("assistant_response") or "")})
+    conv.append({"role": "user", "content": str(ex.get("user_prompt") or "")})
+    return conv, framing
+
+
 def reply_span_rows(model: Any, tokenizer: Any, system: str, user: str, reply: str,
                     layers: Sequence[int]) -> Optional[dict]:
     """{layer: (T_reply, D)} — the residuals of the reply's own tokens as they read
@@ -549,11 +602,14 @@ def _put(zf: zipfile.ZipFile, name: str, arr: np.ndarray) -> None:
 
 def write_sidecar(transcript: Path, exchange_id: str, capture: Optional[dict], *,
                   model_id: str, adapter_id: Optional[str], layer_spec: str = "",
-                  variant: str = "", extra_meta: Optional[dict] = None) -> Optional[Path]:
+                  variant: str = "", extra_meta: Optional[dict] = None,
+                  token_ids: Optional[Sequence[int]] = None) -> Optional[Path]:
     """Append one exchange's capture to the transcript's ``.hidden.npz``.
 
     Members are ``<group>/positions``, ``<group>/L<layer>`` (P, D) fp16,
-    ``<group>/axis_<name>`` per-token float32, and ``<group>/meta`` (a JSON string as a
+    ``<group>/axis_<name>`` per-token float32, ``<group>/token_ids`` int32 when given (a
+    drive opener's group only: a chat reply's ids are in its transcript's tension block),
+    and ``<group>/meta`` (a JSON string as a
     0-d array: model + adapter revision, layers, dims, when), where ``<group>`` is the
     exchange id for the live capture and ``<exchange_id>~<variant>`` for a backfill
     under other weights (`member_group`). A group already present is left alone — a zip
@@ -595,8 +651,76 @@ def write_sidecar(transcript: Path, exchange_id: str, capture: Optional[dict], *
             _put(zf, f"{prefix}L{int(layer)}.npy", np.asarray(mat, dtype=np.float16))
         for name, series in sorted((capture.get("axes") or {}).items()):
             _put(zf, f"{prefix}axis_{name}.npy", np.asarray(series, dtype=np.float32))
+        if token_ids is not None:
+            _put(zf, prefix + "token_ids.npy", np.asarray(list(token_ids), dtype=np.int32))
         _put(zf, prefix + "meta.npy", np.array(json.dumps(meta)))
     return path
+
+
+def token_span(gen_ids: Sequence[int], decode: Callable[[Sequence[int]], str],
+               text: str) -> Optional[tuple]:
+    """``(start, end)`` token indices into ``gen_ids`` covering the LAST occurrence of
+    ``text`` in their decoding, or None when it is not found. The last, because a drive's
+    thought often drafts the opener before the answer states it. Found by its first and
+    last 64 characters, so a cleaner that only touched the middle still matches; token
+    boundaries by binary search over decoded-prefix lengths (a dozen decodes)."""
+    ids = [int(t) for t in gen_ids]
+    text = (text or "").strip()
+    if not ids or not text:
+        return None
+    full = decode(ids)
+    head = text[:64]
+    start_c = full.rfind(head)
+    if start_c < 0:
+        return None
+    tail = text[-64:]
+    tail_at = full.find(tail, start_c)
+    end_c = tail_at + len(tail) if tail_at >= 0 else min(len(full), start_c + len(text))
+
+    def reaching(c: int) -> int:
+        # smallest k whose decoded prefix ids[:k] is at least c characters long
+        lo, hi = 0, len(ids)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if len(decode(ids[:mid])) >= c:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    start = max(0, reaching(start_c + 1) - 1)    # the token holding the first character
+    end = max(start + 1, reaching(end_c))
+    return (start, end)
+
+
+def write_opener_capture(transcript: Optional[Path], exchange_id: str,
+                         taken: Optional[dict], opener: str, *, drive: str,
+                         tokenizer: Any) -> Optional[Path]:
+    """File a drive pass's capture under the opener's exchange (see *Drive openers*).
+
+    ``taken`` is the reflect-generate factory's ``last_hidden_capture``: ``{"capture",
+    "layer_spec", "model_id", "adapter_id"}``, the capture carrying the pass's generated
+    ``token_ids``. Best-effort: telemetry never fails a reach-out, so every failure is a
+    printed line and None."""
+    if transcript is None or not taken or not (taken.get("capture") or {}):
+        return None
+    try:
+        cap = taken["capture"]
+        ids = [int(t) for t in cap.get("token_ids") or []]
+        span = None
+        if ids and tokenizer is not None:
+            text_tok = getattr(tokenizer, "tokenizer", tokenizer)
+            span = token_span(ids, lambda x: text_tok.decode(list(x)), opener)
+        return write_sidecar(
+            Path(transcript), exchange_id, cap,
+            model_id=str(taken.get("model_id") or ""), adapter_id=taken.get("adapter_id"),
+            layer_spec=str(taken.get("layer_spec") or ""),
+            extra_meta={"seam": "drive", "drive": drive,
+                        "opener_span": list(span) if span else None},
+            token_ids=ids or None)
+    except Exception as e:
+        print(f"[hidden] {drive} opener capture not written: {type(e).__name__}: {e}")
+        return None
 
 
 def sidecar_index(path: Path) -> dict:
@@ -650,6 +774,8 @@ def read_sidecar(path: Path) -> dict:
                 rec["meta"] = json.loads(raw.item() if hasattr(raw, "item") else str(raw))
             elif member == "positions":
                 rec["positions"] = [int(x) for x in z[key]]
+            elif member == "token_ids":
+                rec["token_ids"] = [int(x) for x in z[key]]
             elif member.startswith("L"):
                 try:
                     rec["layers"][int(member[1:])] = np.asarray(z[key])
@@ -783,5 +909,56 @@ if __name__ == "__main__":
         got = [a for a in load_axes(axes_dir, "m") if a.name == "pain"][0]
         assert (got.mean, got.std, got.baseline) == (5.0, 0.5, "live")
         assert load_axes(Path(td) / "nowhere", "m") == []
+
+        # the live turn's prompt rebuild: stored system content, earlier turns, the message
+        doc = {"exchanges": [{"user_prompt": "a", "assistant_response": "b"},
+                             {"user_prompt": "c", "assistant_response": "d", "system_content": "S"}]}
+        conv, framing = replay_conversation(doc, 1, "F")
+        assert framing == "replay" and conv[0] == {"role": "system", "content": "S"}
+        assert [m["content"] for m in conv[1:]] == ["a", "b", "c"] and conv[-1]["role"] == "user"
+        conv, framing = replay_conversation(doc, 0, "F")
+        assert framing == "fallback" and conv[0]["content"] == "F" and conv[-1]["content"] == "a"
+        prompts = Path(td) / "prompts"
+        prompts.mkdir()
+        (prompts / "chat_prompt.txt").write_text("Base.\n", encoding="utf-8")
+        assert persona_empty_system(prompts) == "Base."
+        (prompts / "persona_undecided_prompt.txt").write_text(" Undecided. \n", encoding="utf-8")
+        assert persona_empty_system(prompts) == "Base.\n\nUndecided."
+
+        # a drive opener: its span in the pass's ids is the LAST occurrence (the thought
+        # drafted it first), and the group carries the ids and the drive's marker
+        vocab = ["<t>", "draft: ", "Hello", " there", "</t>", "DECISION: yes\n", "OPENER: ",
+                 ", friend", "."]
+
+        class _Tok:
+            def decode(self, ids):
+                return "".join(vocab[i] for i in ids)
+
+        ids = [0, 1, 2, 3, 4, 5, 6, 2, 3, 7, 8]
+        dec = _Tok().decode
+        a, b = token_span(ids, dec, "Hello there, friend.")
+        assert (a, b) == (7, 11), (a, b)
+        assert dec(ids[a:b]) == "Hello there, friend."
+        assert token_span(ids, dec, "Hello there") == (7, 9)
+        assert token_span(ids, dec, "absent") is None and token_span([], dec, "x") is None
+        opener_cap = {"positions": [0, 10], "residuals": {2: np.zeros((2, D), np.float16)},
+                      "axes": {"pain": [0.0] * len(ids)}, "layers": [2], "hidden_dim": D,
+                      "n_tokens": len(ids), "token_ids": ids}
+        taken = {"capture": opener_cap, "layer_spec": "2", "model_id": "m", "adapter_id": "ad"}
+        assert write_opener_capture(transcript, "op0", taken, " Hello there, friend. ",
+                                    drive="outreach", tokenizer=_Tok()) == p
+        back = read_sidecar(p)
+        assert back["op0"]["token_ids"] == ids and "token_ids" not in back["ex1"]
+        m = back["op0"]["meta"]
+        assert (m["seam"], m["drive"], m["opener_span"]) == ("drive", "outreach", [7, 11])
+        assert m["variant"] == "" and m["adapter_id"] == "ad"
+        assert write_opener_capture(transcript, "op1", None, "x", drive="checkin",
+                                    tokenizer=_Tok()) is None
+        assert write_opener_capture(None, "op1", taken, "x", drive="checkin",
+                                    tokenizer=_Tok()) is None
+        # an opener the ids do not contain is still filed, with no span
+        assert write_opener_capture(transcript, "op2", taken, "not in there", drive="synthesis",
+                                    tokenizer=_Tok()) == p
+        assert read_sidecar(p)["op2"]["meta"]["opener_span"] is None
 
     print("hidden_capture self-test: OK")

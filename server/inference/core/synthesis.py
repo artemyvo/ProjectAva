@@ -39,6 +39,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 from core.runtime_state import (runtime as _runtime, session as _session,
                                 reflect_output_reserve as _reserve,
@@ -47,7 +48,8 @@ from core.field_parse import label as _label
 from core import activity_log
 from core import fact_fetch
 from core import reasoning_text
-from core.chat_logger import ChatLogger
+from core.chat_logger import UNKNOWN_ADDRESSEE, ChatLogger
+from core import hidden_capture
 from core.chat_sidecar import is_chat_session_json
 from core.reflection_chunking import build_consolidation_chunks
 from core.reflection_writer import parse_consolidation, parse_impressions
@@ -522,7 +524,7 @@ def _pick_chat(min_age_days: float, min_resynth_days: float) -> Optional[str]:
 
 def _write_synthesis_session(*, opener: str, human: str, source_session: str,
                              about: str, question: str, ask_kind: str = "",
-                             ask_key: str = "") -> str:
+                             ask_key: str = "", hidden: Optional[dict] = None) -> str:
     """Write the reversed, Ava-initiated session to chats/ and return its filename.
 
     Same shape as ``outreach._write_outreach_session`` — exchange 0 is Ava's opener
@@ -547,10 +549,15 @@ def _write_synthesis_session(*, opener: str, human: str, source_session: str,
         initiated_ask={"key": ask_key, "content": question, "ask_kind": ask_kind,
                        "source_session": source_session},
     )
+    opener_id = uuid4().hex
     logger.log_exchange(
         impulse, opener, speaker=_INITIATIVE_SPEAKER,
-        system_content=_session.system_prompt,
+        system_content=_session.system_prompt, exchange_id=opener_id,
     )
+    # The opener pass, captured (`hidden_capture.write_opener_capture`): a session's
+    # first state, which live capture never sees. Telemetry, best-effort.
+    hidden_capture.write_opener_capture(logger.current_file, opener_id, hidden, opener,
+                                        drive="synthesis", tokenizer=_runtime.tokenizer)
     return logger.current_file.name if logger.current_file else ""
 
 
@@ -753,7 +760,7 @@ def run_synthesis_blocking(
                     "source_session": chosen}
 
         human = ((session.get("user") or "").strip()
-                 or (_session.user or "").strip() or "your friend")
+                 or (_session.user or "").strip() or UNKNOWN_ADDRESSEE)
         _stage(stage="picked", session=chosen, user=human)
 
         persona = _persona_context()
@@ -1006,7 +1013,9 @@ def run_synthesis_blocking(
             temperature=0.7, top_p=0.95,
             max_new_tokens_setting=str(opener_reserve),
             disable_rag=True, on_chunk=on_chunk,
+            capture_hidden=hidden_capture.drive_openers_enabled(),
         )
+        hidden = getattr(generate, "last_hidden_capture", None)
         truncated = bool(getattr(generate, "last_truncated", None))
         _skip_common = {"analyzed": True, "raised": False, "source_session": chosen,
                         "about": about, "asks": n_asks, "impressions": n_impressions, "question": question,
@@ -1059,7 +1068,8 @@ def run_synthesis_blocking(
 
         filename = _write_synthesis_session(
             opener=opener, human=human, source_session=chosen,
-            about=about, question=question, ask_kind=ask_kind, ask_key=ask_key)
+            about=about, question=question, ask_kind=ask_kind, ask_key=ask_key,
+            hidden=hidden)
         # A reach-out was written → start the shared cool-down (outreach / check-in).
         reachout_gate.mark_reachout()
         # Mark the raised ask surfaced (rotation + retirement, resolve-and-distill later).

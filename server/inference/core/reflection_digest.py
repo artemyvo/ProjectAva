@@ -40,6 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 from core.field_parse import section as _section
+from core.reasoning_text import truncated_before_answer
 
 # Artifact layout: a single ``digest.json`` — the persona's one self-portrait. Rollback +
 # versioning are provided by the persona snapshot lineage (each persona = one version,
@@ -63,7 +64,10 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 # after it is scratch reasoning, so it is cut like a closed block rather than left in the
 # body. See `strip_think` for why that is not merely tidiness.
 _DANGLING_THINK_RE = re.compile(r"<think>.*$", re.IGNORECASE | re.DOTALL)
-_BULLET_RE = re.compile(r"^[ \t]*[-*][ \t]*")
+# List markers, including the typographic ones a Russian answer uses: the adapter's
+# portraits list with "— " (2026-09), which the renderers' own "- " then doubled into
+# "- — …" in the block injected every turn.
+_BULLET_RE = re.compile(r"^[ \t]*[-*•–—][ \t]*")
 _TAG_RE = re.compile(r"^\[(?:stance|line|disposition)\][ \t]*", re.IGNORECASE)
 # A disposition opens on a bracketed head. The model reliably writes the *name* in the
 # brackets ("- [systematizing the absurd]"), not the literal placeholder tag from the
@@ -320,7 +324,9 @@ def _load_embedder():
     _EMBEDDER_LOADED = True
     try:
         from sentence_transformers import SentenceTransformer
-        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+        from core import load_lock     # one model load at a time (core/load_lock.py)
+        with load_lock.LOCK:
+            _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
     except Exception:
         _EMBEDDER = None
     return _EMBEDDER
@@ -1778,6 +1784,18 @@ def synthesize_digest(
         before_session="", disable_rag=True,
     )
     digest = parse_digest(text)
+    # A draft cut before its thought closed has no answer region. gemma-4's channel is
+    # prefilled, so that thought comes back untagged and `strip_think` has nothing to cut:
+    # the draft's own checklist parses as sections. Observed 2026-09-27: a loop-halted
+    # draft (1,229 tokens) was written as a digest of 18 LINES — "No markdown? Yes." and
+    # the like — and nothing else, and injected every turn. An empty parse is refused for
+    # the same reason: either way the digest already on disk stays.
+    cut = truncated_before_answer(text or "", getattr(generate_fn, "last_truncated", None))
+    if cut or not any(digest.get(k) for k in ("voice", "stances", "dispositions", "lines")):
+        return {"status": "skipped",
+                "reason": ("cut before its answer (the thought never closed)" if cut
+                           else "unparseable or empty"),
+                "persona_count": len(evidence)}
     gates = None
     if gate_screen and digest.get("dispositions"):
         try:
@@ -1975,6 +1993,9 @@ def _selftest() -> None:
     )
     d = parse_digest(sample)
     assert d["voice"] and d["stances"] == ["Utility is a trap."] and len(d["lines"]) == 1
+    # Every list marker goes, the typographic ones included; a hyphen inside a line stays.
+    assert _bullets("— one\n– two\n• three\n- four\n* five\n  —six\nself-aware") == [
+        "one", "two", "three", "four", "five", "six", "self-aware"]
     assert [x["name"] for x in d["dispositions"]] == ["transgressive attack",
                                                       "register-mirroring"], d["dispositions"]
     assert "never adopt the bigotry" in d["dispositions"][0]["not"]
@@ -2053,6 +2074,22 @@ def _selftest() -> None:
     assert plan_digest(cons3, persona_dir=persona3)["should_run"] is False
     assert plan_digest(cons3, persona_dir=persona3, force=True)["should_run"] is True
     print("  seams: plan → cluster → synthesize compose, gate + force honoured ✓")
+
+    # A draft cut before its thought closed (gemma-4 returns it untagged, so its own
+    # labels would parse) and an empty parse are both refused: the digest on disk stays.
+    kept = (persona3 / DIGEST_FILE).read_text(encoding="utf-8")
+
+    def gen_cut(content, sysp, **kw):
+        return sample.split("</think>", 1)[-1]          # the sections, no close marker
+    gen_cut.last_truncated = True
+    out = synthesize_digest(seam_ev, generate_fn=gen_cut, persona_dir=persona3,
+                            run_id="r3-cut", raw_fp=plan["raw_fp"])
+    assert out["status"] == "skipped" and "never closed" in out["reason"], out
+    out = synthesize_digest(seam_ev, generate_fn=lambda *a, **k: "<think>x</think>",
+                            persona_dir=persona3, run_id="r3-empty", raw_fp=plan["raw_fp"])
+    assert out["status"] == "skipped" and out["reason"] == "unparseable or empty", out
+    assert (persona3 / DIGEST_FILE).read_text(encoding="utf-8") == kept
+    print("  a cut draft or an empty parse leaves the digest on disk ✓")
 
     # map_reduce routing: with a generate_fn the blocked path runs; a raising one must
     # fall back to the historical tiers rather than sinking the digest. Needs more than

@@ -842,12 +842,12 @@ class TrainingReviewWidget(QWidget):
         # reply), composing with the other filters in `_apply_hiding`; the Search button
         # then cycles through the survivors.
         self._search_needle: str = ""
-        # Yellow highlight painted under every occurrence of the search phrase in the three
-        # preview boxes. The foreground is pinned too, so the text stays readable whatever
-        # the palette's default text colour is (a light-on-yellow theme would wash out).
+        # Amber highlight painted under every occurrence of the search phrase in the three
+        # preview boxes — deep enough not to glare on the dark pane. The foreground is
+        # pinned too, so the hit stays readable whatever the palette's text colour is.
         self._search_hl_fmt = QTextCharFormat()
-        self._search_hl_fmt.setBackground(QColor("#ffe66b"))
-        self._search_hl_fmt.setForeground(QColor("#000000"))
+        self._search_hl_fmt.setBackground(QColor("#7a5a10"))
+        self._search_hl_fmt.setForeground(QColor("#fff4d0"))
         # Persona-opener filter: show only entries scoring at/above the threshold.
         self._persona_active: bool = False
         self._persona_threshold: float = 0.6
@@ -933,6 +933,10 @@ class TrainingReviewWidget(QWidget):
         # LR multiplier 0 so it can be repaired early — this build did NOT train it.
         if e.get("preview"):
             suffix += "  ▷fresh"
+        # Gated by the capture judge: she gave in to pushback with no reason beyond it, so
+        # the next build leaves the exchange out (core/capture_judge.py).
+        if e.get("capture"):
+            suffix += "  ⛔capture"
         prefix = "wander " if e.get("kind") == "wander" else ""
         return f"{row + 1:>4}. {prefix}{e['key']}{suffix}"
 
@@ -1105,11 +1109,13 @@ class TrainingReviewWidget(QWidget):
         self.cmb_frozen.addItem("Only unfrozen", "unfrozen")
         self.cmb_frozen.addItem("Only 🚫 banned", "banned")
         self.cmb_frozen.addItem("Only ▷ fresh", "fresh")
+        self.cmb_frozen.addItem("Only ⛔ capture-gated", "capture")
         self.cmb_frozen.setToolTip(
             "Show only human-validated (❄ frozen) entries, only the ones still awaiting "
             "review, only the ones banned (🚫) from training, only the fresh preview "
             "rows (▷ — rendered untrained, at LR 0, so they can be repaired before they "
-            "age into a real build), or all of them.\n"
+            "age into a real build), only the ones the capture judge keeps out of the next "
+            "build (⛔ — she gave in to pushback with no reason beyond it), or all of them.\n"
             "Note that “Only unfrozen” still includes banned rows — a ban is a verdict on "
             "the row, not a review of its content.")
         self.cmb_frozen.currentIndexChanged.connect(self._on_frozen_filter)
@@ -1415,6 +1421,9 @@ class TrainingReviewWidget(QWidget):
         fresh = sum(1 for e in self._entries if e.get("preview"))
         if fresh:
             frozen_note += f", {fresh} fresh preview ▷ (untrained)"
+        gated = sum(1 for e in self._entries if e.get("capture"))
+        if gated:
+            frozen_note += f", {gated} capture-gated ⛔ (out of the next build)"
         # Rows > entries means cap-age exchanges rendered a contamination copy each; the
         # list shows the exchange once, so name the collapse instead of hiding it.
         dup_note = f" (from {rows} rows — duplicate copies collapsed)" if rows > n else ""
@@ -1498,6 +1507,10 @@ class TrainingReviewWidget(QWidget):
         for i, e in enumerate(self._entries):
             item = QListWidgetItem(self._item_text(i, e))
             item.setIcon(self._row_icon(e))
+            if e.get("capture"):
+                item.setToolTip("⛔ The capture judge keeps this exchange out of the next build: "
+                                + (e.get("capture_why") or "she gave in to pushback with no reason "
+                                                           "beyond it."))
             self.lst_entries.addItem(item)
         self.lst_entries.blockSignals(False)
         if (self._ratio_active or self._search_needle or self._frozen_filter != "all"
@@ -1565,7 +1578,7 @@ class TrainingReviewWidget(QWidget):
         """The search phrase EXACTLY as typed — no strip.
 
         One definition for the filter, the highlight and both Replace buttons, so what is
-        marked yellow is precisely what a replace would rewrite. It is deliberately not
+        marked amber is precisely what a replace would rewrite. It is deliberately not
         stripped: the phrase this was built for is a poison sequence with a **trailing space**
         (`"terms of "`), and stripping it would delete the words and leave the double space
         behind — a whitespace-tolerant search box is not worth a corpus-wide off-by-one."""
@@ -1596,7 +1609,7 @@ class TrainingReviewWidget(QWidget):
             self._highlight_box(box)
 
     def _highlight_box(self, box: QPlainTextEdit) -> None:
-        """Paint a yellow background under every occurrence of the search phrase in `box`.
+        """Paint an amber background under every occurrence of the search phrase in `box`.
 
         View-level `ExtraSelections` only — the document is never touched, so highlighting
         can never mark a row dirty, reach `_is_dirty`, or end up in a written target."""
@@ -1953,6 +1966,8 @@ class TrainingReviewWidget(QWidget):
                     hide = not e.get("banned")
                 elif frozen_mode == "fresh":
                     hide = not e.get("preview")
+                elif frozen_mode == "capture":
+                    hide = not e.get("capture")
                 else:
                     locked = bool(e.get("locked"))
                     hide = (not locked) if frozen_mode == "frozen" else locked
@@ -1974,6 +1989,8 @@ class TrainingReviewWidget(QWidget):
             notes.append("banned 🚫 only")
         elif frozen_mode == "fresh":
             notes.append("fresh ▷ only")
+        elif frozen_mode == "capture":
+            notes.append("capture-gated ⛔ only")
         if self._persona_active:
             notes.append(f"persona ✦ ≥ {p_thr:g}")
         self._lbl_filter.setText(

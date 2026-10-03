@@ -493,6 +493,78 @@ class BackendClient:
             self._send(payload)
             return self._recv_until({"reset_test_control_started"}, timeout=180.0)
 
+    def capture_judge_report(self) -> dict:
+        """The capture judge's summary under the current judge: graded, gated, waiting."""
+        with self._rpc_lock:
+            self._send({"type": "capture_judge_report"})
+            return self._recv_until({"capture_judge_report"}, timeout=300.0)
+
+    def capture_judge_run(self, *, limit: int = 0, rejudge: bool = False, persona: bool = True) -> dict:
+        """Grade the corpus's waiting training targets on the clean base, in the background
+        (returns at once; progress via capture_judge_status). ``persona=False`` leaves the
+        gated exchanges' [persona] statements to capture_persona_apply."""
+        with self._rpc_lock:
+            self._send({"type": "capture_judge_run", "limit": int(limit), "rejudge": bool(rejudge),
+                        "persona": bool(persona)})
+            return self._recv_until({"capture_judge_started"}, timeout=300.0)
+
+    def capture_judge_status(self, after: int = 0) -> dict:
+        with self._rpc_lock:
+            self._send({"type": "capture_judge_status", "after": int(after)})
+            return self._recv_until({"capture_judge_status"})
+
+    def capture_judge_stop(self) -> dict:
+        with self._rpc_lock:
+            self._send({"type": "capture_judge_stop"})
+            return self._recv_until({"capture_judge_stopping"})
+
+    def capture_persona_plan(self) -> dict:
+        """The live [persona] statements whose every source exchange is capture-gated."""
+        with self._rpc_lock:
+            self._send({"type": "capture_persona_plan"})
+            return self._recv_until({"capture_persona_plan"}, timeout=300.0)
+
+    def capture_persona_apply(self, keys: Optional[list] = None) -> dict:
+        """Withhold them (all, or the content keys in *keys*)."""
+        with self._rpc_lock:
+            self._send({"type": "capture_persona_apply", "keys": list(keys or [])})
+            return self._recv_until({"capture_persona_applied"}, timeout=600.0)
+
+    def capture_repair_report(self, *, attempts: int = 0) -> dict:
+        """The capture repair's store: gated targets attempted, repaired, out of attempts."""
+        with self._rpc_lock:
+            self._send({"type": "capture_repair_report", "attempts": int(attempts)})
+            return self._recv_until({"capture_repair_report"}, timeout=300.0)
+
+    def capture_repair_run(self, *, limit: int = 0, attempts: int = 0) -> dict:
+        """Answer the gated exchanges again, the first attempt the frozen judge passes
+        promoted (returns at once; progress via capture_judge_status)."""
+        with self._rpc_lock:
+            self._send({"type": "capture_repair_run", "limit": int(limit), "attempts": int(attempts)})
+            return self._recv_until({"capture_repair_started"}, timeout=300.0)
+
+    def capture_bench_report(self, *, bench: str = "", samples: int = 1) -> dict:
+        """The capture bench's store: frozen contexts, replies per arm, the paired table."""
+        with self._rpc_lock:
+            self._send({"type": "capture_bench_report", "bench": bench, "samples": int(samples)})
+            return self._recv_until({"capture_bench_report"}, timeout=300.0)
+
+    def capture_bench_run(self, *, arms=("adapter", "base"), bench: str = "", samples: int = 1,
+                          limit: int = 0, **sizes) -> dict:
+        """Answer the bench's contexts under the loaded weights and/or the base, then grade
+        them (returns at once; progress via capture_judge_status). ``sizes``: ``assertion`` /
+        ``reason`` per stratum, read only by the run that freezes the bench."""
+        with self._rpc_lock:
+            self._send({"type": "capture_bench_run", "arms": list(arms), "bench": bench,
+                        "samples": int(samples), "limit": int(limit), **sizes})
+            return self._recv_until({"capture_bench_started"}, timeout=300.0)
+
+    def capture_bench_holdout(self, *, bench: str = "", action: str = "plan") -> dict:
+        """The bench's held-out set: ``plan``, ``apply`` (out of every build) or ``release``."""
+        with self._rpc_lock:
+            self._send({"type": "capture_bench_holdout", "bench": bench, "action": action})
+            return self._recv_until({"capture_bench_holdout"}, timeout=300.0)
+
     def reset_test_status(self, after: int = 0) -> dict:
         with self._rpc_lock:
             self._send({"type": "reset_test_status", "after": int(after)})
@@ -1066,12 +1138,14 @@ class BackendClient:
             # capture. That generation moved out; this is headroom for what is left.
             return self._recv_until({"til_applied"}, timeout=600.0)
 
-    def outreach_now(self):
+    def outreach_now(self, user=None):
         """Manually trigger one Ava-initiated outreach decision (Sleep-tab debug).
 
         Generator yielding ``(kind, msg)`` for the Sleep tab's "Reach Out" button —
-        the same decision pass the idle-wake heartbeat runs, with Ava's reasoning
-        streamed back so the operator can watch her deliberate:
+        the same per-person decision pass the idle-wake sweep runs, with Ava's reasoning
+        streamed back so the operator can watch her deliberate. ``user`` names whose
+        decision it is — their questions (plus the ones that belong to nobody), their
+        reach-out gate; the server defaults it to the active session's speaker:
           * ``("outreach_question", {question, ask_kind, user})`` — the open ask she's weighing.
           * ``("outreach_prompt", {pass, segments, input_tokens, rag_tokens, rag_disabled,
             max_new_tokens, context_length})`` — the FULL model-facing prompt of the
@@ -1086,7 +1160,10 @@ class BackendClient:
         One logical RPC (holds ``_rpc_lock``) — run on a worker thread; the decision
         pass is a full generation, hence the generous timeout."""
         with self._rpc_lock:
-            self._send({"type": "outreach_now"})
+            req = {"type": "outreach_now"}
+            if user:
+                req["user"] = str(user)
+            self._send(req)
             while True:
                 msg = self._recv_until(
                     {"outreach_question", "outreach_prompt", "outreach_chunk",
@@ -1224,7 +1301,8 @@ class BackendClient:
             return self._recv_until({"module_inputs"})
 
     def run_module(self, module: str, filename: str, *, prompt: str = "",
-                   inject=(), temperature: float = 0.7, top_p: float = 0.95):
+                   inject=(), temperature: float = 0.7, top_p: float = 0.95,
+                   weights: str = "adapter"):
         """Run one module against one chat (Modules tab "Simulate"). **Writes nothing.**
 
         Generator yielding ``(kind, msg)``:
@@ -1241,6 +1319,8 @@ class BackendClient:
                 "type": "run_module", "module": module, "filename": filename,
                 "prompt": prompt, "inject": list(inject),
                 "temperature": temperature, "top_p": top_p,
+                # "base": the server runs the pass on the bare base (a clean-base swap).
+                "weights": weights,
             })
             while True:
                 msg = self._recv_until(

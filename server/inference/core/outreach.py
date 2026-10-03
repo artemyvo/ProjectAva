@@ -41,6 +41,7 @@ import re
 import time
 import traceback
 from pathlib import Path
+from uuid import uuid4
 from typing import Any, Callable, Optional
 
 from core.runtime_state import (runtime as _runtime, session as _session,
@@ -50,7 +51,8 @@ from core.field_parse import label as _label
 from core import activity_log
 from core import fact_fetch
 from core import reasoning_text
-from core.chat_logger import ChatLogger
+from core.chat_logger import UNKNOWN_ADDRESSEE, ChatLogger
+from core import hidden_capture
 from core.reflection_memory import (
     ReflectionMemory, is_self_directed_origin, load_origin_note)
 from core import reachout_gate
@@ -141,6 +143,17 @@ _failed_asks: dict[str, float] = {}   # ask key → time.monotonic() of the fail
 # ``server_config.json`` → ``outreach.min_reask_hours``.
 _MIN_REASK_HOURS_DEFAULT = 72.0
 
+# The per-person wake (`run_outreach_sweep_blocking`), mirroring check-in's: at most this
+# many people reach a decision GENERATION per wake (`outreach.max_users`; the rest are
+# deferred to the next), and a person silent past `outreach.max_silence_days` stopped
+# talking rather than went quiet — without the ceiling a dormant contact would be written
+# to for as long as a question of theirs stayed open (0 ⇒ no ceiling).
+_MAX_USERS_DEFAULT = 3
+_MAX_SILENCE_DAYS_DEFAULT = 30.0
+# Per-person outcomes that spent no generation — a cheap bail does not use a sweep slot.
+_CHEAP_SKIPS = frozenset({"no_model", "no_candidates", "all_recently_failed",
+                          "all_awaiting_reply", "empty_ask", "dormant", "deferred"})
+
 # How far down the candidate list to walk before giving up. The top candidate may be
 # held by the unanswered-opener guard below, and the one under it too; without this the
 # job would skip whenever its single favourite was blocked.
@@ -210,6 +223,16 @@ def _min_reask_hours() -> float:
         return float(val) if val is not None else _MIN_REASK_HOURS_DEFAULT
     except Exception:
         return _MIN_REASK_HOURS_DEFAULT
+
+
+def _cfg(name: str, default):
+    """``outreach.<name>`` from the server config, else *default*."""
+    try:
+        cfg = _load_server_config() if _load_server_config is not None else {}
+        val = (cfg.get("outreach") or {}).get(name)
+        return default if val is None else val
+    except Exception:
+        return default
 
 
 def _decision_output_reserve() -> int:
@@ -296,21 +319,104 @@ def _has_dangling_opener(ask: dict) -> bool:
     return False
 
 
-def _pick_ask() -> tuple[Optional[dict], str]:
+# ── whose question ─────────────────────────────────────────────────────────────
+
+# {chat filename: (mtime_ns, person key, display)}. A transcript's header rarely changes
+# after the conversation, so a sweep weighing one pool per person parses each chat once.
+_chat_person_cache: dict[str, tuple[int, str, str]] = {}
+
+
+def _chat_owner(name: str) -> tuple[str, str]:
+    """``(person key, spelling)`` of the conversation in chat file *name*; ``("", "")``
+    for nobody (see :func:`_chat_person`)."""
+    name = str(name or "").strip()
+    if _CHATS_DIR is None or not name.endswith(".json") or "/" in name or ":" in name:
+        return "", ""
+    path = _CHATS_DIR / name
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        # Hot first, then the archive — the fallback the ASK ORIGIN injection reads through
+        # (`generation._ask_origin_block`), so a question keeps its person once a Sleep run
+        # has archived the chat it came from, instead of turning into nobody's.
+        try:
+            from training.reflections_path import archive_chats_dir
+            path = Path(archive_chats_dir()) / name
+            mtime = path.stat().st_mtime_ns
+        except Exception:
+            return "", ""
+    hit = _chat_person_cache.get(name)
+    if hit is not None and hit[0] == mtime:
+        return hit[1], hit[2]
+    key = display = ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (data.get("interlocutor") or "").strip().lower() != "ai":
+            display = str(data.get("user") or "").strip()
+            key = reachout_gate.user_key(display)
+    except Exception:
+        key = display = ""
+    _chat_person_cache[name] = (mtime, key, display if key else "")
+    return key, (display if key else "")
+
+
+def _chat_person(name: str) -> str:
+    """The person key of the conversation in chat file *name*, or ``""`` for nobody.
+
+    The transcript's session-level ``user`` — who actually spoke (`chat_logger` names an
+    initiated session from its first human reply) — keyed the way check-in and the
+    reach-out gate key people (`reachout_gate.user_key`). Nobody for a conversation with a
+    model (``interlocutor: "ai"``), a transcript that is gone or unreadable, or a ref that
+    is not a chat file (``til:`` / ``wiki:`` / ``<kind>/<stem>`` / ``lookup``)."""
+    return _chat_owner(name)[0]
+
+
+def addressee_for(source_session: str) -> str:
+    """Whom to write to about material from *source_session*: its person, in that
+    transcript's own spelling — or ``""`` when it belongs to nobody (:func:`_chat_person`).
+
+    Injected into `assoc_bridge`, whose aha (an open question's need) and pivot (the
+    conversation it switched from) act on one conversation's material and so write to
+    that conversation's person, as outreach does with a question."""
+    return _chat_owner(source_session)[1]
+
+
+def _ask_person(ask: dict) -> str:
+    """Whose question *ask* is: the person of the conversation it was formed in, or ``""``.
+
+    A question formed in a conversation is raised only with that person: the session it
+    opens carries its origin chat as ASK ORIGIN context (`core.ask_origin`), so raised
+    with anyone else it would put one person's conversation into another's. One formed
+    from reading, in a conversation with a model, or in a chat no longer on disk belongs to
+    nobody and may be raised with anyone (:func:`_chat_person`)."""
+    return _chat_person(ask.get("source_session") or "")
+
+
+def _pick_ask(person: Optional[str] = None) -> tuple[Optional[dict], str]:
     """Choose the open ask to weigh, or ``(None, reason)`` when none is eligible.
 
     Walks the surfaceable candidates (already gap-filtered and rotation-ordered by
     :meth:`ReflectionMemory.surfaceable_questions`) and takes the first with no
     dangling unanswered opener that did not just fail to be decided
     (:func:`_note_failed_attempt`). ``all_recently_failed`` names the case where the
-    hold alone emptied the walk, so it is not read as "nothing to raise"."""
+    hold alone emptied the walk, so it is not read as "nothing to raise".
+
+    *person* (a ``reachout_gate.user_key``) walks only the questions that person may be
+    asked — their own and the ones that belong to nobody (:func:`_ask_person`). ``None``
+    walks the whole pool: the unscoped pass, for a corpus that names nobody."""
     try:
         memory = ReflectionMemory(_MEMORY_DIR)
         candidates = memory.surfaceable_questions(
-            ceiling=_SURFACE_CEILING, limit=_CANDIDATE_DEPTH,
+            ceiling=_SURFACE_CEILING,
+            # Scoped, the depth applies after the person filter: a person whose questions
+            # all rank below the pool's first few must still reach them.
+            limit=_CANDIDATE_DEPTH if person is None else 1_000_000,
             min_gap_hours=_min_reask_hours())
     except Exception:
         candidates = []
+    if person is not None:
+        candidates = [a for a in candidates
+                      if _ask_person(a) in ("", person)][:_CANDIDATE_DEPTH]
     if not candidates:
         return None, "no_candidates"
     held = 0
@@ -323,7 +429,8 @@ def _pick_ask() -> tuple[Optional[dict], str]:
     return None, ("all_recently_failed" if held == len(candidates) else "all_awaiting_reply")
 
 
-def _standing_questions_block(user: str, exclude_key: str = "") -> str:
+def _standing_questions_block(user: str, exclude_key: str = "",
+                              person: Optional[str] = None) -> str:
     """The questions she has already put to *user* recently, as a labelled block — or "".
 
     Two failure modes observed live, and this block addresses both at once. **Shyness:**
@@ -343,13 +450,23 @@ def _standing_questions_block(user: str, exclude_key: str = "") -> str:
     `_RAISED_CAP` asks' few sessions each). The candidate under decision is excluded by
     key so it is never listed as its own precedent. Empty when she has raised nothing
     recently — the prompt's check still stands, answered from recall alone.
+
+    *person* keeps only what was put to that person (a session of theirs among the ask's
+    ``surfaced_in_sessions``): the check is "have I already asked them?", and a question
+    put to someone else is neither a repeat nor theirs to see — unscoped, the decision
+    could retire one person's question as a duplicate of another's.
     """
     try:
         memory = ReflectionMemory(_MEMORY_DIR)
-        raised = memory.recently_raised(within_hours=_RAISED_WINDOW_HOURS,
-                                        limit=_RAISED_CAP + 1)
+        raised = memory.recently_raised(
+            within_hours=_RAISED_WINDOW_HOURS,
+            limit=_RAISED_CAP + 1 if person is None else 1_000_000)
     except Exception:
         return ""
+    if person is not None:
+        raised = [r for r in raised
+                  if any(_chat_person(s) == person
+                         for s in (r.get("surfaced_in_sessions") or []))]
     raised = [r for r in raised if (r.get("key") or "") != exclude_key][:_RAISED_CAP]
     lines = []
     for r in raised:
@@ -481,8 +598,11 @@ def _parse_decision(text: str) -> tuple[str, str, str]:
 
 
 def _target_user() -> str:
-    """Name Ava would address — the last known speaker, or a neutral fallback."""
-    return (_session.user or "").strip() or "your friend"
+    """Name Ava would address — the last known speaker, or a neutral fallback.
+
+    The fallback is display text for the prompts; the session writer records it as
+    nobody, and the first human reply names the session (`chat_logger`)."""
+    return (_session.user or "").strip() or UNKNOWN_ADDRESSEE
 
 
 def _source_material(source_session: Optional[str]) -> str:
@@ -703,7 +823,8 @@ def _fetch_ask_facts(ask_content: str) -> dict:
 
 def _write_outreach_session(*, ask_content: str, opener: str, human: str,
                             ask_kind: str, ask_key: str = "",
-                            ask_source_session: str = "") -> str:
+                            ask_source_session: str = "",
+                            hidden: Optional[dict] = None) -> str:
     """Write the reversed outreach session to hot/chats and return its filename.
 
     Exchange 0 is Ava's opener, logged under ``(initiative)`` with a synthetic impulse
@@ -726,10 +847,15 @@ def _write_outreach_session(*, ask_content: str, opener: str, human: str,
         initiated_ask={"key": ask_key, "content": ask_content, "ask_kind": ask_kind,
                        "source_session": ask_source_session},
     )
+    opener_id = uuid4().hex
     logger.log_exchange(
         impulse, opener, speaker=_INITIATIVE_SPEAKER,
-        system_content=_session.system_prompt,
+        system_content=_session.system_prompt, exchange_id=opener_id,
     )
+    # The pass that wrote the opener, captured (`hidden_capture.write_opener_capture`):
+    # a session's first state, which live capture never sees. Telemetry, best-effort.
+    hidden_capture.write_opener_capture(logger.current_file, opener_id, hidden, opener,
+                                        drive="outreach", tokenizer=_runtime.tokenizer)
     return logger.current_file.name if logger.current_file else ""
 
 
@@ -740,8 +866,9 @@ def run_outreach_decision_blocking(
     on_question: Optional[Callable[[dict], None]] = None,
     on_prompt: Optional[Callable[[str, dict], None]] = None,
     bypass_cooldown: bool = False,
+    user: Optional[str] = None,
 ) -> dict:
-    """One idle-slot outreach decision (runs on the GPU executor thread).
+    """One outreach decision (runs on the GPU executor thread).
 
     Skips when no surfaceable ask exists. Otherwise runs the decision pass over the top
     candidate, which resolves four ways: on a **yes** with an opener, writes the
@@ -765,14 +892,23 @@ def run_outreach_decision_blocking(
     ``bypass_cooldown`` skips the shared reach-out rate limit — the manual trigger sets
     it so an operator's on-demand "Reach Out" always sends, even inside another
     reach-out's window. A manual send still *stamps* the gate afterward, so an autonomous
-    job won't pile on right behind it."""
+    job won't pile on right behind it.
+
+    *user* makes it one person's decision — the per-person sweep
+    (:func:`run_outreach_sweep_blocking`) and the manual trigger: only their own questions
+    and the ones that belong to nobody are weighed (:func:`_pick_ask`), the opener is
+    addressed to them, "questions you have already put to them" lists only theirs, and the
+    reach-out gate asked is theirs. ``None`` is the unscoped pass — the whole pool, the
+    last active user, the box-wide gate — for a corpus that names nobody."""
     global _outreach_active
+    owner = not _outreach_active     # a sweep holds the flag across its decisions
     _outreach_active = True
     try:
         if _runtime.model is None:
             return {"skipped": "no_model"}
 
-        ask, reason = _pick_ask()
+        person = reachout_gate.user_key(user) or None
+        ask, reason = _pick_ask(person)
         if ask is None:
             return {"skipped": reason}
         ask_content = (ask.get("content") or "").strip()
@@ -781,7 +917,7 @@ def run_outreach_decision_blocking(
         if not ask_content or not ask_key:
             return {"skipped": "empty_ask"}
 
-        user = _target_user()
+        user = (str(user).strip() if person else "") or _target_user()
         if on_question is not None:
             try:
                 on_question({"question": ask_content, "ask_kind": ask_kind, "user": user})
@@ -832,7 +968,7 @@ def run_outreach_decision_blocking(
         # A `{standing}` slot in the template places it; a customized prompt file on
         # disk that predates the slot gets the block PREPENDED instead of silently
         # dropping it (prepending keeps the contract last, per the reflect-lane rule).
-        standing = _standing_questions_block(user, exclude_key=ask_key)
+        standing = _standing_questions_block(user, exclude_key=ask_key, person=person)
         template = _load_prompt()
         content = (template
                    .replace("{question}", ask_content)
@@ -875,7 +1011,9 @@ def run_outreach_decision_blocking(
             # where "what did retrieval put in front of her?" has a non-empty answer.
             on_prompt_debug=(None if on_prompt is None
                              else (lambda info: on_prompt("decision", info))),
+            capture_hidden=hidden_capture.drive_openers_enabled(),
         )
+        hidden = getattr(generate, "last_hidden_capture", None)
         decision, opener, answer = _parse_decision(raw)
 
         # Refuse a generation that was cut off before it closed its reasoning — BEFORE the
@@ -1011,7 +1149,10 @@ def run_outreach_decision_blocking(
         # is lost; we simply don't send now. (See core.reachout_gate on why gating the job
         # instead of the message starved whichever sibling the scheduler tried last.)
         # A manual "Reach Out" (bypass_cooldown) always sends — the operator asked for it.
-        gate_ok, gate_reason = (True, "") if bypass_cooldown else reachout_gate.may_reach_out()
+        # Scoped to the addressee on a per-person decision: one person's silence says
+        # nothing about another's (see `reachout_gate.may_reach_out`).
+        gate_ok, gate_reason = ((True, "") if bypass_cooldown
+                                else reachout_gate.may_reach_out(user if person else None))
         if not gate_ok:
             print(f"[outreach] holding opener on ask {ask_key[:8]} — {gate_reason}",
                   flush=True)
@@ -1021,10 +1162,11 @@ def run_outreach_decision_blocking(
         filename = _write_outreach_session(
             ask_content=ask_content, opener=opener, human=user, ask_kind=ask_kind,
             ask_key=ask_key,
-            ask_source_session=str(ask.get("source_session") or "").strip())
+            ask_source_session=str(ask.get("source_session") or "").strip(),
+            hidden=hidden)
         # A reach-out was written → start the shared cool-down so synthesis / check-in
         # don't pile a second unprompted message on top of it in the same window.
-        reachout_gate.mark_reachout()
+        reachout_gate.mark_reachout(user if person else None)
         # The ask was raised (proactively, unprompted) → mark it surfaced so the
         # resolve-and-distill loop can later evict it, its surface-count advances (user
         # asks retire past the ceiling; meta is exempt), and selection rotates onward.
@@ -1048,12 +1190,120 @@ def run_outreach_decision_blocking(
         except Exception:
             traceback.print_exc()
         return {"composed": True, "session": filename, "ask_kind": ask_kind,
-                "decision": True, "opener": opener, "question": ask_content}
+                "decision": True, "opener": opener, "question": ask_content,
+                "user": user}
     except Exception as e:
         traceback.print_exc()
         return {"error": f"{type(e).__name__}: {e}"}
     finally:
+        if owner:
+            _outreach_active = False
+
+
+def run_outreach_sweep_blocking(
+    on_question: Optional[Callable[[dict], None]] = None,
+    max_users: Optional[int] = None,
+) -> dict:
+    """One outreach wake: a separate decision for each person she talks to.
+
+    What the idle job and the deliberation executive run, in check-in's per-person shape
+    (`checkin.run_checkin_sweep_blocking`): it walks `checkin.known_users` most recently
+    active first and runs :func:`run_outreach_decision_blocking` per person — their own
+    questions plus the ones that belong to nobody, addressed to them, held by their own
+    reach-out gate. Until 2026-09-27 one decision raised the top question of the whole pool
+    with whoever had spoken last; with several users, a question formed in one person's
+    conversation could open a session with another and carry the first conversation in as
+    its ASK ORIGIN. A person silent past ``outreach.max_silence_days`` is skipped, and at
+    most ``outreach.max_users`` decisions generate per wake (cheap bails spend no slot). A
+    corpus that names nobody falls back to the single unscoped pass.
+
+    The result mirrors check-in's sweep: ``results`` per person, ``sent`` the ones that
+    wrote a session with the first lifted to the top level, ``resolved`` / ``duplicate``
+    lifted as flags (each ran a full decision), and a top-level ``skipped`` for a wake that
+    did none of those — so the scheduler's ``consumed`` predicate reads it as before."""
+    global _outreach_active
+    _outreach_active = True
+    try:
+        if _runtime.model is None:
+            return {"sweep": True, "skipped": "no_model"}
+
+        from core import checkin
+        people = checkin.known_users()
+        if not people:
+            # Nothing attributed to scope by — one unscoped pass, as before.
+            result = run_outreach_decision_blocking(on_question=on_question)
+            result.setdefault("sweep", True)
+            result["users"] = 0
+            return result
+
+        try:
+            cap = max(1, int(max_users if max_users is not None
+                             else _cfg("max_users", _MAX_USERS_DEFAULT)))
+        except Exception:
+            cap = _MAX_USERS_DEFAULT
+        try:
+            dormant_s = max(0.0, float(_cfg("max_silence_days",
+                                            _MAX_SILENCE_DAYS_DEFAULT))) * 86400.0
+        except Exception:
+            dormant_s = _MAX_SILENCE_DAYS_DEFAULT * 86400.0
+
+        results: list[dict] = []
+        sent: list[dict] = []
+        ran = 0
+        now = time.time()
+        for person in people:
+            name = person["display"]
+            if dormant_s and now - float(person.get("last_turn_ts") or 0.0) > dormant_s:
+                results.append({"user": name, "skipped": "dormant"})
+                continue
+            if ran >= cap:
+                results.append({"user": name, "skipped": "deferred"})
+                continue
+            try:
+                r = run_outreach_decision_blocking(user=name, on_question=on_question)
+            except Exception as e:
+                traceback.print_exc()
+                r = {"error": f"{type(e).__name__}: {e}"}
+            r.setdefault("user", name)
+            results.append(r)
+            if str(r.get("skipped") or "") not in _CHEAP_SKIPS:
+                ran += 1
+            if r.get("composed"):
+                sent.append({"user": r.get("user"), "session": r.get("session"),
+                             "opener": r.get("opener"), "question": r.get("question"),
+                             "ask_kind": r.get("ask_kind")})
+
+        out: dict = {"sweep": True, "users": len(people), "ran": ran,
+                     "composed": len(sent), "sent": sent, "results": results}
+        for flag in ("resolved", "duplicate"):
+            if any(r.get(flag) for r in results):
+                out[flag] = True
+        if sent:
+            # Lift the first send so the generic `describe`/client paths read one outreach.
+            out.update({k: v for k, v in sent[0].items() if v is not None})
+        elif not (out.get("resolved") or out.get("duplicate")):
+            out["skipped"] = _sweep_skip_reason(results)
+        return out
+    except Exception as e:
+        traceback.print_exc()
+        return {"sweep": True, "error": f"{type(e).__name__}: {e}"}
+    finally:
         _outreach_active = False
+
+
+def _sweep_skip_reason(results: list[dict]) -> str:
+    """One reason standing for a sweep that wrote nothing — check-in's rule: a reason that
+    cost a generation (declined / truncated / a gate hold) over the cheap disk-read ones,
+    since the scheduler's ``consumed`` predicate turns exactly that into "sleep the
+    interval" vs "retry next poll"."""
+    if any(r.get("error") for r in results):
+        return "error"
+    expensive = [str(r.get("skipped") or "") for r in results
+                 if r.get("skipped") and str(r.get("skipped")) not in _CHEAP_SKIPS]
+    if expensive:
+        return "declined" if "declined" in expensive else expensive[0]
+    reasons = [str(r.get("skipped") or "") for r in results if r.get("skipped")]
+    return reasons[0] if reasons else "nothing_to_do"
 
 
 # ── manual (Sleep-tab) trigger ─────────────────────────────────────────────────
@@ -1074,7 +1324,12 @@ async def handle_outreach_now(ws, msg: dict) -> None:
     Debug segment shape — this is the reach-out job that actually retrieves, so its RAG
     segment is the injected memory block) and ``outreach_chunk`` reasoning deltas, and finishes with ``outreach_done`` carrying the
     outcome (``composed``/``resolved``/``duplicate``/``decision``/``session``/``opener``/
-    ``answer`` or a ``skipped`` reason)."""
+    ``answer`` or a ``skipped`` reason).
+
+    ``user`` names whose decision it is — the Sleep tab sends whoever the Chat tab says is
+    at the keyboard, and it defaults to the active session's speaker. The idle job decides
+    per person (:func:`run_outreach_sweep_blocking`); the button runs ONE of those
+    decisions, as check-in's does. With nobody named at all it is the unscoped pass."""
     loop = asyncio.get_event_loop()
     if _outreach_active or (_host_busy is not None and _host_busy()):
         await _send(ws, {"type": "outreach_done", "skipped": "busy",
@@ -1098,12 +1353,13 @@ async def handle_outreach_now(ws, msg: dict) -> None:
         asyncio.run_coroutine_threadsafe(
             _send(ws, {"type": "outreach_prompt", "pass": label, **info}), loop)
 
+    target = str(msg.get("user") or "").strip() or (_session.user or "").strip()
     try:
         result = await loop.run_in_executor(
             _executor,
             lambda: run_outreach_decision_blocking(
                 on_chunk=_on_chunk, on_question=_on_question, on_prompt=_on_prompt,
-                bypass_cooldown=True),
+                bypass_cooldown=True, user=target or None),
         )
     except Exception as e:
         traceback.print_exc()
@@ -1118,3 +1374,143 @@ async def handle_outreach_now(ws, msg: dict) -> None:
     payload = {"type": "outreach_done"}
     payload.update(result)
     await _send(ws, payload)
+
+
+# ── GPU-free self-test: python -m core.outreach ─────────────────────────────────── #
+
+def _selftest() -> None:
+    import tempfile
+    from datetime import datetime
+    from core import checkin
+
+    global _CHATS_DIR, _MEMORY_DIR, _load_server_config, _outreach_active
+    saved = (_CHATS_DIR, _MEMORY_DIR, _load_server_config, _runtime.model,
+             checkin.known_users, globals()["run_outreach_decision_blocking"])
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _CHATS_DIR, _MEMORY_DIR = Path(td) / "chats", Path(td) / "memory"
+            _CHATS_DIR.mkdir()
+            _MEMORY_DIR.mkdir()
+            _load_server_config = None
+            _chat_person_cache.clear()
+
+            def chat(name: str, user: str, **extra) -> None:
+                doc = {"user": user, "exchanges": [{"speaker": user, "user_prompt": "hi"}]}
+                (_CHATS_DIR / name).write_text(json.dumps({**doc, **extra}),
+                                               encoding="utf-8")
+
+            chat("20260901_100000.json", "Dana")
+            chat("20260902_100000.json", "Sam Roe")
+            chat("20260903_100000.json", "PeerBot", interlocutor="ai")
+
+            # -- whose question -------------------------------------------------- #
+            assert _chat_person("20260901_100000.json") == "dana"
+            assert _chat_person("20260902_100000.json") == "sam"      # first-token key
+            assert _chat_person("20260903_100000.json") == ""         # a model: nobody
+            assert _chat_person("wander/article-1") == ""             # reading: nobody
+            assert _chat_person("til:2026-09-01") == ""
+            assert _chat_person("20990101_000000.json") == ""         # gone: nobody
+            assert addressee_for("20260902_100000.json") == "Sam Roe"  # the chat's spelling
+            assert addressee_for("20260903_100000.json") == ""         # a model: nobody
+            assert addressee_for("wander/article-1") == ""
+            # An archived chat keeps its person (hot first, then the archive).
+            from training import reflections_path
+            real_archive = reflections_path.archive_chats_dir
+            archive = Path(td) / "archive"
+            archive.mkdir()
+            (archive / "20260801_090000.json").write_text(
+                json.dumps({"user": "Boris", "exchanges": []}), encoding="utf-8")
+            reflections_path.archive_chats_dir = lambda: archive
+            try:
+                assert _chat_person("20260801_090000.json") == "boris"
+                assert addressee_for("20260801_090000.json") == "Boris"
+            finally:
+                reflections_path.archive_chats_dir = real_archive
+
+            # -- the pool, per person ---------------------------------------------- #
+            now = datetime.now().isoformat()
+
+            def ask(key, kind, src):
+                return {"op": "insert", "kind": "ask", "key": key, "ask_kind": kind,
+                        "content": f"question {key}", "source_session": src, "ts": now}
+
+            recs = [ask("kSam", "meta", "20260902_100000.json"),     # meta sorts first
+                    ask("kDana", "user", "20260901_100000.json"),
+                    ask("kRead", "user", "wander/article-1"),
+                    ask("kPeer", "user", "20260903_100000.json")]
+            mem = _MEMORY_DIR / "rag_memory.jsonl"
+            mem.write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+
+            assert _pick_ask(None)[0]["key"] == "kSam"                 # unscoped: whole pool
+            assert _pick_ask("sam")[0]["key"] == "kSam"
+            dana = _pick_ask("dana")[0]["key"]
+            assert dana in ("kDana", "kRead", "kPeer"), dana           # never Sam's question
+            assert _pick_ask("zed")[0]["key"] in ("kRead", "kPeer")    # only nobody's
+
+            # -- "questions you have already put to them" is theirs only ------------ #
+            chat("20260904_100000.json", "Dana")
+            chat("20260905_100000.json", "Sam")
+            with open(mem, "a", encoding="utf-8") as fh:
+                for key, where in (("kDana", "20260904_100000.json"),
+                                   ("kSam", "20260905_100000.json")):
+                    fh.write(json.dumps({"op": "surface", "key": key, "ts": now,
+                                         "surfaced_in": where}) + "\n")
+            block = _standing_questions_block("Dana", person="dana")
+            assert "question kDana" in block and "question kSam" not in block, block
+            both = _standing_questions_block("you")
+            assert "question kDana" in both and "question kSam" in both   # unscoped
+
+            # -- a decision inside a sweep leaves the sweep's flag alone ------------ #
+            _runtime.model = None
+            _outreach_active = True
+            assert run_outreach_decision_blocking(user="Dana") == {"skipped": "no_model"}
+            assert _outreach_active is True
+            _outreach_active = False
+
+            # -- the sweep ------------------------------------------------------------ #
+            _runtime.model = object()
+            calls: list = []
+
+            def stub(user=None, on_question=None, **_kw):
+                calls.append(user)
+                if user == "Dana":
+                    return {"composed": True, "session": "s.json", "opener": "hello",
+                            "question": "q", "ask_kind": "user", "user": "Dana"}
+                return {"skipped": "no_candidates"}
+
+            globals()["run_outreach_decision_blocking"] = stub
+            t = time.time()
+            checkin.known_users = lambda: [
+                {"key": "old", "display": "Old", "last_turn_ts": t - 100 * 86400},
+                {"key": "dana", "display": "Dana", "last_turn_ts": t},
+                {"key": "sam", "display": "Sam", "last_turn_ts": t},
+                {"key": "zed", "display": "Zed", "last_turn_ts": t}]
+            out = run_outreach_sweep_blocking(max_users=1)
+            assert calls == ["Dana"], calls          # Old dormant; Dana spent the one slot
+            assert out["composed"] == 1 and out["user"] == "Dana" and out["opener"] == "hello"
+            assert [r.get("skipped") for r in out["results"]] == [
+                "dormant", None, "deferred", "deferred"], out["results"]
+            assert _outreach_active is False
+
+            calls.clear()
+            out = run_outreach_sweep_blocking(max_users=5)
+            assert calls == ["Dana", "Sam", "Zed"] and out["ran"] == 1   # cheap bails free
+
+            checkin.known_users = lambda: []         # nothing attributed: one unscoped pass
+            calls.clear()
+            out = run_outreach_sweep_blocking()
+            assert calls == [None] and out["users"] == 0 and out["sweep"]
+    finally:
+        (_CHATS_DIR, _MEMORY_DIR, _load_server_config, _runtime.model,
+         checkin.known_users, globals()["run_outreach_decision_blocking"]) = saved
+        _chat_person_cache.clear()
+    print("outreach selftest OK")
+
+
+if __name__ == "__main__":
+    import sys
+    # The sibling `training` package, as the other GPU-free self-tests do.
+    _server = Path(__file__).resolve().parent.parent.parent
+    if str(_server) not in sys.path:
+        sys.path.insert(0, str(_server))
+    _selftest()

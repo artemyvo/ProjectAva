@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from core.field_parse import section as _section
+from core.reasoning_text import truncated_before_answer
 from core.reflection_digest import (       # the fold primitives this reuses verbatim
     _RECENCY_BANDS,
     _age_days,
@@ -81,7 +82,9 @@ from core.user_digest import (             # and the portrait primitives, likewi
     SELF_SLUG,
     _evidence_summary,
     build_portrait_prompt_input,
+    clip_skip_raw,
     raw_fingerprint,
+    select_portrait_evidence,
 )
 
 # The op-log kind. Its own kind rather than an attributed `[impression]`: see the module
@@ -112,9 +115,6 @@ _FACET_KEYS = ("seems", "returns_to", "ways", "how_i_land", "unsure")
 # floor, for the same reason: below it the fold is a handful of first readings and
 # synthesizing "how I come across" from three lines produces confident nonsense.
 MIN_EVIDENCE_ITEMS = 4
-
-# Clipped raw carried on an unparseable synthesis (see user_digest._SKIP_RAW_CLIP).
-_SKIP_RAW_CLIP = 1500
 
 # Same budget as the user portrait, for the same reason: thinking is on, the <think>
 # block scales with the accumulated evidence rather than with the answer, and a cut that
@@ -242,7 +242,8 @@ def should_regenerate(users_dir: Path, items: list[dict]) -> bool:
 
 
 def write_portrait(users_dir: Path, portrait: dict, *, raw_text: str, run_id: str,
-                   evidence: list[dict], raw_fp: Optional[str] = None) -> Path:
+                   evidence: list[dict], raw_fp: Optional[str] = None,
+                   shown: Optional[int] = None) -> Path:
     """Atomically write the outside-view portrait file."""
     from training.reflections_path import atomic_write_text
 
@@ -260,7 +261,7 @@ def write_portrait(users_dir: Path, portrait: dict, *, raw_text: str, run_id: st
         "ways": portrait.get("ways", []),
         "how_i_land": portrait.get("how_i_land", []),
         "unsure": portrait.get("unsure", []),
-        "evidence": _evidence_summary(evidence, raw_fp),
+        "evidence": _evidence_summary(evidence, raw_fp, shown=shown),
         "raw": raw_text or "",
     }
     atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
@@ -387,15 +388,19 @@ def synthesize_portrait(
     still her reading, in her voice, and the clean base's job was the evaluation that fed
     it. RAG is disabled and the pass unfenced — the clustered evidence in the prompt is the
     whole input, and retrieval would only reintroduce the situational fragments a standing
-    reading exists to replace.
+    reading exists to replace. Like the user portrait, the prompt carries only the ranked
+    head of *evidence* that fits ``user_digest.PORTRAIT_EVIDENCE_CHARS`` (this pass has
+    OOMed at prefill too), and the summary reports ``shown`` / ``omitted``.
 
     Returns a status summary; never raises.
     """
     if not evidence:
         return {"status": "skipped", "reason": "no evidence"}
+    shown, omitted = select_portrait_evidence(evidence)
+    sizes = {"shown": len(shown), "omitted": omitted}
     try:
         sys_prompt = prompt if prompt is not None else load_portrait_prompt()
-        body = build_portrait_prompt_input(SELF_DISPLAY, evidence)
+        body = build_portrait_prompt_input(SELF_DISPLAY, shown, omitted=omitted)
         raw = generate_fn(
             body, sys_prompt,
             temperature=temperature, top_p=top_p,
@@ -403,29 +408,33 @@ def synthesize_portrait(
             before_session="", disable_rag=True,
         )
     except Exception as e:
-        return {"status": "failed", "reason": f"{type(e).__name__}: {e}"}
+        return {"status": "failed", "reason": f"{type(e).__name__}: {e}", **sizes}
 
     portrait = parse_self_portrait(raw or "")
-    if not any(portrait.get(k) for k in _FACET_KEYS):
+    # Cut before its thought closed ⇒ no answer region, whatever parsed (see the same
+    # guard in `user_digest.synthesize_portrait`).
+    cut = truncated_before_answer(raw or "", getattr(generate_fn, "last_truncated", None))
+    if cut or not any(portrait.get(k) for k in _FACET_KEYS):
         # Carry the raw for WHY nothing parsed — one reason string cannot distinguish a
         # generation cut inside its <think> (stripped to nothing above) from a model that
-        # ignored the section labels. Clipped: it rides a run event into the store and the
-        # activity journal.
+        # ignored the section labels. Clipped around the answer (`clip_skip_raw`): it
+        # rides a run event into the store and the activity journal.
         raw_text = raw or ""
         return {"status": "skipped", "reason": "unparseable or empty",
                 "truncated": getattr(generate_fn, "last_truncated", None),
-                "raw_chars": len(raw_text), "raw": raw_text[:_SKIP_RAW_CLIP]}
+                "raw_chars": len(raw_text), "raw": clip_skip_raw(raw_text), **sizes}
 
     try:
         path = write_portrait(users_dir, portrait, raw_text=raw or "", run_id=run_id,
-                              evidence=evidence, raw_fp=raw_fp)
+                              evidence=evidence, raw_fp=raw_fp, shown=len(shown))
     except Exception as e:
-        return {"status": "failed", "reason": f"write error: {e}"}
+        return {"status": "failed", "reason": f"write error: {e}", **sizes}
 
     return {
         "status": "written",
         "path": str(path),
         "themes": len(evidence),
+        **sizes,
         "counts": {k: (1 if isinstance(portrait.get(k), str) and portrait.get(k)
                        else len(portrait.get(k) or []))
                    for k in _FACET_KEYS},
@@ -525,6 +534,39 @@ def _selftest() -> None:
         assert not should_regenerate(users, items)
         assert plan_portrait(mem, users_dir=users) is None
         assert plan_portrait(mem, users_dir=users, force=True) is not None
+
+        # -- synthesis: the prompt carries only the ranked head that fits -------- #
+        prompts_seen: list[str] = []
+
+        def _stub(body, _sys, **_kw):
+            prompts_seen.append(body)
+            return raw
+
+        many = [{"content": f"observation {i:03d} " + "z" * 200, "recurrences": 2}
+                for i in range(300)]
+        res = synthesize_portrait(many, generate_fn=_stub, users_dir=users,
+                                  run_id="r2", raw_fp=fp, prompt="p")
+        assert res["status"] == "written" and res["omitted"] > 0, res
+        assert res["shown"] + res["omitted"] == len(many)
+        assert "further observations" in prompts_seen[0]
+        assert latest_portrait(users)["evidence"]["shown"] == res["shown"]
+
+        # A skip's raw is clipped around where the generation stopped, not its head.
+        res = synthesize_portrait(many[:5], generate_fn=lambda *a, **k: (
+            "<think>" + "same line again\n" * 300), users_dir=users, run_id="r3",
+            prompt="p")
+        assert res["status"] == "skipped" and res["shown"] == 5 and res["omitted"] == 0
+        assert res["raw_chars"] > len(res["raw"]) and res["raw"].rstrip().endswith("again")
+
+        # Cut before its thought closed: gemma-4 returns that thought untagged, so the
+        # labels it rehearsed would parse — the truncation flag is what refuses it.
+        def _cut(*_a, **_k):
+            return raw.split("</think>", 1)[1]
+        _cut.last_truncated = True
+        res = synthesize_portrait(many[:5], generate_fn=_cut, users_dir=users,
+                                  run_id="r4", prompt="p")
+        assert res["status"] == "skipped", res
+        assert latest_portrait(users)["run_id"] == "r2"
 
     print("self_portrait selftest OK")
 

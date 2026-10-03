@@ -64,7 +64,7 @@ def index_events(events: list) -> tuple:
             verdicts[_key(e)].append(e)
         elif kind == "annotation":
             annotations[_key(e)].append(e)
-        elif kind in ("lock", "ban"):
+        elif kind in ("lock", "ban", "holdout"):
             flags[_key(e)].append(e)
     return verdicts, annotations, flags
 

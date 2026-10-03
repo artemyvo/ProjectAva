@@ -10,6 +10,11 @@ import threading
 import time
 from typing import Any, Callable, Generator, Optional, Tuple
 
+try:
+    from core import load_lock
+except ImportError:  # pragma: no cover — run as a script from core/
+    import load_lock  # type: ignore
+
 # Stop unsloth from wrapping its generated model forwards (e.g.
 # unsloth_compiled_cache/unsloth_compiled_module_gemma4.py) in torch.compile. Those
 # @torch.compile decorators SNAPSHOT the TorchDynamo config at decoration time — which
@@ -407,6 +412,25 @@ class UnslothBackend(InferenceBackend):
         load_in_4bit: Optional[bool] = None,
         load_in_8bit: Optional[bool] = None,
     ) -> Tuple[Any, Any]:
+        """Load *model_id* (+ *adapter_id*) under the process-wide load lock
+        (``core/load_lock.py``): transformers' ``from_pretrained`` patches class-level
+        functions while it runs, and an embedder loading in another thread at the same
+        moment can leave ``tie_weights`` stubbed for the life of the process — gemma-4's
+        ``lm_head`` then never ties to its embedding and every load is refused. A stub a
+        load outside the lock left is put back first."""
+        with load_lock.LOCK:
+            load_lock.heal(lambda m: print(m, flush=True))
+            return self._load_locked(model_id, context_length, adapter_id,
+                                     load_in_4bit=load_in_4bit, load_in_8bit=load_in_8bit)
+
+    def _load_locked(
+        self,
+        model_id: str,
+        context_length: int,
+        adapter_id: Optional[str] = None,
+        load_in_4bit: Optional[bool] = None,
+        load_in_8bit: Optional[bool] = None,
+    ) -> Tuple[Any, Any]:
         import os
         os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
         # Belt-and-suspenders: the module-scope setdefault already covers a fresh process,
@@ -590,6 +614,19 @@ class UnslothBackend(InferenceBackend):
 
         detail = ", ".join(bad[:8]) + (f" (+{len(bad) - 8} more)" if len(bad) > 8 else "")
         msg = f"model loaded with offloaded / unmaterialized weights: {detail}"
+        # A tied lm_head left on meta is not a placement problem: its weight is the
+        # embedding's, and it is empty because tying never ran — a load in another thread
+        # left transformers' tie_weights stubbed (core/load_lock.py). Say so rather than
+        # blaming free VRAM.
+        stubs = load_lock.stubbed()
+        if stubs or any("lm_head" in b and b.endswith("meta") for b in bad):
+            raise RuntimeError(
+                f"{msg}. An lm_head on the meta device is weight tying that did not run"
+                + (f" — {', '.join(stubs)} is stubbed right now" if stubs else "")
+                + ": a from_pretrained in another thread overlapping this one leaves "
+                  "transformers' tie_weights stubbed for the life of the process "
+                  "(core/load_lock.py). Restart the process."
+            )
         if os.environ.get("AVA_ALLOW_OFFLOAD"):
             print(f"[backend] WARNING: {msg} — AVA_ALLOW_OFFLOAD is set, continuing. "
                   f"Generation will likely fail with 'Cannot copy out of meta tensor'.",
@@ -1432,7 +1469,7 @@ class UnslothBackend(InferenceBackend):
 
                 lm_hook = lm_head.register_forward_hook(_lm_hook)
 
-            # Hidden-state capture (optional; live chat only): a forward hook on each
+            # Hidden-state capture (optional; live chat and a drive's opener pass): a forward hook on each
             # decoder layer in the spec keeps that step's last-position residual on
             # device — a clone, since fused kernels may reuse the layer's output buffer.
             # Reduced to a few stored positions + per-token axis projections after the
@@ -1678,12 +1715,17 @@ class UnslothBackend(InferenceBackend):
             def _decode(ids):
                 return text_tok.decode(list(ids))
 
-            return hidden_capture.reduce_capture(
+            cap = hidden_capture.reduce_capture(
                 gen_ids, rows, _decode,
                 store_layers=spec.get("store_layers") or [],
                 axes=spec.get("axes") or [],
                 max_positions=int(spec.get("max_positions") or hidden_capture.DEFAULT_MAX_POSITIONS),
             )
+            if cap is not None:
+                # The ids the rows sit on. A chat turn has them in its tension block; a
+                # drive pass (`hidden_capture.write_opener_capture`) has nowhere else.
+                cap["token_ids"] = [int(t) for t in gen_ids]
+            return cap
         except Exception as e:
             print(f"[hidden] capture reduce failed: {e}")
             return None

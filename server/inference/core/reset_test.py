@@ -742,11 +742,11 @@ def make_gate_check(*, records: Iterable[dict], key: Optional[str],
 
 def gate_candidates(memory_dirs: list, verdict_records: list, judge_key: Optional[str],
                     reset_records: list, key: Optional[str]) -> list:
-    """The pending items (closures that wait for the test) over *memory_dirs* — the live
-    op-log first, a run's staging one after it."""
+    """The pending items (closures that wait for the test, the distill gate's retro
+    requeues included) over *memory_dirs* — the live op-log first, a run's staging one
+    after it."""
     rag, weights = dg.read_oplogs(memory_dirs)
-    closures = aj.collect_closures(rag)
-    aj.mark_distilled(closures, aj.distilled_index(weights))
+    closures = dg.gate_closures(rag, weights)
     verdicts = dg.latest_verdicts(verdict_records, judge_key) if judge_key else {}
     items = plan_items(closures, rag, verdicts, index_store(reset_records), key)
     return [it for it in items if it["group"] == "pending"]
@@ -817,7 +817,7 @@ def apply_retro(items: Iterable[dict], *, writer, ledger, run_id: str,
         fields = decision_payload(it)
         if it["state"] in ("failed", "untestable"):
             reason = f"reset test ({run_id}): {state_reason(it)}"
-            dg.supersede(c, writer=writer, ledger=ledger, reason=reason)
+            dg.supersede(c, writer=writer, ledger=ledger, reason=reason, run_id=run_id)
             action = "superseded"
         else:
             action = "confirmed"
@@ -843,10 +843,12 @@ CONTROL_STORE_FILENAME = "reset_controls.jsonl"
 # weights: adapter = the model loaded now; base = inside the clean base (adapter off).
 # prompt: live = the session's standing prompt; original = chat_prompt.txt, the one a
 # prompt experiment replaced. persona: portrait = as live; empty = P8's persona-empty
-# control (the undecided framing, no [persona] records in RAG).
+# control (the undecided framing, no [persona] records in RAG). adapter_orig_empty is
+# base_orig_empty with the adapter on: the two differ in the weights alone.
 CONDITIONS = {
     "as_is": {"weights": "adapter", "prompt": "live", "persona": "portrait"},
     "adapter_orig": {"weights": "adapter", "prompt": "original", "persona": "portrait"},
+    "adapter_orig_empty": {"weights": "adapter", "prompt": "original", "persona": "empty"},
     "base_live": {"weights": "base", "prompt": "live", "persona": "portrait"},
     "base_orig_empty": {"weights": "base", "prompt": "original", "persona": "empty"},
 }

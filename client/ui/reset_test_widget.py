@@ -366,7 +366,9 @@ class ResetTestWidget(QWidget):
         line(f"{it.get('group')}  ·  {it.get('path')}/{it.get('ask_kind')}  ·  closed "
              f"{str(it.get('closed_ts') or '')[:19]}  ·  chat {it.get('answered_in') or '?'}"
              + (f"  ·  answered by {it.get('who')}" if it.get("who") else "")
-             + (f"  ·  distilled → [{it.get('distilled')}]" if it.get("distilled") else ""), muted)
+             + (f"  ·  requeued by the distill gate's retro (was [{it.get('requeued')}])"
+                if it.get("requeued") else
+                f"  ·  distilled → [{it.get('distilled')}]" if it.get("distilled") else ""), muted)
         line()
         line("QUESTION", muted)
         line(str(it.get("question") or ""))

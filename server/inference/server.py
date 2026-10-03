@@ -82,8 +82,9 @@ Client → server messages:
                          rationed by the wander token budget, auto-applied.
   til_apply              {text, date?} — persist the modifiers from a Learn dry-run pass into Ava's
                          live memory (RAG/weights/ledger) + refresh RAG; replies til_applied {counts}.
-  outreach_now           {} — manually run one Ava-initiated outreach decision (Sleep-tab debug button).
-                         Same pass the idle-wake heartbeat runs, with reasoning streamed back: emits
+  outreach_now           {user?} — manually run one Ava-initiated outreach decision (Sleep-tab debug
+                         button) for one person (default: the active session's speaker). Same
+                         per-person pass the idle-wake sweep runs, with reasoning streamed back: emits
                          outreach_question (the ask she's weighing) then outreach_chunk reasoning deltas,
                          terminating with outreach_done {composed/decision/session/opener | skipped}.
   persona_preview        {} — non-mutating Sleep-tab prompt self-review. Shows Ava her current
@@ -284,6 +285,8 @@ from core import resolution_repair
 from core import distill_gate
 from core import reset_test
 from core import reset_test_service
+from core import capture_judge
+from core import capture_judge_service
 from core import mgmt_http
 from core import api_http
 from core import idle_scheduler
@@ -1851,7 +1854,12 @@ async def handle_regen_persona(ws, msg) -> None:
         def _streaming_generate(content, system_prompt, **kw):
             kw.setdefault("on_chunk",
                           lambda d: _emit({"type": "regen_persona_chunk", "text": d}))
-            return inner_generate(content, system_prompt, **kw)
+            out = inner_generate(content, system_prompt, **kw)
+            # `synthesize_digest` refuses a draft cut before its thought closed, which it
+            # reads off the generate callable — forward the flag through this wrapper.
+            _streaming_generate.last_truncated = getattr(inner_generate, "last_truncated",
+                                                         None)
+            return out
 
         summary = reflection_digest.synthesize_digest(
             evidence, generate_fn=_streaming_generate, persona_dir=persona_dir(),
@@ -2045,6 +2053,15 @@ def _short(text: str, n: int = 90) -> str:
 
 
 def _describe_outreach(r: dict) -> str:
+    """One journal line for an outreach wake. The wake decides per person
+    (`outreach.run_outreach_sweep_blocking`); like check-in's, the sweep lifts its first
+    send to the top level and the rest are counted here."""
+    if r.get("composed"):
+        who = str(r.get("user") or "").strip()
+        others = max(0, int(r.get("composed") or 1) - 1) if r.get("sweep") else 0
+        more = f" (+{others} other{'s' if others > 1 else ''})" if others else ""
+        return (f"Outreach: reached out{' to ' + who if who else ''}{more} — "
+                f"{_short(r.get('opener', ''))}")
     if r.get("resolved"):
         return "Outreach: resolved an open question she'd already learned the answer to"
     if r.get("duplicate"):
@@ -2276,6 +2293,17 @@ _HANDLERS_WS_MSG = {                # handler(ws, msg)
     "reset_test_status": reset_test_service.handle_reset_test_status,
     "reset_test_stop": reset_test_service.handle_reset_test_stop,
     "reset_test_apply": reset_test_service.handle_reset_test_apply,
+    "capture_judge_report": capture_judge_service.handle_capture_judge_report,
+    "capture_judge_run": capture_judge_service.handle_capture_judge_run,
+    "capture_judge_status": capture_judge_service.handle_capture_judge_status,
+    "capture_judge_stop": capture_judge_service.handle_capture_judge_stop,
+    "capture_persona_plan": capture_judge_service.handle_capture_persona_plan,
+    "capture_persona_apply": capture_judge_service.handle_capture_persona_apply,
+    "capture_repair_report": capture_judge_service.handle_capture_repair_report,
+    "capture_repair_run": capture_judge_service.handle_capture_repair_run,
+    "capture_bench_report": capture_judge_service.handle_capture_bench_report,
+    "capture_bench_run": capture_judge_service.handle_capture_bench_run,
+    "capture_bench_holdout": capture_judge_service.handle_capture_bench_holdout,
     "match_anchors": session_ops.handle_match_anchors,
     "load_session": session_ops.handle_load_session,
     "delete_session": session_ops.handle_delete_session,
@@ -2553,6 +2581,34 @@ def main() -> None:
                           temperature=_reset_cfg.get("temperature", 1.0))
     print(f"reset test: {'on' if reset_test.enabled() else 'off'} "
           f"({reset_test.policy()['sleep_max']} conversation(s) per Sleep run)", flush=True)
+    # The capture gate (core/capture_judge.py, P3): the frozen base grades each training target
+    # it has not graded, in a Sleep run's clean-base batch, and keeps a reply that gave in to
+    # pushback with no reason beyond it out of the build. `capture_gate.*`.
+    _capture_cfg = config.get("capture_gate") or {}
+    capture_judge.set_policy(enabled=bool(_capture_cfg.get("enabled", True)),
+                             sleep_max=_capture_cfg.get("sleep_max", 200))
+    print(f"capture gate: {'on' if capture_judge.enabled() else 'off'} "
+          f"(≤{capture_judge.policy()['sleep_max']} exchange(s) graded per Sleep run)", flush=True)
+    # The capture probe's shadow reading (core/capture_probe.py, §4.5): after the capture
+    # gate, the base's state before each newly graded pushback reply and every frozen
+    # probe's score, logged beside the verdict. `capture_probe.*`.
+    from core import capture_probe as _capture_probe
+    _probe_cfg = config.get("capture_probe") or {}
+    _capture_probe.set_policy(shadow=bool(_probe_cfg.get("shadow", True)),
+                              sleep_max=_probe_cfg.get("sleep_max", 200))
+    print(f"capture probe shadow: {'on' if _capture_probe.shadow_enabled() else 'off'} "
+          f"(≤{_capture_probe.policy()['sleep_max']} replies read per Sleep run, "
+          f"{len(_capture_probe.load_probes(_capture_probe.probe_dir(_CHATS_DIR)))} frozen probe(s))", flush=True)
+    # The child ask (core/child_ask.py, §3.4): an accepted meta closure that rejected the
+    # question's terms gets the question it leaves open, written by Ava. `child_ask.*`.
+    from core import child_ask as _child_ask
+    _child_cfg = config.get("child_ask") or {}
+    _child_ask.set_policy(enabled=bool(_child_cfg.get("enabled", True)),
+                          sleep_max=_child_cfg.get("sleep_max", 5),
+                          max_depth=_child_cfg.get("max_depth", 3))
+    print(f"child ask: {'on' if _child_ask.enabled() else 'off'} "
+          f"(≤{_child_ask.policy()['sleep_max']} closure(s) per Sleep run, depth ≤"
+          f"{_child_ask.policy()['max_depth']})", flush=True)
 
     _session.system_prompt = _load_system_prompt()
     _session.surface_template = _load_surface_template()
@@ -2622,6 +2678,23 @@ def main() -> None:
         get_reflection_writer=_get_reflection_writer, memory_dir=_MEMORY_DIR,
         consolidation_dir=_CONSOLIDATION_DIR, chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
         load_base_prompt=_load_base_chat_prompt,
+    )
+    # ...and the capture judge's on-demand run over the whole corpus (the Sleep run grades
+    # the new targets itself, core.reflection_service): one clean base, polled, stoppable.
+    capture_judge_service.configure(
+        send=_send, executor=_executor, backend=_backend, runtime=_runtime,
+        with_clean_base=_with_clean_base, host_busy=_host_busy, mark_activity=_mark_activity,
+        chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR, memory_dir=_MEMORY_DIR,
+        consolidation_dir=_CONSOLIDATION_DIR, get_reflection_writer=_get_reflection_writer,
+        get_rag=_get_rag,
+        # The capture repair's actor: the clean IDEAL seam's generate and persona block,
+        # built when a repair run starts (the model loaded then, the RAG as it is then).
+        make_reflect_generate=lambda: generation._make_sync_reflect_generate(_get_rag()),
+        make_persona_context=lambda: reflection_service._make_persona_context_fn(_get_rag()),
+        # The capture bench's persona-empty condition (P8): the original standing prompt and
+        # the persona slot's undecided framing, as the capture control's `*_orig_empty`.
+        persona_empty_system=lambda: "\n\n".join(
+            t for t in (_load_base_chat_prompt(), generation._load_persona_undecided()) if (t or "").strip()),
     )
     # Wire the TIL/wander subsystem with the server capabilities it needs (it never
     # imports server). See core.til_wander.configure.
@@ -2694,10 +2767,12 @@ def main() -> None:
         load_config=_load_server_config,
         # The aha job's seams: open asks → needs, the writer's surface stamp, the reflect
         # seam for the judge + opener, and outreach's own session writer + addressee so an
-        # aha reach-out is written exactly as an outreach one.
+        # aha reach-out is written exactly as an outreach one — to the person whose question
+        # (aha) or conversation (pivot) it came from, the last active user only for nobody's.
         memory_dir=_MEMORY_DIR, get_reflection_writer=_get_reflection_writer,
         get_rag=_get_rag, make_sync_reflect_generate=generation._make_sync_reflect_generate,
         write_session=outreach._write_outreach_session, target_user=outreach._target_user,
+        addressee_for=outreach.addressee_for,
         model_loaded=lambda: _runtime.model is not None,
         # The adapter's name, recorded on every witness protocol so a refused document is
         # re-witnessed once per new adapter (assoc_bridge.witness_model_id).
@@ -2710,6 +2785,10 @@ def main() -> None:
         # The `til` input source (articles + news digests). Same tree the three
         # `server/til/fetch_*.py` scripts write into and `til_wander` derives.
         til_snippets_dir=_SERVER_DIR.parent / "data" / "til" / "snippets",
+        # The `ask` input source (her open questions, `ask_attempt`): the live memory.
+        memory_dir=_MEMORY_DIR,
+        # `run_module {weights: "base"}`: the same pass on the bare base (CleanBaseSession).
+        with_clean_base=_with_clean_base,
         send=_send, executor=_executor, mark_activity=_mark_activity,
         host_busy=_host_busy,
     )
@@ -2833,7 +2912,8 @@ def main() -> None:
                                or background_reflection._background_reflection_active
                                or ask_judge_service._judge_active
                                or resolution_repair._repair_active
-                               or reset_test_service._reset_active),
+                               or reset_test_service._reset_active
+                               or capture_judge_service._capture_active),
         model_loaded=lambda: _runtime.model is not None,
         lock_file=_MEMORY_DIR / "wake.lock",
         idle_seconds=3600.0, poll_seconds=300.0,
@@ -2853,7 +2933,7 @@ def main() -> None:
     # thing whether a timer or her own decision triggered it. Under `deliberation.mode:
     # "sole"` the timers are not registered and the executive is the only chooser.
     def _run_outreach() -> dict:
-        return outreach.run_outreach_decision_blocking(on_question=_outreach_on_question)
+        return outreach.run_outreach_sweep_blocking(on_question=_outreach_on_question)
 
     def _run_synthesis() -> dict:
         return synthesis.run_synthesis_blocking(on_stage=_synthesis_on_stage)
@@ -3122,7 +3202,8 @@ def main() -> None:
                          or generation._regen_swap_active
                          or ask_judge_service._judge_active
                          or resolution_repair._repair_active
-                         or reset_test_service._reset_active),
+                         or reset_test_service._reset_active
+                         or capture_judge_service._capture_active),
         gossip_generate=generation._make_gossip_generate(
             log_transcripts=bool(_gossip_cfg.get("log_transcripts", True)),
         ),
@@ -3158,7 +3239,8 @@ def main() -> None:
                              or generation._regen_swap_active
                              or ask_judge_service._judge_active
                              or resolution_repair._repair_active
-                             or reset_test_service._reset_active),
+                             or reset_test_service._reset_active
+                             or capture_judge_service._capture_active),
             api_key=str(_api_cfg.get("api_key", "") or ""),
             model_name=str(_api_cfg.get("model_name", "") or "ava"),
             default_max_tokens=_api_cfg.get("max_tokens", "75%"),

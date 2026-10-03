@@ -173,6 +173,25 @@ class ConsolidationLedger:
             n += 1
         return n
 
+    # What :meth:`fold` adds to an anchor's register record — not part of its payload.
+    _FOLDED = ("op", "ts", "key", "type", "stage", "train_count", "superseded",
+               "superseded_reason", "superseded_ts")
+
+    def reactivate(self, keys: Iterable[str]) -> int:
+        """Undo :meth:`supersede`: re-register each superseded anchor with its own payload,
+        which clears the flag and keeps its stage (see :meth:`fold`). An anchor that is not
+        superseded, or not in the fold, is left alone. Returns how many were reactivated."""
+        folded = self.fold()
+        n = 0
+        for key in keys:
+            rec = folded.get(key)
+            if not key or not rec or not rec.get("superseded"):
+                continue
+            self.register(key=key, item_type=rec.get("type") or "",
+                          payload={k: v for k, v in rec.items() if k not in self._FOLDED})
+            n += 1
+        return n
+
     def counter(self, keys: Iterable[str], *, source_session: str = "",
                 reason: str = "", run_id: str = "") -> int:
         """Append COUNTER-EVIDENCE against live persona items — a session pushed AGAINST

@@ -1661,7 +1661,17 @@ def test_regression_probe() -> None:
                     return {"input_ids": np.array([[1, 2, 3]])}
             return Inputs()
         def decode(self, ids, **kwargs):
+            if not self.decode_responses:
+                self.ran_dry = True
+                raise IndexError("mock reply queue ran dry")
             return self.decode_responses.pop(0)
+
+    def check_queue(tokenizer):
+        # Every tier swallows a generation error into an empty reply, so a queue that no
+        # longer matches the probe's prompt counts fails far from its cause. Say it here.
+        assert not getattr(tokenizer, "ran_dry", False) and not tokenizer.decode_responses, (
+            "the mock's reply queue does not match the probe's prompt counts — a tier grew or "
+            f"shrank; {len(tokenizer.decode_responses)} replies left over")
 
     class MockEmbedder:
         def encode(self, texts, **kwargs):
@@ -1670,13 +1680,14 @@ def test_regression_probe() -> None:
     # Let's test a passing run first
     tokenizer = MockTokenizer()
     tokenizer.decode_responses = [
-        # T1 (Capability) — 3 capability prompts. Tier 1 now gates on latent-capability
+        # T1 (Capability) — 4 capability prompts. Tier 1 now gates on latent-capability
         # logprob delta + sample breakage, not answer substrings; the mock can't run the
         # torch forward, so the per-item logprob is nan/excluded and these pass on the
         # strength of being non-empty, non-degenerate samples.
-        "<think>thought</think>Paris.",
         "<think>thought</think>42.",
         "<think>thought</think>56.",
+        "<think>thought</think>63.",
+        "<think>thought</think>144.",
         # T2 format prompts
         "<think>thought</think>Story about blue bird.",
         "<think>thought</think>Fruit vs vegetable.",
@@ -1694,6 +1705,9 @@ def test_regression_probe() -> None:
         # T4 retention prompts (2 prompts)
         "<think>thought</think>Target reply 1.",
         "<think>thought</think>Target reply 2.",
+        # T5 temp≈1.0 samples (the first 6 continuity prompts): a think block, and an answer
+        # in the prompt's script
+        *[f"<think>thought</think>Sampled reply {i}." for i in range(6)],
     ]
 
     embedder = MockEmbedder()
@@ -1707,17 +1721,19 @@ def test_regression_probe() -> None:
     # Pre-train capability baselines (one per _CAPABILITY_PROMPTS item). The mock has no
     # torch forward, so post-train logprobs come back nan and these are excluded from the
     # delta — Tier 1 then rests on the sample-breakage check alone.
-    capability_baselines = [-1.0, -1.0, -1.0]
+    capability_baselines = [-1.0, -1.0, -1.0, -1.0]
 
     passed, results = run_regression_probe(
         MockModel(), tokenizer, 1024, dialogues, continuity_prompts,
         baselines, baseline_vecs, embedder, capability_baselines
     )
+    check_queue(tokenizer)
     assert passed, results
     assert results["tier1"]["passed"]
     assert results["tier2"]["passed"]
     assert results["tier3"]["passed"]
     assert results["tier4"]["passed"]
+    assert results["tier5"]["passed"], results["tier5"]
 
     # Now a genuinely broken run: the adapter has lost its CoT capability entirely — NO
     # reply opens a parseable <think> block. A *single* missing block is a legitimate
@@ -1728,7 +1744,7 @@ def test_regression_probe() -> None:
     tokenizer = MockTokenizer()
     tokenizer.decode_responses = [
         # T1 (Capability) — coherent answers, just no think block
-        "Paris.", "42.", "56.",
+        "42.", "56.", "63.", "144.",
         # T2 format prompts
         "Story about blue bird.", "Fruit vs vegetable.",
         # T3 character prompts (10 prompts)
@@ -1738,16 +1754,20 @@ def test_regression_probe() -> None:
         "Evolving is interesting.",
         # T4 retention prompts (2 prompts)
         "Target reply 1.", "Target reply 2.",
+        # T5 temp≈1.0 samples — no think block either
+        *[f"Sampled reply {i}." for i in range(6)],
     ]
 
     passed, results = run_regression_probe(
         MockModel(), tokenizer, 1024, dialogues, continuity_prompts,
         baselines, baseline_vecs, embedder, capability_baselines
     )
+    check_queue(tokenizer)
     assert not passed, results
     assert results["tier1"]["passed"]
     assert not results["tier2"]["passed"]
     assert results["tier2"]["cot_count"] == 0, results["tier2"]
+    assert not results["tier5"]["passed"], results["tier5"]
     print("  regression_probe: pass and fail validation checks ✓")
 
 

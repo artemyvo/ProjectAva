@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
 
 from ui.main_window import MainWindow
+from ui.theme import apply_dark_theme
 
 
 def main() -> None:
@@ -21,6 +22,7 @@ def main() -> None:
 
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, True)
     app = QApplication(sys.argv)
+    apply_dark_theme(app)
     window = MainWindow(server_url=args.server)
     window.show()
     sys.exit(app.exec())

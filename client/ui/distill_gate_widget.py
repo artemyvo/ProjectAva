@@ -17,9 +17,14 @@ withholds it:
 
 This page shows what waits for the gate, what it decided, and — for the records distilled
 before the gate existed — what it would do to them: keep, supersede (out of recall, the
-digest's evidence and training; kept as evidence and reversible) or reroute (superseded and
-distilled as the other kind). **Apply retro…** writes that, after a confirmation. The plan
-reads the verdicts of the current judge, so run **Judge all** on the Judge page first.
+digest's evidence and training; kept as evidence and reversible), reroute (superseded and
+distilled as the other kind) or requeue. A position about Ava is held for the context-reset
+test here too: the retro reads the test's applied results and never distills an untested
+position. An untested `[persona]` record waits for the test's own retro (the Reset test
+page); an untested position filed as a `[fact]` is requeued (the fact superseded, the
+closure back in the gate's queue until the test decides it). A record already out of memory
+is left as it is. **Apply retro…** writes the plan, after a confirmation. The plan reads the
+verdicts of the current judge, so run **Judge all** on the Judge page first.
 """
 
 from __future__ import annotations
@@ -38,9 +43,11 @@ from ui.chat_widget import ChatWidget
 _FILTERS = [
     ("everything", None), ("waiting for the gate", ("pending", None)),
     ("retro: supersede", ("retro", "supersede")), ("retro: reroute", ("retro", "reroute")),
-    ("retro: keep", ("retro", "keep")), ("retro: no verdict yet", ("retro", "wait")),
+    ("retro: requeue", ("retro", "requeue")), ("retro: keep", ("retro", "keep")),
+    ("retro: wait", ("retro", "wait")), ("retro: out already", ("retro", "out")),
     ("decided", ("decided", None)),
 ]
+_APPLIES = ("keep", "supersede", "reroute", "requeue")      # the retro actions that write
 _GREEN, _AMBER, _RED, _GREY = (QColor(140, 220, 140), QColor(255, 190, 120),
                                QColor(255, 140, 140), QColor(150, 150, 150))
 
@@ -70,7 +77,8 @@ def _colour(it: dict) -> Optional[QColor]:
     if it.get("state") == "decided":
         return _GREY
     if it.get("state") == "retro":
-        return {"keep": _GREEN, "supersede": _RED, "reroute": _AMBER, "wait": _GREY}.get(it.get("action"))
+        return {"keep": _GREEN, "supersede": _RED, "reroute": _AMBER, "requeue": _AMBER,
+                "wait": _GREY, "out": _GREY}.get(it.get("action"))
     if it.get("reset_state"):
         return {"passed": _GREEN, "failed": _RED}.get(it["reset_state"], _AMBER)
     return {"distill": _GREEN, "withhold": _RED, "wait": _GREY, "rejudge": _AMBER}.get(d.get("decision"))
@@ -195,7 +203,7 @@ class DistillGateWidget(QWidget):
         self._lbl_summary.setText("   ·   ".join(parts))
         if self._lbl_status.text() == "Reading…":      # keep an apply's result line
             self._lbl_status.setText("")
-        actionable = sum(v for k, v in retro.items() if k in ("keep", "supersede", "reroute"))
+        actionable = sum(v for k, v in retro.items() if k in _APPLIES)
         self._btn_apply.setEnabled(bool(key) and actionable > 0 and not msg.get("busy"))
         self._populate()
 
@@ -259,6 +267,14 @@ class DistillGateWidget(QWidget):
         line(str(it.get("answer") or "(empty)"))
         if it.get("state") == "retro":
             line(f"→ distilled before the gate as [{it.get('distilled')}]", muted)
+            out = it.get("out") or {}
+            if out:
+                line(f"→ out of memory since {str(out.get('ts') or '')[:19]}: "
+                     f"{out.get('reason') or out.get('label')}"
+                     + (f" (merged into {out['into']})" if out.get("into") else ""), muted)
+        elif it.get("requeued"):
+            line(f"→ distilled before the gate as [{it.get('requeued')}]; the retro superseded it and "
+                 f"requeued the closure for the reset test", muted)
         line()
         v = it.get("verdict") or {}
         if v:
@@ -295,10 +311,19 @@ class DistillGateWidget(QWidget):
                              f"digest's evidence and training; kept as evidence, reversible",
                 "reroute": f"supersede the [{it.get('distilled')}] record and distill the answer as "
                            f"[{d.get('as')}]",
-                "wait": "nothing yet — no verdict under the current judge (run Judge all)",
+                "requeue": f"supersede the [{it.get('distilled')}] record and requeue the closure: the "
+                           f"answer is a position of hers, so it waits for the context-reset test (P7) "
+                           f"like any pending closure, and the gate decides it at a Sleep run — passed "
+                           f"→ [{d.get('as')}], failed → withheld",
+                "wait": ("nothing — an untested position: the context-reset test's own retro decides "
+                         "this record (the Reset test page)" if it.get("reset_state")
+                         else "nothing yet — no verdict under the current judge (run Judge all)"),
+                "out": "nothing — the record is already out of memory",
             }.get(action, action)
             line(f"APPLY WILL: {what}", coloured)
             line(f"because: {d.get('reason') or ''}", muted)
+            if it.get("reset_state"):
+                line(f"reset test: {it['reset_state']}", muted)
         cur.setCharFormat(neutral)
         self._out.verticalScrollBar().setValue(0)
 
@@ -313,8 +338,11 @@ class DistillGateWidget(QWidget):
             f"and training; kept in the ledger as evidence and reversible\n"
             f"• reroute {retro.get('reroute', 0)} record(s) — superseded and distilled as the "
             f"other kind\n"
+            f"• requeue {retro.get('requeue', 0)} record(s) — superseded; each answer, a position "
+            f"of hers, waits for the context-reset test as a pending closure\n"
             f"• keep {retro.get('keep', 0)} record(s) as they are\n"
-            f"• leave {retro.get('wait', 0)} without a verdict for later\n\n"
+            f"• leave {retro.get('wait', 0)} waiting (no verdict yet, or the Reset test page "
+            f"decides them) and {retro.get('out', 0)} already out of memory\n\n"
             f"Each decision is written to the memory op-log beside its closure.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)

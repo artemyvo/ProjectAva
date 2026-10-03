@@ -48,7 +48,7 @@ non-zero floor rather than to 0.
 | 2 | Gist / consolidation summary | RAG | wall-clock, source-chat age | floor `0.2` @ 192h (crossfades ↑ vs #1) | (long-horizon recall) |
 | 3 | Persona records `[persona]` | RAG | wall-clock, source-bundle age | floor `0.2` @ 96h | weights (implicitly) |
 | 4 | Facts `[fact]` | RAG + CoT | **does not fade** | constant `1.0` (timeless truth) | weights (host-CoT injection) — hearsay is RAG-only |
-| 5 | Open questions `[ask]` | agenda; direct chat injection off | surface-count retirement | evicted on resolve | — (drives outreach) |
+| 5 | Open questions `[ask]` | agenda; direct chat injection off | surface-count retirement | evicted on resolve; a meta closure the judge accepts while its WHY reads as rejecting the question's terms opens its child, the question it leaves open (`child_of`, `core/child_ask.py`, since 2026-10-01) | — (drives outreach) |
 | 6 | Wander (self-reading) | weights; direct RAG injection off | wall-clock step fade | `0` past 96h | weights (fixed LR mult) |
 | 7 | Persona digest | prompt injection | regenerated, not retrieved | versioned, rollback-able | prompt |
 | 8 | Impressions `[impression]` | RAG | **does not fade** | constant `1.0` (superseded by a later reading, not by time) | prompt (via #9) — never weights |

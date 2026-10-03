@@ -49,7 +49,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
-from core.field_parse import section as _section
+from core.field_parse import any_heading as _any_heading, section as _section
+from core.reasoning_text import truncated_before_answer
 
 from core.reflection_digest import (       # the fold primitives this reuses verbatim
     _RECENCY_BANDS,
@@ -81,6 +82,13 @@ _SECTION_RE = re.compile(
     _section("WHO", "CARES", "WAYS", "WITH_ME", "WITH ME", "UNSURE"),
     re.IGNORECASE | re.MULTILINE,
 )
+# The order the prompt asks for them in — what `parse_portrait` falls back on when the
+# answer drops its labels or translates them.
+_FACET_ORDER = ("WHO", "CARES", "WAYS", "WITH_ME", "UNSURE")
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
+# A heading in a language nobody listed: a line that is only a label and its colon. Its
+# name is never read; only its position counts (`_translated_sections`).
+_HEADING_RE = re.compile(_any_heading(), re.MULTILINE)
 
 # Evidence kinds a portrait folds, and what each contributes.
 #   impression — her own reading of the person (the [persona] analogue). The core.
@@ -119,6 +127,24 @@ _SKIP_RAW_CLIP = 1500
 # ends on EOS pays nothing for the headroom, so the cost of raising it is bounded by the
 # runaway case it exists to survive.
 PORTRAIT_MAX_NEW_TOKENS = "16384"
+
+# Ceiling on the evidence the synthesis prompt carries, in characters of rendered theme
+# lines. A MEMORY guard, not a window guard (`PromptBudgetError` is that): the pass
+# prefills its whole prompt in one forward, and on the 32 GB box (gemma-4-31B 4-bit +
+# adapter, 18.3 GiB resident) that prefill OOMs somewhere between ~13k and ~16k prompt
+# tokens, depending on what else holds VRAM at the time. The premise the module docstring
+# gives for skipping map-reduce ("one person's evidence is one to two orders of magnitude
+# smaller") no longer holds for the owner: by 2026-09-27 their fold was 1,144 observations
+# → 307 themes, a 16.4k-token prompt, and the pass OOMed on 9 of the 16 runs from
+# 2026-09-13 (the failing request was 64 KiB per prompt token, inside SDPA). The outside
+# view has the same shape and OOMed the same way at 13–18k in August, so `self_portrait`
+# shares this ceiling. The evidence arrives most-reinforced first
+# (`cluster_persona_evidence`), so the ceiling only ever drops the faintest tail. Measured
+# on the stored evidence (2026-09-27): the owner's prompt keeps the top 103 of 306 themes —
+# every one of them repeated across conversations — and drops 191 one-offs and 12 faded
+# repeats, 6.8k prompt tokens instead of 16.3k; the outside view keeps 142 of 177 (all 59
+# repeats), 7.0k instead of 8.3k.
+PORTRAIT_EVIDENCE_CHARS = 32000
 
 
 # ── person identity ────────────────────────────────────────────────────────── #
@@ -334,8 +360,8 @@ def should_regenerate(users_dir: Path, person: str, items: list[dict]) -> bool:
 
 
 def write_portrait(users_dir: Path, person: str, portrait: dict, *, raw_text: str,
-                   run_id: str, evidence: list[dict], raw_fp: Optional[str] = None
-                   ) -> Optional[Path]:
+                   run_id: str, evidence: list[dict], raw_fp: Optional[str] = None,
+                   shown: Optional[int] = None) -> Optional[Path]:
     """Atomically write *person*'s portrait file. Returns the path (None if nameless)."""
     from training.reflections_path import atomic_write_text
 
@@ -353,19 +379,23 @@ def write_portrait(users_dir: Path, person: str, portrait: dict, *, raw_text: st
         "ways": portrait.get("ways", []),
         "with_me": portrait.get("with_me", []),
         "unsure": portrait.get("unsure", []),
-        "evidence": _evidence_summary(evidence, raw_fp),
+        "evidence": _evidence_summary(evidence, raw_fp, shown=shown),
         "raw": raw_text or "",
     }
+    if portrait.get("parse"):
+        record["parse"] = portrait["parse"]
     atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
     return path
 
 
-def _evidence_summary(evidence: list[dict], raw_fp: Optional[str] = None) -> dict:
+def _evidence_summary(evidence: list[dict], raw_fp: Optional[str] = None, *,
+                      shown: Optional[int] = None) -> dict:
     """Persistable summary of the clustered evidence — the portrait's audit trail.
 
     Mirrors ``reflection_digest._evidence_summary``: the themes are kept with their
     recurrence and merged members so a wrong merge or an over-weighted one-off is visible
-    on the artifact rather than only in the prose it produced.
+    on the artifact rather than only in the prose it produced. ``shown`` is how many of
+    them, from the top, the synthesis prompt carried (:func:`select_portrait_evidence`).
     """
     themes = [
         {
@@ -382,25 +412,133 @@ def _evidence_summary(evidence: list[dict], raw_fp: Optional[str] = None) -> dic
         "raw_fingerprint": raw_fp,
         "item_count": sum(t["cluster_size"] for t in themes),
         "theme_count": len(themes),
+        "shown": len(themes) if shown is None else shown,
         "themes": themes,
     }
 
 
 # ── prompt input + parsing ─────────────────────────────────────────────────── #
 
-def build_portrait_prompt_input(person: str, evidence: list[dict]) -> str:
+def _evidence_line(e: dict) -> str:
+    n = e.get("recurrences", 1)
+    seen = "once" if n <= 1 else f"across {n} separate conversations"
+    return f"- {e.get('content', '').strip()}  [{seen}]"
+
+
+def select_portrait_evidence(evidence: list[dict], *,
+                             budget_chars: int = PORTRAIT_EVIDENCE_CHARS
+                             ) -> tuple[list[dict], int]:
+    """The ranked head of *evidence* that fits :data:`PORTRAIT_EVIDENCE_CHARS`, and how
+    many themes were left out.
+
+    Stops at the first theme that does not fit instead of skipping past it for shorter
+    ones, so everything left out weighs less than everything shown — the one claim the
+    prompt makes about the omission. The first theme is always kept.
+    """
+    shown: list[dict] = []
+    used = 0
+    for e in evidence:
+        cost = len(_evidence_line(e)) + 1
+        if shown and used + cost > budget_chars:
+            break
+        shown.append(e)
+        used += cost
+    return shown, len(evidence) - len(shown)
+
+
+def build_portrait_prompt_input(person: str, evidence: list[dict], *,
+                                omitted: int = 0) -> str:
     """Render one person's clustered evidence as the synthesis prompt's body.
 
     Each theme carries how many distinct conversations it surfaced in, because that is the
     difference between "he said this once" and "this is how he is" — and the prompt asks
     for that difference to show in the prose rather than being flattened into a bullet.
+    *omitted* (from :func:`select_portrait_evidence`) is said out loud, so a partial view
+    is not presented as everything she has noticed.
     """
     lines = [f"What you have come to notice about {person}:", ""]
-    for e in evidence:
-        n = e.get("recurrences", 1)
-        seen = "once" if n <= 1 else f"across {n} separate conversations"
-        lines.append(f"- {e.get('content', '').strip()}  [{seen}]")
+    lines.extend(_evidence_line(e) for e in evidence)
+    if omitted:
+        lines += ["", f"({omitted} further observation{'' if omitted == 1 else 's'}, "
+                      "each fainter than any above, left out for length.)"]
     return "\n".join(lines)
+
+
+def _labelled_sections(body: str) -> dict[str, str]:
+    """``{FACET: block}`` for every labelled section, plus WHO from its position.
+
+    The label-free WHO: an answer that labels CARES onward but not WHO still writes the
+    WHO paragraph first, where the prompt asks for it, and a label-only scan dropped it.
+    Both user portraits on disk on 2026-09-27 were written that way — a ~470-char WHO
+    paragraph ahead of the CARES label, discarded — so the block injected every turn had
+    no first line. Taken only when the first label found is CARES, i.e. when the text sits
+    exactly where WHO belongs.
+    """
+    sections: dict[str, str] = {}
+    matches = list(_SECTION_RE.finditer(body))
+    for i, m in enumerate(matches):
+        name = m.group(1).upper().replace(" ", "_")
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        sections[name] = body[start:end].strip()
+    if (matches and "WHO" not in sections
+            and matches[0].group(1).upper() == "CARES"):
+        lead = body[:matches[0].start()].strip()
+        if lead:
+            sections["WHO"] = lead
+    return sections
+
+
+def _positional_sections(body: str) -> dict[str, str]:
+    """The five facets read by POSITION, for an answer that carries no label at all.
+
+    From 2026-08-31 the adapter often answered with the five sections in the prompt's order
+    but without their labels: a one-line WHO paragraph, then four one-per-line lists,
+    blank-line separated. Every such answer on record (15, 2026-08-31 → 2026-09-27) had
+    exactly that shape, and every one was discarded as "unparseable or empty". Read by
+    position only under that shape — exactly five blocks — and only behind a CLOSED
+    thought (`parse_portrait` checks), so provenance is as strict as ever; any other block
+    count still reads as nothing. The closed thought is not optional: gemma-4's channel is
+    prefilled, so a thought that never closes comes back untagged (`reasoning_text`) and
+    `strip_think` has nothing to cut — a loop-halted scratch list in five blocks would read
+    as a portrait. One such generation is on record (2026-09-24, 236 tokens, halted on
+    the loop guard).
+    """
+    blocks = [b.strip() for b in _BLANK_LINE_RE.split(body.strip()) if b.strip()]
+    if len(blocks) != len(_FACET_ORDER):
+        return {}
+    return dict(zip(_FACET_ORDER, blocks))
+
+
+def _translated_sections(body: str) -> dict[str, str]:
+    """The five facets under headings in a language nobody listed, read by POSITION.
+
+    On 2026-10-01 the adapter answered with the five sections in the prompt's order under
+    Russian glosses of their labels, each heading a line of its own ending in a colon (the
+    self-test's stand-ins, ``Каким я его знаю:`` … ``Чего я пока не знаю:``, have its
+    shape). Neither reader took it: `_SECTION_RE` knows the English names only, and the
+    WHO heading stood alone above its paragraph, so the position read counted six blocks.
+    A heading here is any line that is only a short label and its colon
+    (`field_parse.any_heading`), and its name is never read: the prompt's order says
+    which facet it opens. Two shapes only: five headings, the first opening the answer;
+    or four after an unlabelled paragraph, which is then WHO, as `_labelled_sections`
+    takes it ahead of CARES. Like the position read, only behind a closed thought
+    (`parse_portrait` checks). Any other count reads as nothing here, so a stray
+    colon-ended line in a complete answer is never taken for a heading and every facet
+    after it shifted by one.
+    """
+    heads = list(_HEADING_RE.finditer(body))
+    lead = body[:heads[0].start()].strip() if heads else ""
+    if len(heads) == len(_FACET_ORDER) and not lead:
+        facets, sections = _FACET_ORDER, {}
+    elif len(heads) == len(_FACET_ORDER) - 1 and lead:
+        facets, sections = _FACET_ORDER[1:], {"WHO": lead}
+    else:
+        return {}
+    ends = [m.start() for m in heads[1:]] + [len(body)]
+    for facet, m, end in zip(facets, heads, ends):
+        sections[facet] = body[m.end():end].strip()
+    return sections
 
 
 def parse_portrait(text: str) -> dict:
@@ -409,25 +547,62 @@ def parse_portrait(text: str) -> dict:
     Lenient about *shape*, never about provenance: `strip_think` cuts an unterminated
     ``<think>`` as well as closed ones, so a generation truncated mid-thought yields no
     body rather than a portrait assembled out of the section labels this prompt taught
-    the model to rehearse while thinking.
+    the model to rehearse while thinking. (A thought that never closed and arrives with no
+    tag at all — gemma-4's prefilled channel — gives this text nothing to cut; refusing it
+    takes the generator's truncation flag, which :func:`synthesize_portrait` checks.) The
+    shape leniency covers missing labels, whose
+    place the prompt's fixed order fills (:func:`_labelled_sections`,
+    :func:`_positional_sections`), and labels in a language nobody listed, whose order
+    says which is which (:func:`_translated_sections`). A portrait read by position
+    carries ``parse: "positional"`` or ``parse: "translated_labels"`` so the artifact says
+    how it was read.
     """
     body = strip_think(text)
-    sections: dict[str, str] = {}
-    matches = list(_SECTION_RE.finditer(body))
-    for i, m in enumerate(matches):
-        name = m.group(1).upper().replace(" ", "_")
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
-        sections[name] = body[start:end].strip()
+    sections = _labelled_sections(body)
+    parse = ""
+    if not sections and "</think>" in (text or "").lower():
+        sections, parse = _translated_sections(body), "translated_labels"
+        if not sections:
+            sections, parse = _positional_sections(body), "positional"
     who = " ".join(l.strip() for l in sections.get("WHO", "").splitlines()
                    if l.strip()).strip()
-    return {
+    portrait = {
         "who": who,
         "cares": _bullets(sections.get("CARES", "")),
         "ways": _bullets(sections.get("WAYS", "")),
         "with_me": _bullets(sections.get("WITH_ME", "")),
         "unsure": _bullets(sections.get("UNSURE", "")),
     }
+    if parse and sections:
+        portrait["parse"] = parse
+    return portrait
+
+
+def clip_skip_raw(raw: str, limit: int = _SKIP_RAW_CLIP) -> str:
+    """*raw* cut to *limit* chars for a skip event, keeping what the parser read.
+
+    A plain head clip of a thinking generation is all thought — the answer, the only
+    region a section parse reads, lies past it — so the skip rendered by
+    `reflection_runner._pass_output_debug` reported "<think> never closed" and an empty
+    parse for generations that had closed their thought and answered without labels
+    (2026-09-27: a 7,149-char portrait whose 2,706-char answer sat past the 1,500-char
+    clip). A closed thought is therefore elided behind its opening lines and the answer
+    kept; an unclosed one keeps its head and its tail, which is where it stopped.
+    """
+    raw = raw or ""
+    if len(raw) <= limit:
+        return raw
+    low = raw.lower()
+    opener = low.find("<think>")
+    close = low.find("</think>", opener) if opener >= 0 else -1
+    if close != -1:
+        keep = opener + len("<think>") + 240
+        if keep < close:
+            return (raw[:keep] + f" […{close - keep} chars of thought…]"
+                    + raw[close:])[:limit]
+        return raw[:limit]
+    half = limit // 2
+    return raw[:half] + f"\n[…{len(raw) - 2 * half} chars…]\n" + raw[-half:]
 
 
 def load_portrait_prompt(prompts_dir: Optional[Path] = None) -> str:
@@ -591,14 +766,20 @@ def synthesize_portrait(
     a bad portrait (see below) — and it does not self-correct, since the next run re-reads
     the same, by then larger, evidence.
 
+    The prompt carries the ranked head of *evidence* that fits
+    :data:`PORTRAIT_EVIDENCE_CHARS` (the prefill is what runs out of memory); the summary
+    reports ``shown`` / ``omitted`` on every outcome.
+
     Returns a status summary; never raises.
     """
     if not evidence:
         return {"status": "skipped", "reason": "no evidence", "person": person}
+    shown, omitted = select_portrait_evidence(evidence)
+    sizes = {"shown": len(shown), "omitted": omitted}
     try:
         sys_prompt = prompt if prompt is not None else load_portrait_prompt()
         sys_prompt = sys_prompt.replace("{person}", person)
-        body = build_portrait_prompt_input(person, evidence)
+        body = build_portrait_prompt_input(person, shown, omitted=omitted)
         raw = generate_fn(
             body, sys_prompt,
             temperature=temperature, top_p=top_p,
@@ -607,34 +788,43 @@ def synthesize_portrait(
         )
     except Exception as e:
         return {"status": "failed", "reason": f"{type(e).__name__}: {e}",
-                "person": person}
+                "person": person, **sizes}
 
     portrait = parse_portrait(raw or "")
-    if not any(portrait.get(k) for k in ("who", "cares", "ways", "with_me", "unsure")):
+    # A generation cut before it closed its thought has no answer region, whatever parsed:
+    # on gemma-4 that thought arrives untagged, so `strip_think` cannot cut it and a label
+    # the draft rehearsed would read as a section (`reasoning_text.truncated_before_answer`).
+    cut = truncated_before_answer(raw or "", getattr(generate_fn, "last_truncated", None))
+    if cut or not any(portrait.get(k) for k in ("who", "cares", "ways", "with_me", "unsure")):
         # Carry the evidence for WHY nothing parsed, or the skip is unactionable: one
         # reason string cannot distinguish a generation truncated inside its <think>
         # (now stripped to nothing by `strip_think` rather than parsed as a portrait)
         # from a model that ignored the five section labels. `last_truncated` is set on
         # the generate callable by the reflection generate seam; absent on a caller that
         # does not publish it, hence the getattr. The raw is clipped — it rides a run
-        # event into the store and the activity journal.
+        # event into the store and the activity journal — around the answer, not from
+        # the head (see `clip_skip_raw`).
         raw_text = raw or ""
         return {"status": "skipped", "reason": "unparseable or empty", "person": person,
                 "truncated": getattr(generate_fn, "last_truncated", None),
                 "raw_chars": len(raw_text),
-                "raw": raw_text[:_SKIP_RAW_CLIP]}
+                "raw": clip_skip_raw(raw_text), **sizes}
 
     try:
         path = write_portrait(users_dir, person, portrait, raw_text=raw or "",
-                              run_id=run_id, evidence=evidence, raw_fp=raw_fp)
+                              run_id=run_id, evidence=evidence, raw_fp=raw_fp,
+                              shown=len(shown))
     except Exception as e:
-        return {"status": "failed", "reason": f"write error: {e}", "person": person}
+        return {"status": "failed", "reason": f"write error: {e}", "person": person,
+                **sizes}
 
     return {
         "status": "written",
         "person": person,
         "path": str(path) if path else "",
         "themes": len(evidence),
+        **sizes,
+        "parse": portrait.get("parse", "labelled"),
         "counts": {
             "cares": len(portrait.get("cares") or []),
             "ways": len(portrait.get("ways") or []),
@@ -774,6 +964,140 @@ def _selftest() -> None:
 
         body = build_portrait_prompt_input("Artemy", ev)
         assert "Artemy" in body and ("once" in body or "conversations" in body)
+        assert "further observation" not in body               # nothing omitted
+
+        # -- the evidence ceiling ------------------------------------------- #
+        # The ranked head that fits, in rank order; the first theme always fits; and the
+        # cut is at the first theme that does not fit — a shorter theme below it is NOT
+        # pulled up, so everything omitted is fainter than everything shown.
+        ranked = [{"content": f"reading {i} " + "x" * 80, "recurrences": 2}
+                  for i in range(10)]
+        per_line = len(_evidence_line(ranked[0])) + 1
+        head, left = select_portrait_evidence(ranked, budget_chars=per_line * 4 + 5)
+        assert head == ranked[:4] and left == 6
+        assert select_portrait_evidence(ranked[:1], budget_chars=1) == (ranked[:1], 0)
+        uneven = [ranked[0], {"content": "y" * 500, "recurrences": 2}, ranked[1]]
+        assert select_portrait_evidence(uneven, budget_chars=per_line * 3) == (
+            [ranked[0]], 2)
+        assert "6 further observations" in build_portrait_prompt_input(
+            "Artemy", head, omitted=left)
+
+        # -- missing labels: the prompt's order fills them in -------------------- #
+        # Labels rehearsed inside the thought never count (it is stripped first).
+        unlabelled = (
+            "<think>WHO first, then CARES, WAYS, WITH_ME, UNSURE.</think>"
+            "An engineer building his own mind-shaped thing.\n\n"
+            "Whether an idea survives being attacked.\nHis own project.\n\n"
+            "Terse; drops the pleasantries.\n\n"
+            "Wants the objection, not the agreement.\n\n"
+            "Whether the quiet is thinking or something else.\n"
+        )
+        pos = parse_portrait(unlabelled)
+        assert pos.get("parse") == "positional" and pos["who"].startswith("An engineer")
+        assert pos["cares"] == ["Whether an idea survives being attacked.",
+                                "His own project."]
+        assert pos["ways"] and pos["with_me"] and len(pos["unsure"]) == 1
+        assert "parse" not in parsed                            # labelled stays labelled
+        facets = ("who", "cares", "ways", "with_me", "unsure")
+        # Only in that shape: four blocks, or five inside an unclosed thought, are nothing.
+        four = parse_portrait(unlabelled.replace("Terse; drops the pleasantries.\n\n", ""))
+        assert not any(four[k] for k in facets)
+        dangling = parse_portrait(unlabelled.replace("</think>", "\n"))
+        assert not any(dangling[k] for k in facets)
+        # ...nor from untagged text: a prefilled gemma-4 thought that never closed arrives
+        # with no marker at all, and five blocks of it are not a portrait.
+        untagged = parse_portrait(unlabelled.split("</think>", 1)[1])
+        assert not any(untagged[k] for k in facets)
+        # WHO unlabelled, CARES onward labelled: the paragraph ahead of CARES is WHO...
+        lead = parse_portrait("<think>x</think>An engineer, impatient with shelf answers."
+                              "\n\nCARES\n- his own project\n\nUNSURE\n- the quiet\n")
+        assert lead["who"].startswith("An engineer") and "parse" not in lead
+        # ...but text ahead of any other first label is not.
+        assert parse_portrait("<think>x</think>A preface.\n\nWAYS\n- terse\n")["who"] == ""
+
+        # -- translated labels: headings in another language, read by position -- #
+        # The 2026-10-01 shape: the five sections in order, each under a colon-ended
+        # heading in Russian; the WHO heading alone above its paragraph, the others right
+        # above their "— " lists. The position read counted six blocks and took nothing.
+        translated = (
+            "<think>WHO, CARES, WAYS, WITH_ME, UNSURE, in his language.</think>"
+            "Каким я его знаю:\n\n"
+            "Инженер, который чинит старые радиоприёмники и спорит с каждым выводом, "
+            "пока тот не выдержит.\n\n"
+            "Что для него важно:\n"
+            "— выдержит ли идея, если на неё напасть\n"
+            "— его мастерская\n\n"
+            "Как он говорит:\n"
+            "— коротко, без любезностей\n\n"
+            "Как у нас всё устроено:\n"
+            "— ему нужно возражение, а не согласие\n\n"
+            "Чего я пока не знаю:\n"
+            "— молчит ли он, когда думает, или по другой причине\n"
+        )
+        tr = parse_portrait(translated)
+        assert tr.get("parse") == "translated_labels", tr
+        assert tr["who"].startswith("Инженер") and tr["who"].endswith("не выдержит.")
+        assert tr["cares"] == ["выдержит ли идея, если на неё напасть", "его мастерская"]
+        assert tr["ways"] and tr["with_me"] and len(tr["unsure"]) == 1
+        assert not any(i.endswith(":") for k in facets[1:] for i in tr[k])  # no heading kept
+        # The same with the WHO heading right above its paragraph, and with WHO unlabelled
+        # ahead of the other four (as `_labelled_sections` takes one ahead of CARES).
+        assert parse_portrait(translated.replace("Каким я его знаю:\n\n",
+                                                 "Каким я его знаю:\n")) == tr
+        assert parse_portrait(translated.replace("Каким я его знаю:\n\n", "")) == tr
+        # Never behind an unclosed thought, nor from untagged text...
+        assert not any(parse_portrait(translated.replace("</think>", "\n"))[k] for k in facets)
+        assert not any(parse_portrait(translated.split("</think>", 1)[1])[k] for k in facets)
+        # ...and in no other shape: a sixth colon-ended line (a preamble here) is not
+        # taken for a heading with every facet after it shifted by one.
+        extra = translated.replace("</think>", "</think>Вот что я вижу:\n\n")
+        assert not any(parse_portrait(extra)[k] for k in facets)
+
+        # -- the skip clip keeps what the parser read --------------------------- #
+        long_raw = ("<think>" + "draft line\n" * 400 + "</think>"
+                    + "An answer without labels.\n" * 10)
+        clip = clip_skip_raw(long_raw)
+        assert len(clip) <= _SKIP_RAW_CLIP and "chars of thought" in clip
+        assert "</think>An answer without labels." in clip
+        stuck = clip_skip_raw("<think>" + "looping line\n" * 400)
+        assert stuck.startswith("<think>looping") and "</think>" not in stuck
+        assert stuck.rstrip().endswith("looping line")          # the tail: where it stopped
+        assert clip_skip_raw("short") == "short"
+
+        # -- synthesis end to end: budgeted prompt, position-read answer, audit --- #
+        prompts_seen: list[str] = []
+
+        def _stub(body, _sys, **_kw):
+            prompts_seen.append(body)
+            return unlabelled
+
+        many = [{"content": f"reading {i:03d} " + "y" * 200, "recurrences": 2}
+                for i in range(300)]
+        res = synthesize_portrait("Artemy", many, generate_fn=_stub, users_dir=users,
+                                  run_id="r3", raw_fp=fp, prompt="About {person}.")
+        assert res["status"] == "written" and res["parse"] == "positional", res
+        assert res["omitted"] > 0 and res["shown"] + res["omitted"] == len(many)
+        assert len(prompts_seen[0]) < PORTRAIT_EVIDENCE_CHARS + 200
+        stored = latest_portrait(users, "Artemy")
+        assert stored["parse"] == "positional"
+        assert stored["evidence"]["shown"] == res["shown"]
+        assert stored["evidence"]["theme_count"] == len(many)
+
+        # Cut before its thought closed: labels in the (untagged) draft do not make it an
+        # answer — skipped, and the stored portrait is left alone.
+        def _cut(_body, _sys, **_kw):
+            return raw_text.split("</think>", 1)[1]
+        _cut.last_truncated = True
+        res = synthesize_portrait("Artemy", many, generate_fn=_cut, users_dir=users,
+                                  run_id="r4", prompt="p")
+        assert res["status"] == "skipped", res
+        assert latest_portrait(users, "Artemy")["run_id"] == "r3"
+
+        # Translated labels end to end: written, and the file says how it was read.
+        res = synthesize_portrait("Artemy", many[:5], generate_fn=lambda *a, **k: translated,
+                                  users_dir=users, run_id="r5", prompt="p")
+        assert res["status"] == "written" and res["parse"] == "translated_labels", res
+        assert latest_portrait(users, "Artemy")["parse"] == "translated_labels"
 
     print("user_digest selftest OK")
 

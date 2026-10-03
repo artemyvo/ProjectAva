@@ -69,6 +69,7 @@ _get_rag: Optional[Callable] = None
 _make_sync_reflect_generate: Optional[Callable] = None
 _write_session: Optional[Callable] = None
 _target_user: Optional[Callable[[], str]] = None
+_addressee_for: Optional[Callable[[str], str]] = None
 _model_loaded: Optional[Callable[[], bool]] = None
 # The loaded adapter's name (or the base model id with no adapter): recorded on every
 # protocol the witness writes as its `model_id`, which is what lets a refused document be
@@ -91,14 +92,16 @@ AHA_OPENER_MAX_NEW_TOKENS = 2048
 
 def configure(*, chats_dirs, til_snippets_dir, root, prompts_dir, load_config=None,
               memory_dir=None, get_reflection_writer=None, get_rag=None, make_sync_reflect_generate=None,
-              write_session=None, target_user=None, model_loaded=None, model_name=None) -> None:
+              write_session=None, target_user=None, model_loaded=None, model_name=None,
+              addressee_for=None) -> None:
     """Wire the paths once at startup. `load_config` returns the server config dict. The
     rest back the aha job: the reflection memory (open asks → needs), the writer (surface
     stamps), the reflect seam (judge + opener), the reversed-session writer and the
-    addressee (both outreach's own, injected so the self-test can stub them)."""
+    addressee — the last active user, and the person a chat ref belongs to (all outreach's
+    own, injected so the self-test can stub them)."""
     global _CHATS_DIRS, _TIL_DIR, _ROOT, _PROMPTS_DIR, _load_config
     global _MEMORY_DIR, _get_reflection_writer, _get_rag, _make_sync_reflect_generate, _write_session, _target_user
-    global _model_loaded, _model_name
+    global _model_loaded, _model_name, _addressee_for
     _CHATS_DIRS = [Path(p) for p in chats_dirs]
     _TIL_DIR = Path(til_snippets_dir) if til_snippets_dir else None
     _ROOT = Path(root)
@@ -110,6 +113,7 @@ def configure(*, chats_dirs, til_snippets_dir, root, prompts_dir, load_config=No
     _make_sync_reflect_generate = make_sync_reflect_generate
     _write_session = write_session
     _target_user = target_user
+    _addressee_for = addressee_for
     _model_loaded = model_loaded
     _model_name = model_name
 
@@ -176,6 +180,7 @@ def _make_embedder(cfg: dict):
         from assoc.dense import HashEmbedder
         return HashEmbedder()
     from assoc.dense import BgeM3Embedder
+    from core import load_lock
     device = cfg["device"]
     if device == "cuda":
         try:
@@ -184,7 +189,10 @@ def _make_embedder(cfg: dict):
                 device = "cpu"
         except Exception:
             device = "cpu"
-    return BgeM3Embedder(device=device)
+    # One model load at a time in this process (core/load_lock.py): an embedder loading
+    # while the model loads in another thread can leave transformers' tie_weights stubbed.
+    with load_lock.LOCK:
+        return BgeM3Embedder(device=device)
 
 
 def library(cfg: Optional[dict] = None):
@@ -872,7 +880,6 @@ def run_aha_blocking(*, bypass_cooldown: bool = False, on_stage: Optional[Callab
         with activity_log_ctx("assoc_aha"):
             reflect = _make_sync_reflect_generate(_get_rag() if _get_rag else None)
             generate_fn = make_generate_fn(reflect, label="assoc_aha")
-            user = (_target_user() if _target_user else "") or "your friend"
             ask_needs = (ns.get("needs") or {})
             judged = []
             for cand in cands[: cfg["aha_max_judgements"]]:
@@ -882,6 +889,9 @@ def run_aha_blocking(*, bypass_cooldown: bool = False, on_stage: Optional[Callab
                                "strength": round(out.strength, 4)})
                 if out.verdict not in ("connect", "satisfies"):
                     continue
+                # The need is an open question; it goes to the person it belongs to.
+                meta = ask_needs.get(out.need) or {}
+                user, scope = _addressee(meta.get("source_session", ""))
                 opener, info = _compose_opener(out, generate_fn, user)
                 if info.get("truncated") or not opener:
                     return {"skipped": "opener_truncated" if info.get("truncated") else "no_opener", "judged": judged}
@@ -891,16 +901,15 @@ def run_aha_blocking(*, bypass_cooldown: bool = False, on_stage: Optional[Callab
                         return {"skipped": "opener_leak", "judged": judged}
                 except ImportError:
                     pass
-                gate_ok, gate_reason = (True, "") if bypass_cooldown else _gate()
+                gate_ok, gate_reason = (True, "") if bypass_cooldown else _gate(scope)
                 if not gate_ok:
                     return {"skipped": gate_reason, "judged": judged, "opener": opener}
-                meta = ask_needs.get(out.need) or {}
                 need_text = meta.get("content") or out.passages.get("need", "").split("\n", 1)[-1]
                 filename = ""
                 if _write_session is not None:
                     filename = _write_session(ask_content=need_text, opener=opener, human=user, ask_kind="aha",
                                               ask_key=meta.get("ask_key", ""), ask_source_session=meta.get("source_session", ""))
-                _mark_reachout()
+                _mark_reachout(scope)
                 if meta.get("ask_key") and _get_reflection_writer is not None:
                     try:
                         _get_reflection_writer().write_surface(key=meta["ask_key"], surfaced_in=filename)
@@ -925,18 +934,40 @@ def run_aha_blocking(*, bypass_cooldown: bool = False, on_stage: Optional[Callab
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def _gate() -> tuple:
+def _addressee(source_ref: str) -> tuple[str, Optional[str]]:
+    """Whom a reach-out drawn from *source_ref* goes to, and whose reach-out gate holds it.
+
+    The person the material belongs to — the owner of the need's question (aha), the person
+    of the conversation it pivoted from (pivot) — under their own gate, as outreach decides
+    per person (2026-09-27): the session carries *source_ref* as its ASK ORIGIN, and the
+    pivot's prompt quotes that conversation, so written to anyone else it would hand one
+    person's conversation to another. Material that belongs to nobody (reading, a
+    conversation with a model, a chat no longer on disk) goes to the last active user under
+    the box-wide gate, as before."""
+    owner = ""
+    if _addressee_for is not None and source_ref:
+        try:
+            owner = str(_addressee_for(source_ref) or "").strip()
+        except Exception:
+            owner = ""
+    if owner:
+        return owner, owner
+    from core.chat_logger import UNKNOWN_ADDRESSEE
+    return (_target_user() if _target_user else "") or UNKNOWN_ADDRESSEE, None
+
+
+def _gate(scope: Optional[str] = None) -> tuple:
     try:
         from core import reachout_gate
-        return reachout_gate.may_reach_out()
+        return reachout_gate.may_reach_out(scope)
     except Exception:
         return True, ""
 
 
-def _mark_reachout() -> None:
+def _mark_reachout(scope: Optional[str] = None) -> None:
     try:
         from core import reachout_gate
-        reachout_gate.mark_reachout()
+        reachout_gate.mark_reachout(scope)
     except Exception:
         pass
 
@@ -1103,7 +1134,8 @@ def run_pivot_blocking(*, bypass_cooldown: bool = False, on_stage: Optional[Call
         with activity_log_ctx("assoc_pivot"):
             reflect = _make_sync_reflect_generate(_get_rag() if _get_rag else None)
             gen = make_generate_fn(reflect, label="assoc_pivot")
-            user = (_target_user() if _target_user else "") or "your friend"
+            # The context is one conversation, quoted into the prompt: write to its person.
+            user, scope = _addressee(doc.meta.get("session", ""))
             body, rendered = _jump_body(lib, jump, context)
             raw, info = gen(load_pivot_prompt().replace("{user}", user), body, thinking=True,
                             max_new_tokens=PIVOT_MAX_NEW_TOKENS, temperature=0.0)
@@ -1127,14 +1159,14 @@ def run_pivot_blocking(*, bypass_cooldown: bool = False, on_stage: Optional[Call
                 except Exception:
                     pass
                 return {**out, "kept": True}
-            gate_ok, gate_reason = (True, "") if bypass_cooldown else _gate()
+            gate_ok, gate_reason = (True, "") if bypass_cooldown else _gate(scope)
             if not gate_ok:
                 return {**out, "skipped": gate_reason, "opener": opener}
             filename = ""
             if _write_session is not None:
                 filename = _write_session(ask_content=f"a pivot on «{jump.bridge}»: {note or opener[:120]}", opener=opener,
                                           human=user, ask_kind="pivot", ask_key="", ask_source_session=doc.meta.get("session", ""))
-            _mark_reachout()
+            _mark_reachout(scope)
             try:
                 worklog.record("pivot", note or f"The word «{jump.bridge}» took me somewhere else, and I wrote to {user} about it.",
                                refs={"session": filename, "bridge": jump.bridge, "target": jump.target},
@@ -1390,7 +1422,8 @@ def _selftest() -> None:
                   load_config=lambda: {"assoc": {"embedder": "hash", "device": "cpu"}},
                   memory_dir=memdir, get_reflection_writer=lambda: _Writer(), get_rag=lambda: None,
                   make_sync_reflect_generate=lambda rag: reflect_aha, write_session=write_session,
-                  target_user=lambda: "artemyvo")
+                  # Someone else spoke last: the aha must still go to the question's owner.
+                  target_user=lambda: "Sam", addressee_for=lambda ref: "artemyvo" if ref == "20260801_100000.json" else "")
         lib = library()
         ns = sync_needs(lib)
         check("open asks become registered needs", (ns["open_asks"], ns["registered"]), (1, 1))
@@ -1420,7 +1453,12 @@ def _selftest() -> None:
             print("    aha returned:", r)
         check("the aha composes on a connect verdict", bool(r.get("composed")), True)
         check("...writes the session through outreach's writer", written and written[0]["ask_kind"] == "aha", True)
-        check("...addressed to the target user", written and written[0]["human"] == "artemyvo", True)
+        check("...addressed to the person whose question it is, not whoever spoke last",
+              written and written[0]["human"] == "artemyvo", True)
+        check("nobody's material goes to the last active user, under the box-wide gate",
+              _addressee("wander/some-article"), ("Sam", None))
+        check("a person's goes to them, under their own gate",
+              _addressee("20260801_100000.json"), ("artemyvo", "artemyvo"))
         check("...with the ask's own text as the need", written and "CTO" in written[0]["ask_content"], True)
         check("...stamping the ask surfaced", surfaced and surfaced[0][0] == "ask-k1", True)
         check("...and the opener parsed", "позиция CTO" in (r.get("opener") or ""), True)
@@ -1528,7 +1566,7 @@ def _selftest() -> None:
                   load_config=lambda: {"assoc": {"embedder": "hash", "device": "cpu"}},
                   memory_dir=memdir, get_reflection_writer=lambda: _Writer(), get_rag=lambda: None,
                   make_sync_reflect_generate=lambda rag: reflect_pivot, write_session=write_session,
-                  target_user=lambda: "artemyvo", model_loaded=lambda: True)
+                  target_user=lambda: "Sam", addressee_for=lambda ref: "artemyvo" if ref == "20260801_100000.json" else "", model_loaded=lambda: True)
         lib.build.senses = lib.build.senses or {"position": {}}
         r1 = run_pivot_blocking()
         check("a keep verdict lands as a worklog note", (r1.get("kept"), bool(r1.get("note"))), (True, True))
@@ -1539,6 +1577,8 @@ def _selftest() -> None:
             print("    pivot returned:", r2)
         check("a raise verdict writes a session", (r2.get("composed"), len(written) - n_before), (True, 1))
         check("...as a pivot reach-out", written[-1]["ask_kind"], "pivot")
+        check("...to the person of the conversation it pivoted from",
+              (r2.get("conversation"), written[-1]["human"]), ("chat/20260801_100000", "artemyvo"))
         check("...and the opener parsed", "позиция" in (r2.get("opener") or ""), True)
         check("a cheap bail does not spend the interval", pivot_consumed({"skipped": "no_jump"}), False)
         body, pctx = prepare_pivot_for_module(chat, load_pivot_prompt())

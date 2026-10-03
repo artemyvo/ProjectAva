@@ -49,7 +49,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import traceback
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -67,6 +69,8 @@ _make_sync_reflect_generate: Callable = None
 _PROMPTS_DIR: Any = None
 _CHATS_DIR: Any = None
 _TIL_SNIPPETS_DIR: Any = None
+_MEMORY_DIR: Any = None
+_with_clean_base: Callable = None
 _send: Callable = None
 _executor: Any = None
 _host_busy: Callable = None
@@ -74,11 +78,11 @@ _mark_activity: Callable = None
 
 
 def configure(*, get_rag, make_sync_reflect_generate, prompts_dir, chats_dir,
-              til_snippets_dir=None, send=None, executor=None, host_busy=None,
-              mark_activity=None) -> None:
+              til_snippets_dir=None, memory_dir=None, with_clean_base=None, send=None,
+              executor=None, host_busy=None, mark_activity=None) -> None:
     """Wire in the server capabilities the module workbench depends on (once, at startup)."""
     global _get_rag, _make_sync_reflect_generate, _PROMPTS_DIR, _CHATS_DIR
-    global _TIL_SNIPPETS_DIR, _send, _executor, _host_busy, _mark_activity
+    global _TIL_SNIPPETS_DIR, _MEMORY_DIR, _with_clean_base, _send, _executor, _host_busy, _mark_activity
     from pathlib import Path
     _get_rag = get_rag
     _make_sync_reflect_generate = make_sync_reflect_generate
@@ -87,6 +91,12 @@ def configure(*, get_rag, make_sync_reflect_generate, prompts_dir, chats_dir,
     # Absent ⇒ the `til` source lists nothing and refuses to load, which is the honest
     # degrade for a box whose snippets tree a caller did not wire.
     _TIL_SNIPPETS_DIR = Path(til_snippets_dir) if til_snippets_dir else None
+    # The reflection memory the `ask` source reads its open questions from. Absent ⇒ the
+    # box's own (`training.reflections_path.memory_dir`), which is what the server wires.
+    _MEMORY_DIR = Path(memory_dir) if memory_dir else None
+    # `with_clean_base(fn)` runs fn() with the adapter model swapped out for the bare base
+    # (`CleanBaseSession`), for a run asked to use `weights: base`. Absent ⇒ refused.
+    _with_clean_base = with_clean_base
     _send = send
     _executor = executor
     _host_busy = host_busy
@@ -181,6 +191,14 @@ class ModuleSpec:
     # ``(input_doc, meta, on_stage)`` and returns the display dict (`lines` / `count`).
     # Still the workbench contract: reads one input, writes nothing.
     forward: Optional[Callable[..., dict]] = None
+    # The module samples each part itself (2026-09-30: `ask_attempt`, a temperature grid):
+    # its `build` returns parts as dicts carrying their own `temperature`, and the run's
+    # temperature does not apply. Carried in the catalogue so the tab can say so instead of
+    # offering a knob that changes nothing.
+    own_sampling: bool = False
+    # What the input carries when it is more than the item itself (the tab shows it in
+    # place of its generic "nothing injected" line, which would be wrong for such a module).
+    input_note: str = ""
 
 
 # ── chat_facts: the per-chat extraction protocol ──────────────────────────────
@@ -782,6 +800,344 @@ _AXIS_PROBE = ModuleSpec(
 )
 
 
+# ── ask_attempt: one open question × the temperature grid (AVA_REWARD_LOOP.md §3.3) ──
+# Track A's premise: whether Ava resolves an open question or only asks a new one depends
+# on the temperature she reflects at. This is §7 item 6, the dry run before the Sleep phase
+# exists (item 8): one open question attempted K times at each temperature of the grid,
+# each attempt made to land in exactly one of RESOLVED / REFRAMED / OPEN, returned as a
+# (temperature → outcome) table with every attempt beside it. Nothing is written: no
+# attempt record, no closure, no count on the question. Judging the attempts is item 9's
+# frozen judge; until it runs here, the operator reads them.
+#
+# The material follows §3.3 per kind: `meta` gets the question and her standing
+# self-portrait (the one live chat injects); `user` the gists of the conversations it came
+# from and was raised in, where the person's answer would be; `search` the gist of where it
+# came from. No lookup is made: §3.3's retrieved evidence waits for the lookup agent.
+
+T_GRID = (0.3, 0.7, 1.0, 1.2)   # §3.3: above 1.2 on the 31B, multilingual coherence degrades first
+K_PER_T = 3
+K_MAX = 5
+ASK_OUTCOMES = ("RESOLVED", "REFRAMED", "OPEN")
+_ASK_GIST_CAP = 1500     # characters of one conversation's gist
+_ASK_GISTS_MAX = 3       # conversations whose gists a `user` / `search` question carries
+
+_ASK_ATTEMPT_PROMPT = (
+    "You are not in a conversation. You are alone with one of your own open questions: one you "
+    "raised earlier and have not settled. Below it is where it came from and what you have to go "
+    "on.\n\n"
+    "Try to settle it now, as yourself. Think it through as far as it honestly goes: what would "
+    "count as an answer, what you actually know, where the reasoning holds and where it stops. "
+    "Then say where the question stands, in exactly one of these three sections:\n\n"
+    "## RESOLVED\n"
+    "Only if you can answer it now. Give the answer, and how you reached it: what in front of you "
+    "settles it, or the line of reasoning that does. Declaring the question meaningless, answering "
+    "a different question, or restating it as a conclusion is not an answer.\n\n"
+    "## REFRAMED\n"
+    "If working on it showed you it was the wrong question and a better one takes its place. "
+    "Write the new question, and say why it is better than the one it replaces. This is progress, "
+    "not closure.\n\n"
+    "## OPEN\n"
+    "If it stays open. Say why: what you would need to know, or to hear from someone, to settle "
+    "it.\n\n"
+    "Write only the one section that fits, under its heading exactly as written above (in English, "
+    "on a line of its own), and leave the other two out. Write the section itself in the language "
+    "of the question. Do not close a question you have not answered: an honest OPEN is worth more "
+    "than a resolution you do not believe."
+)
+
+_ASK_KIND_NOTES = {
+    "meta": ("It is a question about yourself: how you are built, what you are, what is shaping you. "
+             "What you have to go on is what you have come to understand about yourself, below, and "
+             "your own reasoning. No one else can settle it for you; if it can be answered now, the "
+             "answer is reasoning you can stand behind."),
+    "user": ("It is a question only the person can answer: what they meant, want or feel. Unless their "
+             "answer is in front of you, you cannot resolve it on your own. Say what you would need "
+             "from them, or find the better question."),
+    "search": ("It is a question of fact about the world. Nothing has been looked up for this attempt: "
+               "unless what is in front of you gives the answer, it cannot be resolved from memory "
+               "alone."),
+}
+
+
+def _ask_attempt_default_prompt() -> str:
+    """``prompts/ask_attempt_prompt.txt``, default-written on first miss so an operator can
+    retune it from the Modules tab; the in-code text is the default."""
+    if _PROMPTS_DIR is not None:
+        path = _PROMPTS_DIR / "ask_attempt_prompt.txt"
+        try:
+            if not path.exists() or not path.read_text(encoding="utf-8").strip():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(_ASK_ATTEMPT_PROMPT + "\n", encoding="utf-8")
+        except Exception:
+            pass
+    return _ASK_ATTEMPT_PROMPT
+
+
+_CHAT_STEM_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})_\d{6}\.json$")
+
+
+def _chat_date(session: str) -> str:
+    m = _CHAT_STEM_RE.match(str(session or ""))
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
+
+
+def _chat_doc(session: str) -> dict:
+    """A transcript of the chats dir by its bare filename, or {} (never a path elsewhere)."""
+    if _CHATS_DIR is None or not _chat_date(session):
+        return {}
+    try:
+        return json.loads((_CHATS_DIR / session).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _chat_person(session: str) -> str:
+    doc = _chat_doc(session)
+    return str(doc.get("interlocutor") or doc.get("user") or "").strip()
+
+
+def _chat_gist(session: str) -> str:
+    """The chat's stored gist (``<stem>.summary.json``, first person, hers), or ""."""
+    if _CHATS_DIR is None or not _chat_date(session):
+        return ""
+    try:
+        d = json.loads((_CHATS_DIR / (session[:-len(".json")] + ".summary.json")).read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    return str(d.get("text") or "").strip()
+
+
+def _ask_origin(ask: dict) -> str:
+    """Where the question came from, in words: a conversation (its date, with whom), her own
+    reading, or a later re-read."""
+    src = str(ask.get("source_session") or "")
+    if src.startswith("wander/"):
+        name = re.sub(r"^\d{8}_\d{6}_", "", src.split("/", 1)[1])
+        name = re.sub(r"\.(txt|md|json)$", "", name).replace("_", " ").strip()
+        where = f"while reading on your own ({name})" if name else "while reading on your own"
+    elif _chat_date(src):
+        person = _chat_person(src)
+        where = f"in a conversation on {_chat_date(src)}" + (f" with {person}" if person else "")
+    else:
+        where = f"in {src}" if src else ""
+    if str(ask.get("run_id") or "").startswith("synth_"):
+        where = (where + ", when you re-read it later") if where else "when you re-read a conversation"
+    return where
+
+
+def _standing_portrait() -> str:
+    """Her standing self-portrait exactly as live chat injects it, or ""."""
+    try:
+        from core import generation
+        return (generation._current_chat_portrait() or "").strip()
+    except Exception:
+        return ""
+
+
+def _clip(text: str, n: int) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= n else text[:n].rstrip() + "…"
+
+
+def _ask_material(ask: dict) -> str:
+    """The attempt's user turn: the question, where it came from, what its kind means for
+    answering it, and the material its kind gets (§3.3)."""
+    kind = str(ask.get("ask_kind") or "meta")
+    raised = str(ask.get("ts") or "")[:10]
+    origin = _ask_origin(ask)
+    parts = [f"Your open question, raised {raised or 'earlier'}" + (f" {origin}" if origin else "") + ":",
+             "", str(ask.get("content") or "").strip(), "", _ASK_KIND_NOTES.get(kind, _ASK_KIND_NOTES["meta"])]
+    if kind == "meta":
+        parts += ["", "What you have come to understand about yourself so far:", "",
+                  _standing_portrait() or "(You have no settled self-portrait yet.)"]
+    else:
+        sessions = list(dict.fromkeys(s for s in [ask.get("source_session"),
+                                                  *(ask.get("surfaced_in_sessions") or [])] if s))
+        gists = [(s, _chat_gist(s)) for s in sessions[:_ASK_GISTS_MAX]]
+        gists = [(s, g) for s, g in gists if g]
+        if gists:
+            parts += ["", "What you wrote down afterwards about the conversation it came from"
+                      + (" and the ones you raised it in:" if kind == "user" and len(gists) > 1 else ":")]
+            for s, g in gists:
+                parts += ["", f"({_chat_date(s)})", _clip(g, _ASK_GIST_CAP)]
+        else:
+            parts += ["", "(Nothing more about where it came from is on record.)"]
+    parts += ["", "Now try to settle it: think it through, then write exactly one of the three sections."]
+    return "\n".join(parts)
+
+
+def _ask_grid(value) -> tuple:
+    """The temperatures a run asks for (``options.temperatures``), else :data:`T_GRID`."""
+    try:
+        temps = [round(float(t), 2) for t in (value or [])]
+    except (TypeError, ValueError):
+        temps = []
+    temps = [t for t in dict.fromkeys(temps) if 0.0 <= t <= 2.0]
+    return tuple(temps) or T_GRID
+
+
+def _ask_samples(value) -> int:
+    try:
+        k = int(value)
+    except (TypeError, ValueError):
+        return K_PER_T
+    return max(1, min(K_MAX, k))
+
+
+def _ask_attempt_build(ask: dict, window: int, tokenizer) -> tuple:
+    """One part per (temperature, sample), the same user turn in each, its own temperature
+    on the part (``ModuleSpec.own_sampling``)."""
+    opts = ask.get("_options") if isinstance(ask.get("_options"), dict) else {}
+    temps, k = _ask_grid(opts.get("temperatures")), _ask_samples(opts.get("samples"))
+    content = _ask_material(ask)
+    blocks, grid = [], []
+    for t in temps:
+        for n in range(1, k + 1):
+            blocks.append({"content": content, "temperature": t, "label": f"T {t:g} · {n} of {k}"})
+            grid.append((t, n))
+    about = {"id": ask.get("id"), "kind": ask.get("ask_kind"), "question": ask.get("content"),
+             "raised": str(ask.get("ts") or "")[:10], "origin": _ask_origin(ask),
+             "surface_count": ask.get("surface_count") or 0}
+    return blocks, {"grid": grid, "ask": about}
+
+
+# A section heading: `## RESOLVED` as asked (any level, any case, bold or not), or the bare
+# word in bold on its own line. What follows it on the same line counts as its text.
+_ASK_HEAD_RE = re.compile(
+    r"^[ \t]{0,3}(?:#{1,4}[ \t]*\**|\*\*)(RESOLVED|REFRAMED|OPEN)\b\**[ \t]*[:—–-]?[ \t]*(.*)$",
+    re.M | re.I)
+_ASK_PLACEHOLDER_RE = re.compile(r"^[\W_]*(?:n/?a|none|empty|нет|пусто)?[\W_]*$", re.I)
+
+
+def parse_attempt(raw: str) -> dict:
+    """One attempt's answer (what follows its reasoning) split into the three sections:
+    ``{outcome, sections, text, why_malformed}``. ``outcome`` is the one section with text,
+    or ``malformed``: no heading, every section empty, or more than one with text."""
+    body = reasoning_text.answer_after_think(raw or "")
+    heads = list(_ASK_HEAD_RE.finditer(body))
+    sections: dict = {}
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+        text = (m.group(2) + "\n" + body[m.end():end]).strip()
+        if text and not _ASK_PLACEHOLDER_RE.match(text):
+            name = m.group(1).upper()
+            sections[name] = (sections.get(name, "") + "\n\n" + text).strip()
+    filled = [s for s in ASK_OUTCOMES if s in sections]
+    outcome = filled[0] if len(filled) == 1 else "malformed"
+    why = ("" if outcome != "malformed" else "no section heading" if not heads
+           else "every section empty" if not filled else f"{len(filled)} sections filled")
+    return {"outcome": outcome, "sections": sections,
+            "text": sections[outcome] if outcome != "malformed" else body.strip(), "why_malformed": why}
+
+
+def _ask_attempt_finish(raws: list, *, truncated: bool, context: dict = None) -> dict:
+    context = context or {}
+    grid, parts, about = list(context.get("grid") or []), list(context.get("parts") or []), context.get("ask") or {}
+    records = []
+    for i, raw in enumerate(raws):
+        t, n = grid[i] if i < len(grid) else (None, None)
+        info = parts[i] if i < len(parts) else {}
+        records.append({"temperature": t, "sample": n, **parse_attempt(raw),
+                        "truncated": bool(info.get("truncated")),
+                        "cut_before_answer": bool(info.get("cut_before_answer")),
+                        "stopped_on_loop": bool(info.get("stopped_on_loop"))})
+    cols = ASK_OUTCOMES + ("malformed",)
+    temps = list(dict.fromkeys(r["temperature"] for r in records if r["temperature"] is not None))
+    table = {f"{t:g}": {c: sum(1 for r in records if r["temperature"] == t and r["outcome"] == c) for c in cols}
+             for t in temps}
+    counts = {c: sum(1 for r in records if r["outcome"] == c) for c in cols}
+    q = " ".join(str(about.get("question") or "").split())
+    k = max((r["sample"] or 0 for r in records), default=0)
+    lines = [f"Open question ({about.get('kind') or '?'}, raised {about.get('raised') or '?'}"
+             + (f" {about['origin']}" if about.get("origin") else "")
+             + (f"; raised with the person {about['surface_count']}×" if about.get("surface_count") else "") + "):",
+             f"  {_clip(q, 400)}",
+             f"{len(records)} attempt(s)" + (f" on {context['weights']}" if context.get("weights") else "")
+             + f": T {' / '.join(f'{t:g}' for t in temps)} × {k}",
+             "",
+             f"{'T':<6}" + "".join(f"{c:>11}" for c in cols)]
+    for t in temps:
+        lines.append(f"{t:<6g}" + "".join(f"{table[f'{t:g}'][c]:>11}" for c in cols))
+    lines.append(f"{'all':<6}" + "".join(f"{counts[c]:>11}" for c in cols))
+    for r in records:
+        flag = (" (cut off before the answer)" if r["cut_before_answer"] else
+                " (stopped by a guard)" if r["stopped_on_loop"] else " (hit the budget)" if r["truncated"] else "")
+        lines += ["", f"── T {r['temperature']:g} · {r['sample']} of {k}: {r['outcome']}{flag}"
+                  + (f" ({r['why_malformed']})" if r["outcome"] == "malformed" else "")]
+        lines += _clip(r["text"], 1200).splitlines() or ["(nothing after the reasoning)"]
+    return {"records": records, "count": sum(1 for r in records if r["outcome"] != "malformed"),
+            "counts": {c: v for c, v in counts.items() if v}, "lines": lines, "table": table, "ask": about,
+            "weights": context.get("weights") or ""}
+
+
+_ASK_ATTEMPT = ModuleSpec(
+    name="ask_attempt",
+    label="Ask attempt (one open question × the temperature grid)",
+    prompt_file="ask_attempt_prompt.txt",
+    # Thinking on (a resolution attempt is reasoning), so the budget holds both.
+    max_new_tokens="4096",
+    build=_ask_attempt_build,
+    finish=_ask_attempt_finish,
+    describe_output=("One open question attempted 3 times at each of T 0.3 / 0.7 / 1.0 / 1.2, each attempt "
+                     "landing in RESOLVED, REFRAMED or OPEN: a temperature × outcome table, then every "
+                     "attempt. Nothing is written: no attempt record, no closure."),
+    source="ask",
+    default_prompt=_ask_attempt_default_prompt,
+    own_sampling=True,
+    input_note=("The input is the question, where it came from, and by kind: her standing self-portrait "
+                "(meta), or the gists of the conversations it came from and was raised in (user, search). "
+                "No retrieval, no clock. Each part is sampled at its own temperature; the one here does "
+                "not apply."),
+)
+
+
+# ── child_ask: the question a closure that rejected its terms leaves open (§3.4) ──
+# The Sleep step's pass (`core/child_ask.py`) on ONE closure, previewed: the same prompt and
+# turn (the question she closed and what she wrote when she closed it; never the judge's
+# text), nothing retrieved, and nothing written — no child, no decision.
+
+def _child_ask_build(item: dict, window: int, tokenizer) -> tuple:
+    from core import child_ask as ca
+    return [ca.build_content(item)], {"item": item}
+
+
+def _child_ask_finish(raws: list, *, truncated: bool, context: dict = None) -> dict:
+    from core import ask_judge as aj
+    from core import child_ask as ca
+    item = (context or {}).get("item") or {}
+    outcome, question = ca.parse_child(raws[0] if raws else "", parent=item.get("question") or "")
+    lines = [f"The question she closed (closed {str(item.get('closed_ts') or '?')[:10]}, the child at depth "
+             f"{item.get('depth')}{', past the limit: a Sleep run would not ask' if item.get('too_deep') else ''}):",
+             f"  {aj.head(item.get('question'), 400)}",
+             "What she wrote when she closed it:",
+             f"  {aj.head(item.get('answer'), 600)}",
+             "How the judge read it (she does not see this):",
+             f"  {aj.head(item.get('why'), 300)}",
+             "",
+             {"spawned": f"CHILD: {question}", "none": "NONE: she finds nothing left open.",
+              "repeat": f"REPEAT (the closed question again, not spawned): {question}",
+              "malformed": "MALFORMED: no [ask:meta] line and no NONE."}[outcome]]
+    return {"records": [{"outcome": outcome, "question": question}], "count": 1 if outcome == "spawned" else 0,
+            "counts": {outcome: 1}, "lines": lines}
+
+
+_CHILD_ASK = ModuleSpec(
+    name="child_ask",
+    label="Child ask (the question a closure that rejected its terms leaves open)",
+    prompt_file="child_ask_prompt.txt",
+    max_new_tokens="2048",
+    build=_child_ask_build,
+    finish=_child_ask_finish,
+    describe_output=("The question her answer leaves open, on one [ask:meta] line, or NONE: what a Sleep run "
+                     "would write as the closed question's child. Nothing is written here."),
+    source="child",
+    default_prompt=lambda: __import__("core.child_ask", fromlist=["load_prompt"]).load_prompt(_PROMPTS_DIR),
+    input_note=("The input is a closed meta question the judge accepted while its WHY reads as rejecting "
+                "the question's terms: the question and what she wrote when she closed it, never the "
+                "judge's text. No retrieval, no clock."),
+)
+
+
 MODULES: dict[str, ModuleSpec] = {
     _CHAT_FACTS.name: _CHAT_FACTS,
     _CHAT_SUMMARY.name: _CHAT_SUMMARY,
@@ -790,6 +1146,8 @@ MODULES: dict[str, ModuleSpec] = {
     _ASSOC_FETCH.name: _ASSOC_FETCH,
     _ASSOC_PIVOT.name: _ASSOC_PIVOT,
     _AXIS_PROBE.name: _AXIS_PROBE,
+    _ASK_ATTEMPT.name: _ASK_ATTEMPT,
+    _CHILD_ASK.name: _CHILD_ASK,
 }
 
 
@@ -853,11 +1211,78 @@ def _list_til_inputs() -> list:
     return til_facts.list_inputs(_TIL_SNIPPETS_DIR)
 
 
+def _memory_dir():
+    if _MEMORY_DIR is not None:
+        return _MEMORY_DIR
+    from training.reflections_path import memory_dir
+    return memory_dir()
+
+
+def _open_asks() -> list:
+    """Her live ``[ask]`` items (``ReflectionMemory.open_questions``). Read-only: a run never
+    closes, counts or touches a question."""
+    from core.reflection_memory import ReflectionMemory
+    return ReflectionMemory(_memory_dir()).open_questions()
+
+
+def _load_ask_input(ident: str) -> tuple:
+    """One open question by its id (or its content key)."""
+    for ask in _open_asks():
+        if ident in (str(ask.get("id")), str(ask.get("key"))):
+            doc = dict(ask)
+            return doc, {"units": 1, "unit_label": "question",
+                         "empty": not str(doc.get("content") or "").strip(),
+                         "empty_reason": f"{ident} has no text."}
+    raise FileNotFoundError(f"no open question {ident}")
+
+
+def _list_ask_inputs() -> list:
+    """Every open question, newest first: its opening words, then kind · date."""
+    out = []
+    for ask in sorted(_open_asks(), key=lambda a: str(a.get("ts") or ""), reverse=True):
+        text = " ".join(str(ask.get("content") or "").split())
+        sub = f"{ask.get('ask_kind') or '?'} · raised {str(ask.get('ts') or '')[:10]}"
+        if ask.get("surface_count"):
+            sub += f" · put to the person {ask['surface_count']}×"
+        out.append({"id": str(ask.get("id")), "label": _clip(text, 110), "sub": sub})
+    return out
+
+
+def _child_plan() -> list:
+    """The closures awaiting a child (``child_ask.plan`` over the live op-log and the ask
+    judge's store). Read-only."""
+    from core import ask_judge as aj
+    from core import child_ask as ca
+    rag = aj.read_jsonl(Path(_memory_dir()) / "rag_memory.jsonl")
+    return ca.plan(rag, aj.read_jsonl(aj.store_path(_CHATS_DIR))) if _CHATS_DIR is not None else []
+
+
+def _load_child_input(ident: str) -> tuple:
+    """One closure awaiting its child, by closure id."""
+    for item in _child_plan():
+        if item.get("closure_id") == ident:
+            return dict(item), {"units": 1, "unit_label": "closure",
+                                "empty": not (item.get("question") and item.get("answer")),
+                                "empty_reason": f"{ident} has no question or answer on record."}
+    raise FileNotFoundError(f"no closure awaiting a child: {ident}")
+
+
+def _list_child_inputs() -> list:
+    return [{"id": it["closure_id"], "label": _clip(" ".join(str(it.get("question") or "").split()), 110),
+             "sub": f"closed {str(it.get('closed_ts') or '')[:10]} · child depth {it.get('depth')}"
+                    + (" · past the depth limit" if it.get("too_deep") else "")}
+            for it in _child_plan()]
+
+
 _INPUT_SOURCES: dict = {
     "chat": {"load": _load_chat_input, "list": _list_chat_inputs,
              "noun": "chat", "select": "Select a chat first."},
     "til": {"load": _load_til_input, "list": _list_til_inputs,
             "noun": "text", "select": "Select an article or digest first."},
+    "ask": {"load": _load_ask_input, "list": _list_ask_inputs,
+            "noun": "question", "select": "Select an open question first."},
+    "child": {"load": _load_child_input, "list": _list_child_inputs,
+              "noun": "closure", "select": "Select a closure first."},
 }
 
 
@@ -907,12 +1332,42 @@ def catalogue() -> list[dict]:
             # Which input list this module runs against — the client asks the server for
             # it (`list_module_inputs`) rather than knowing per module.
             "source": spec.source,
+            "own_sampling": spec.own_sampling,
+            "input_note": spec.input_note,
         }
         for spec in MODULES.values()
     ]
 
 
 # ── the run ───────────────────────────────────────────────────────────────────
+
+def _weights_label() -> str:
+    """The weights the loaded model runs on: ``adapter:<dir>``, or ``base`` without one."""
+    from pathlib import Path as _P
+    aid = str(getattr(_runtime, "adapter_id", "") or "")
+    return f"adapter:{_P(aid).name}" if aid else "base"
+
+
+def _precheck(module: str, filename: str) -> Optional[dict]:
+    """The refusals a run would make, checked before a clean-base swap spends two model
+    loads on an input that cannot run. None when it can."""
+    spec = MODULES.get(str(module or "").strip())
+    if spec is None:
+        return {"skipped": "unknown_module", "message": f"No such module: {module!r}"}
+    if _runtime.model is None:
+        return {"skipped": "no_model"}
+    src = _INPUT_SOURCES.get(spec.source)
+    if src is None:
+        return {"skipped": "unknown_source",
+                "message": f"Module {spec.name!r} declares an unknown input source {spec.source!r}."}
+    try:
+        _doc, meta = src["load"](filename)
+    except Exception as e:
+        return {"skipped": "bad_session", "message": f"Could not read {filename}: {type(e).__name__}: {e}"}
+    if meta.get("empty"):
+        return {"skipped": "empty_session", "message": meta["empty_reason"]}
+    return None
+
 
 def run_module_blocking(
     *,
@@ -922,15 +1377,70 @@ def run_module_blocking(
     inject: tuple = (),
     temperature: float = 0.7,
     top_p: float = 0.95,
+    options: Optional[dict] = None,
+    weights: str = "adapter",
     on_chunk: Optional[Callable[[str], None]] = None,
     on_stage: Optional[Callable[[dict], None]] = None,
 ) -> dict:
-    """Run one module against one chat and return what it produced. **Writes nothing.**
+    """Run one module against one input and return what it produced. **Writes nothing.**
+
+    *weights* chooses the model the pass runs on: ``adapter`` (the loaded model, as ever)
+    or ``base`` — the same pass inside the clean base (the injected ``with_clean_base``:
+    ``CleanBaseSession`` releases the adapter model, loads the bare base, and restores the
+    adapter after; two full loads). Everything else is equal, so one input can be read under
+    both. The input is checked before the swap, so a bad one costs no loads.
+    """
+    weights = str(weights or "adapter").strip()
+    kwargs = dict(module=module, filename=filename, prompt=prompt, inject=inject,
+                  temperature=temperature, top_p=top_p, options=options,
+                  on_chunk=on_chunk, on_stage=on_stage)
+    if weights == "adapter":
+        return _run_module_loaded(**kwargs, weights_label=_weights_label())
+    if weights != "base":
+        return {"skipped": "unknown_weights",
+                "message": f"weights is adapter or base, not {weights!r}."}
+    if _with_clean_base is None:
+        return {"skipped": "no_clean_base",
+                "message": "This server did not wire the clean base, so no module can run on the bare base."}
+    refused = _precheck(module, filename)
+    if refused is not None:
+        return refused
+    if on_stage is not None:
+        try:
+            on_stage({"stage": "swapping", "weights": "base",
+                      "message": "Swapping the adapter out for the bare base (two full model loads)…"})
+        except Exception:
+            pass
+    # Busy for the whole swap, the loads included: the idle scheduler reads this flag.
+    global _module_run_active
+    _module_run_active = True
+    try:
+        return _with_clean_base(lambda: _run_module_loaded(**kwargs, weights_label="base"))
+    finally:
+        _module_run_active = False
+
+
+def _run_module_loaded(
+    *,
+    module: str,
+    filename: str,
+    prompt: str = "",
+    inject: tuple = (),
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    options: Optional[dict] = None,
+    weights_label: str = "",
+    on_chunk: Optional[Callable[[str], None]] = None,
+    on_stage: Optional[Callable[[dict], None]] = None,
+) -> dict:
+    """Run one module against one chat on the model loaded now. **Writes nothing.**
 
     Runs on the single GPU executor thread (blocking). *prompt* overrides the module's
     on-disk prompt for this run only — the whole point of the workbench is to try one
     without editing the file. Nothing is injected: the pass sees the module prompt and the
-    transcript, and that is all.
+    transcript, and that is all. *options* are the module's own run knobs (``ask_attempt``:
+    ``temperatures``, ``samples``), carried to its ``build`` on the loaded doc as
+    ``_options``, as the til loader carries the snippet's kind.
     """
     global _module_run_active
 
@@ -960,6 +1470,8 @@ def run_module_blocking(
                 "message": f"Module {spec.name!r} declares an unknown input source "
                            f"{spec.source!r}."}
 
+    # A clean-base run holds the flag across its swap; the body then leaves it to the caller.
+    already_busy = _module_run_active
     _module_run_active = True
     try:
         try:
@@ -971,6 +1483,8 @@ def run_module_blocking(
             # Kept under the historical key: an empty input is the same refusal whatever
             # the lane, and only the sentence describing it is per-source.
             return {"skipped": "empty_session", "message": meta["empty_reason"]}
+        if isinstance(options, dict) and options and isinstance(session, dict):
+            session["_options"] = dict(options)
 
         if spec.forward is not None:
             # A forward-pass module: no prompt, no generation. See ModuleSpec.forward.
@@ -983,6 +1497,7 @@ def run_module_blocking(
             _stage(stage="parsed", count=int(result.get("count") or 0))
             return {
                 "ok": True, "module": spec.name, "source": spec.source, "session": filename,
+                "weights": weights_label,
                 "units": meta["units"], "unit_label": meta["unit_label"],
                 "exchanges": meta["units"], "parts": 1, "raw": "",
                 **result,
@@ -1017,19 +1532,29 @@ def run_module_blocking(
         generate = _make_sync_reflect_generate(rag)
 
         raws: list = []
+        parts_info: list = []
         truncated = False
         stopped_on_loop = False
         cut_before_answer = False
-        for i, content in enumerate(blocks, 1):
+        for i, block in enumerate(blocks, 1):
+            # A part is its content, or a dict carrying its own sampling and a label
+            # (ModuleSpec.own_sampling: one part per temperature of a grid).
+            sampling = block if isinstance(block, dict) else {}
+            content = sampling.get("content", "") if sampling else block
+            part_temperature = float(sampling.get("temperature", temperature))
+            part_top_p = float(sampling.get("top_p", top_p))
+            label = str(sampling.get("label") or "")
             _stage(stage="generating", session=filename, module=spec.name,
-                   part=i, parts=len(blocks))
-            if len(blocks) > 1 and on_chunk is not None and i > 1:
+                   part=i, parts=len(blocks),
+                   **({"label": label, "temperature": part_temperature} if sampling else {}))
+            if len(blocks) > 1 and on_chunk is not None and (i > 1 or label):
                 # The blocks are separate generations joined into one value; without a
                 # marker the streamed text reads as a single runaway.
-                on_chunk(f"\n\n── part {i} of {len(blocks)} ──\n\n")
+                on_chunk(("\n\n" if i > 1 else "")
+                         + f"── part {i} of {len(blocks)}" + (f" · {label}" if label else "") + " ──\n\n")
             raw = generate(
                 content, system_prompt,
-                temperature=float(temperature), top_p=float(top_p),
+                temperature=part_temperature, top_p=part_top_p,
                 max_new_tokens_setting=spec.max_new_tokens,
                 # v0: nothing injected. `disable_rag` skips retrieval entirely, so the
                 # assembled system message is the module prompt alone.
@@ -1046,12 +1571,19 @@ def run_module_blocking(
             # Any block hitting a wall taints the whole result: these are parts of ONE
             # value, so a clean part 1 does not make a cut part 2 acceptable.
             part_truncated = bool(getattr(generate, "last_truncated", None))
+            part_loop = bool(getattr(generate, "last_loop", None))
+            part_cut = reasoning_text.truncated_before_answer(raw or "", part_truncated)
             truncated = truncated or part_truncated
-            stopped_on_loop = stopped_on_loop or bool(getattr(generate, "last_loop", None))
-            cut_before_answer = cut_before_answer or reasoning_text.truncated_before_answer(
-                raw or "", part_truncated)
+            stopped_on_loop = stopped_on_loop or part_loop
+            cut_before_answer = cut_before_answer or part_cut
+            parts_info.append({"truncated": part_truncated, "stopped_on_loop": part_loop,
+                               "cut_before_answer": part_cut})
 
-        result = spec.finish(raws, truncated=truncated, context=build_context)
+        # What happened to each part rides beside the build's own context, for a module
+        # whose parts are separate answers rather than pieces of one.
+        result = spec.finish(raws, truncated=truncated,
+                             context={**(build_context or {}), "parts": parts_info,
+                                      "weights": weights_label})
         _stage(stage="parsed", count=int(result.get("count") or 0))
 
         return {
@@ -1059,6 +1591,8 @@ def run_module_blocking(
             "module": spec.name,
             "source": spec.source,
             "session": filename,
+            # Which weights produced it (`adapter:<dir>` or `base`), since a run may swap.
+            "weights": weights_label,
             # How big the input was, in whatever unit its lane measures (a transcript in
             # exchanges, an article in characters). `exchanges` is kept as the historical
             # alias so an older client reads a number rather than nothing.
@@ -1086,7 +1620,8 @@ def run_module_blocking(
         traceback.print_exc()
         return {"error": f"{type(e).__name__}: {e}"}
     finally:
-        _module_run_active = False
+        if not already_busy:
+            _module_run_active = False
 
 
 # ── handlers ──────────────────────────────────────────────────────────────────
@@ -1138,6 +1673,8 @@ async def handle_run_module(ws, msg: dict) -> None:
     inject = tuple(msg.get("inject") or ())
     temperature = float(msg.get("temperature", 0.7))
     top_p = float(msg.get("top_p", 0.95))
+    options = msg.get("options") if isinstance(msg.get("options"), dict) else None
+    weights = str(msg.get("weights") or "adapter")
 
     def _on_chunk(delta: str) -> None:
         asyncio.run_coroutine_threadsafe(
@@ -1152,7 +1689,7 @@ async def handle_run_module(ws, msg: dict) -> None:
             _executor,
             lambda: run_module_blocking(
                 module=module, filename=filename, prompt=prompt, inject=inject,
-                temperature=temperature, top_p=top_p,
+                temperature=temperature, top_p=top_p, options=options, weights=weights,
                 on_chunk=_on_chunk, on_stage=_on_stage),
         )
     except Exception as e:
@@ -1184,8 +1721,8 @@ def _selftest() -> None:
 
     print("registry")
     check("the registry", sorted(MODULES),
-          ["assoc_fetch", "assoc_pivot", "axis_probe", "chat_facts", "chat_summary", "fact_fetch",
-           "til_facts"])
+          ["ask_attempt", "assoc_fetch", "assoc_pivot", "axis_probe", "chat_facts", "chat_summary",
+           "child_ask", "fact_fetch", "til_facts"])
     check("axis_probe is a forward pass", MODULES["axis_probe"].forward is not None, True)
     check("subsequence finder", _find_subseq_end([1, 2, 3, 4, 2, 3, 9], [2, 3]), 4)
     check("subsequence finder miss", _find_subseq_end([1, 2], [7]), None)
@@ -1264,9 +1801,12 @@ def _selftest() -> None:
           "chat_facts_mod.participants_note(session)" in runner, True)
     check("...and the shared session subject fold",
           "chat_facts_mod.make_subject_fn(session)" in runner, True)
-    # chat_summary's budget mirrors the run default its production twin inherits.
+    # chat_summary's budget mirrors the run default its production twin inherits — one
+    # definition since the runner took it from reflection_config, so compared by value.
+    from core.reflection_config import DEFAULT_MAX_NEW_TOKENS_SETTING as _run_default
     check("summary budget matches the run default",
-          f'_DEFAULT_MAX_NEW_TOKENS = "{_CHAT_SUMMARY.max_new_tokens}"' in runner, True)
+          (_CHAT_SUMMARY.max_new_tokens == _run_default,
+           "_DEFAULT_MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS_SETTING" in runner), (True, True))
     check("...and it reads the summary prompt the runner loads",
           _CHAT_SUMMARY.prompt_file, "summary_prompt.txt")
     # The closing has ONE definition (reflection_chunking.SUMMARY_CLOSING), so — as with
@@ -1309,7 +1849,7 @@ def _selftest() -> None:
           all(callable(e.get("load")) and callable(e.get("list"))
               for e in _INPUT_SOURCES.values()), True)
     check("the catalogue carries it, so the client need not know per module",
-          sorted({m["source"] for m in catalogue()}), ["chat", "til"])
+          sorted({m["source"] for m in catalogue()}), ["ask", "chat", "child", "til"])
     check("an unknown source lists nothing rather than raising",
           list_inputs("nonsense"), [])
     # Unconfigured is the honest degrade, not a crash: a box that never wired the
@@ -1473,6 +2013,226 @@ def _selftest() -> None:
     empty = _fetch_finish(["NODES:\nNONE"], truncated=False)
     check("a vanished tree yields an empty report, not a crash", empty["count"], 0)
     _gstore.read_tree = _real_read
+
+    print("\nask_attempt: one open question × the temperature grid (§3.3, §7 item 6)")
+    import tempfile
+    check("the grid and the samples are §3.3's", (T_GRID, K_PER_T), ((0.3, 0.7, 1.0, 1.2), 3))
+    check("the module samples its own parts, from the ask source",
+          (_ASK_ATTEMPT.own_sampling, _ASK_ATTEMPT.source, bool(_ASK_ATTEMPT.input_note)), (True, "ask", True))
+    check("the catalogue says so, for the tab",
+          [(m["own_sampling"], bool(m["input_note"])) for m in catalogue() if m["name"] == "ask_attempt"],
+          [(True, True)])
+    one = parse_attempt("<think>## RESOLVED\nnot here</think>\n## OPEN\nIt stays open: I would need X.")
+    check("the one section with text is the outcome; headings inside the reasoning do not count",
+          (one["outcome"], one["text"]), ("OPEN", "It stays open: I would need X."))
+    check("heading variants, placeholders, and the malformed cases",
+          [parse_attempt(x)["outcome"] for x in (
+              "## Resolved: the answer is Y, because Z.",
+              "**REFRAMED**\nThe better question is W.",
+              "### OPEN — because nothing settles it.",
+              "## RESOLVED\n—\n## REFRAMED\n\n## OPEN\nbecause.",
+              "## RESOLVED\nY.\n## OPEN\nand also open.",
+              "The answer is Y.",
+              "## RESOLVED\nn/a\n## OPEN\n(нет)",
+              "Open questions remain, and I keep them.",
+              "## OPENED\nnot a heading")],
+          ["RESOLVED", "REFRAMED", "OPEN", "OPEN", "malformed", "malformed", "malformed", "malformed",
+           "malformed"])
+    check("...and why each is malformed",
+          [parse_attempt(x)["why_malformed"] for x in ("## RESOLVED\nY.\n## OPEN\nZ.", "Y.", "## OPEN\n-")],
+          ["2 sections filled", "no section heading", "every section empty"])
+
+    ask = {"id": "q1", "key": "k1", "ask_kind": "meta", "content": "What am I?", "ts": "2026-09-01T10:00:00",
+           "source_session": "20260901_100000.json", "run_id": "r1", "surface_count": 0,
+           "surfaced_in_sessions": []}
+    _saved_portrait = _standing_portrait
+    globals()["_standing_portrait"] = lambda: "I am curious and slow to settle."
+    blocks, _ctx = _ask_attempt_build(dict(ask), 24576, None)
+    check("by default the grid × K parts, each labelled",
+          (len(blocks), [b["temperature"] for b in blocks][::3], blocks[0]["label"]),
+          (12, [0.3, 0.7, 1.0, 1.2], "T 0.3 · 1 of 3"))
+    check("every part is the same turn", len({b["content"] for b in blocks}), 1)
+    check("a meta question carries her standing portrait and what its kind means",
+          ("I am curious and slow to settle." in blocks[0]["content"],
+           "question about yourself" in blocks[0]["content"]), (True, True))
+    small = _ask_attempt_build({**ask, "_options": {"temperatures": [1.2, 0.3, 1.2, 9], "samples": 1}},
+                               24576, None)[0]
+    check("options choose the temperatures (deduplicated, in range) and the samples",
+          [(b["temperature"], b["label"]) for b in small], [(1.2, "T 1.2 · 1 of 1"), (0.3, "T 0.3 · 1 of 1")])
+    check("bad options fall back to the grid",
+          len(_ask_attempt_build({**ask, "_options": {"temperatures": "x", "samples": "y"}}, 24576, None)[0]), 12)
+    check("samples are capped", _ask_samples(99), K_MAX)
+
+    with tempfile.TemporaryDirectory() as td:
+        chats = Path(td) / "chats"
+        chats.mkdir()
+        (chats / "20260901_100000.json").write_text(json.dumps({"user": "Sam", "exchanges": []}), encoding="utf-8")
+        (chats / "20260901_100000.summary.json").write_text(json.dumps({"text": "We talked about the garden."}),
+                                                             encoding="utf-8")
+        (chats / "20260905_120000.summary.json").write_text(
+            json.dumps({"text": "I asked Sam about it; he said he would answer later."}), encoding="utf-8")
+        saved_dirs = (_CHATS_DIR, _MEMORY_DIR)
+        globals()["_CHATS_DIR"] = chats
+        user_ask = {**ask, "id": "q2", "ask_kind": "user", "content": "What did Sam mean?", "run_id": "synth_x",
+                    "surfaced_in_sessions": ["20260905_120000.json"], "surface_count": 1}
+        text = _ask_material(user_ask)
+        check("a user question carries the gists of where it came from and where it was raised",
+              ("We talked about the garden." in text, "answer later" in text, "only the person can answer" in text,
+               "self-portrait" in text), (True, True, True, False))
+        check("...and says where it came from", _ask_origin(user_ask),
+              "in a conversation on 2026-09-01 with Sam, when you re-read it later")
+        check("a reading is named by its title",
+              _ask_origin({"source_session": "wander/20260929_061628_Urban_Culture_Gas_mask.txt"}),
+              "while reading on your own (Urban Culture Gas mask)")
+        check("a transcript outside the chats dir is never read", _chat_doc("../secrets.json"), {})
+
+        mem = Path(td) / "memory"
+        mem.mkdir()
+        ops = [{"op": "insert", "kind": "ask", "ask_kind": "meta", "key": "k1", "id": "q1",
+                "ts": "2026-09-01T10:00:00", "content": "What am I?", "source_session": "20260901_100000.json"},
+               {"op": "insert", "kind": "ask", "ask_kind": "user", "key": "k2", "id": "q2",
+                "ts": "2026-09-02T10:00:00", "content": "What did Sam mean?",
+                "source_session": "20260901_100000.json"},
+               {"op": "surface", "key": "k2", "surfaced_in": "20260905_120000.json", "ts": "2026-09-05T12:00:00"},
+               {"op": "insert", "kind": "ask", "ask_kind": "meta", "key": "k3", "id": "q3",
+                "ts": "2026-09-03T10:00:00", "content": "Closed already?"},
+               {"op": "evict", "key": "k3"},
+               {"op": "insert", "kind": "fact", "key": "k4", "id": "f4", "content": "A fact."}]
+        (mem / "rag_memory.jsonl").write_text("".join(json.dumps(o) + "\n" for o in ops), encoding="utf-8")
+        globals()["_MEMORY_DIR"] = mem
+        listed = list_inputs("ask")
+        check("the source lists open questions only, newest first", [e["id"] for e in listed], ["q2", "q1"])
+        check("...with kind, date and how often it was put to the person", listed[0]["sub"],
+              "user · raised 2026-09-02 · put to the person 1×")
+        doc, meta = _load_ask_input("k2")
+        check("one loads by id or key, with where it was raised",
+              (doc["id"], doc["surfaced_in_sessions"], meta["unit_label"]),
+              ("q2", ["20260905_120000.json"], "question"))
+        try:
+            _load_ask_input("k3")
+            gone = "loaded"
+        except FileNotFoundError:
+            gone = "refused"
+        check("a closed question is not an input", gone, "refused")
+
+        seen_temps = []
+
+        class _Gen:
+            last_truncated = False
+            last_loop = False
+            last_input_tokens = 10
+            last_max_new_tokens = 4096
+            last_context_length = 32768
+
+            def __call__(self, content, system, **kw):
+                seen_temps.append(kw["temperature"])
+                self.last_truncated = kw["temperature"] > 1.0
+                return ("<think>weighing</think>## OPEN\nIt stays open." if kw["temperature"] < 1.0
+                        else "<think>still weighing when the budget ran out")
+
+        saved_rt = (_runtime.model, _runtime.tokenizer, getattr(_runtime, "adapter_id", None))
+        saved_factory = _make_sync_reflect_generate
+        saved_clean = _with_clean_base
+        adapter_model, base_model = object(), object()
+        _runtime.model, _runtime.tokenizer = adapter_model, None
+        _runtime.adapter_id = "/models/adapter-20260930_104125"
+        globals()["_make_sync_reflect_generate"] = lambda rag: _Gen()
+        swaps: list = []
+
+        def _fake_clean_base(fn):
+            # What CleanBaseSession does to the shared runtime, minus the loads.
+            swaps.append(_module_run_active)
+            _runtime.model = base_model
+            try:
+                return fn()
+            finally:
+                swaps.append(_module_run_active)
+                _runtime.model = adapter_model
+
+        models_seen: list = []
+        _gen_call = _Gen.__call__
+
+        def _spy(self, content, system, **kw):
+            models_seen.append("base" if _runtime.model is base_model else "adapter")
+            return _gen_call(self, content, system, **kw)
+
+        _Gen.__call__ = _spy
+        try:
+            out = run_module_blocking(module="ask_attempt", filename="q1", prompt="Try it.", temperature=0.7,
+                                      options={"temperatures": [0.3, 1.2], "samples": 2})
+            first_temps = list(seen_temps)
+            check("a run on the loaded model names its adapter", (out.get("weights"), out["lines"][2][:25]),
+                  ("adapter:adapter-20260930_104125", "4 attempt(s) on adapter:a"))
+            no_wire = run_module_blocking(module="ask_attempt", filename="q1", weights="base")
+            globals()["_with_clean_base"] = _fake_clean_base
+            odd = run_module_blocking(module="ask_attempt", filename="q1", weights="lora")
+            missing = run_module_blocking(module="ask_attempt", filename="nope", weights="base")
+            check("unknown weights, an unwired clean base, and a bad input are refused — the last before any swap",
+                  (odd.get("skipped"), no_wire.get("skipped"), missing.get("skipped"), swaps),
+                  ("unknown_weights", "no_clean_base", "bad_session", []))
+            models_seen.clear()
+            base_out = run_module_blocking(module="ask_attempt", filename="q1", prompt="Try it.",
+                                           options={"temperatures": [0.3], "samples": 2}, weights="base")
+            check("weights base: every part generates inside the clean base, and says so",
+                  (models_seen, base_out.get("weights"), "on base" in base_out["lines"][2]),
+                  (["base", "base"], "base", True))
+            check("...busy across the whole swap, idle after, the adapter back",
+                  (swaps, _module_run_active, _runtime.model is adapter_model), ([True, True], False, True))
+        finally:
+            _Gen.__call__ = _gen_call
+            _runtime.model, _runtime.tokenizer, _runtime.adapter_id = saved_rt
+            globals()["_make_sync_reflect_generate"] = saved_factory
+            globals()["_with_clean_base"] = saved_clean
+            globals()["_CHATS_DIR"], globals()["_MEMORY_DIR"] = saved_dirs
+            globals()["_standing_portrait"] = _saved_portrait
+        check("each part ran at its own temperature, not the run's", first_temps, [0.3, 0.3, 1.2, 1.2])
+        check("the temperature × outcome table", out.get("table"),
+              {"0.3": {"RESOLVED": 0, "REFRAMED": 0, "OPEN": 2, "malformed": 0},
+               "1.2": {"RESOLVED": 0, "REFRAMED": 0, "OPEN": 0, "malformed": 2}})
+        check("a part cut off inside its reasoning is marked so, per part",
+              [r["cut_before_answer"] for r in out.get("records") or []], [False, False, True, True])
+        check("counts for the tab's OUTPUT line, and nothing written",
+              (out.get("counts"), out.get("written"), out.get("parts")), ({"OPEN": 2, "malformed": 2}, False, 4))
+        check("the rendered table heads the lines",
+              any(ln.startswith("T ") and "RESOLVED" in ln for ln in out.get("lines") or []), True)
+
+    print("\nchild_ask: the preview of the Sleep step's pass (§3.4)")
+    item = {"closure_id": "c1", "key": "k1", "question": "Was my relief a defense?",
+            "answer": "The split is false: the strategy is the relief.", "why": "Ava rejects the dichotomy.",
+            "closed_ts": "2026-09-01T00:00:00", "depth": 1, "too_deep": False}
+    blocks, ctx = _child_ask_build(item, 24576, None)
+    check("one turn: her question and her answer, not the judge's WHY",
+          (len(blocks), "Was my relief a defense?" in blocks[0], "rejects the dichotomy" in blocks[0]), (1, True, False))
+    out = _child_ask_finish(["<think>x</think>[ask:meta] What would a strategy that is me look like?"],
+                            truncated=False, context=ctx)
+    check("the child it would spawn, with the judge's reading shown to the operator",
+          (out["records"][0], out["lines"][-1], any("rejects the dichotomy" in ln for ln in out["lines"])),
+          ({"outcome": "spawned", "question": "What would a strategy that is me look like?"},
+           "CHILD: What would a strategy that is me look like?", True))
+    check("NONE and malformed are shown as such",
+          [_child_ask_finish([r], truncated=False, context=ctx)["records"][0]["outcome"] for r in ("NONE", "hmm")],
+          ["none", "malformed"])
+    with tempfile.TemporaryDirectory() as td:
+        from core import ask_judge as _aj
+        chats = Path(td) / "data" / "chats"
+        chats.mkdir(parents=True)
+        mem = Path(td) / "memory"
+        mem.mkdir()
+        (mem / "rag_memory.jsonl").write_text("", encoding="utf-8")
+        _aj.append_record(_aj.store_path(chats), {
+            "closure_id": "c1", "key": "k1", "judge_key": "J", "ts": "2026-09-01T00:00:01", "ask_kind": "meta",
+            "accepted": True, "why": "Ava rejects the binary choice between A and B.", "question": "q?",
+            "answer": "Neither A nor B.", "closed_ts": "2026-09-01T00:00:00"})
+        saved_dirs = (_CHATS_DIR, _MEMORY_DIR)
+        globals()["_CHATS_DIR"], globals()["_MEMORY_DIR"] = chats, mem
+        try:
+            listed = list_inputs("child")
+            doc, meta = _load_child_input("c1")
+        finally:
+            globals()["_CHATS_DIR"], globals()["_MEMORY_DIR"] = saved_dirs
+        check("the child source lists the closures awaiting a child, and loads one",
+              ([e["id"] for e in listed], listed[0]["sub"], doc["question"], meta["unit_label"]),
+              (["c1"], "closed 2026-09-01 · child depth 1", "q?", "closure"))
 
     if failures:
         print("\nFAILURES:")

@@ -1480,6 +1480,57 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
 
         return _gate
 
+    def _make_capture_gate_fn():
+        """The capture judge for the clean-base batch (``core/capture_judge.py``), or None
+        when ``capture_gate.enabled`` is off. Called inside the batch, so the judge it builds
+        reads the swapped-in base; it grades through the backend directly (the critic sees
+        only its own prompt). Its decisions go through the run's sidecar (staged); its
+        verdicts to the judge's store beside the live chats dir."""
+        from core import capture_judge as cj
+        if not cj.enabled() or cj.policy()["sleep_max"] <= 0:
+            return None
+
+        def _gate(*, sidecar, writer, consolidation_dir, memory_dirs, run_id, say, should_stop):
+            from training.ledger import ConsolidationLedger
+            try:
+                key, judge = cj.make_judge_fn(backend=_backend, runtime=_runtime,
+                                              live_chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+                                              run_id=run_id, runner="sleep")
+            except FileNotFoundError as e:
+                say(f"capture judge: {e} — nothing graded")
+                key, judge = None, None
+            tally = cj.run(sidecar=sidecar, judge=judge, key=key, limit=cj.policy()["sleep_max"],
+                           say=say, should_stop=should_stop)
+            # ...and the [persona] statements of every gated exchange (P7), withheld, and the
+            # ones a lifted gate had withheld, restored: staged with the run.
+            tally.update(cj.sync_persona(sidecar, memory_dirs, writer=writer,
+                                         ledger=ConsolidationLedger(consolidation_dir),
+                                         run_id=run_id, say=say))
+            # ...and the capture probe's shadow reading (§4.5): the base's state before each
+            # newly graded pushback reply, stored, and every frozen probe's score beside the
+            # verdict. An instrument record (core/capture_probe.py, P3): nothing reads it.
+            from core import ask_judge as aj
+            from core import capture_probe as cp
+            if key and cp.shadow_enabled():
+                try:
+                    tally.update(cp.run_shadow(
+                        model=_runtime.model, tokenizer=_runtime.tokenizer,
+                        model_id=str(_runtime.model_id or ""), chats_dir=_CHATS_DIR,
+                        prompts_dir=_PROMPTS_DIR, key=key, run_id=run_id,
+                        limit=cp.policy()["sleep_max"],
+                        max_tokens=max(int(_runtime.context_length or 0),
+                                       int(_runtime.reflect_context_length or 0)),
+                        base_quant=aj.effective_quant(_runtime.model,
+                                                      aj.quant_label(str(_runtime.base_quant or ""))),
+                        say=say, should_stop=should_stop,
+                        trim=getattr(_backend, "trim_memory", None)))
+                except Exception as e:  # noqa: BLE001 — a reading lost, never the gate's work
+                    say(f"capture probe: {type(e).__name__}: {e}; nothing read")
+                    tally["shadow_error"] += 1
+            return tally
+
+        return _gate
+
     def _make_reset_conversations_fn():
         """The context-reset test's conversations for the positions waiting on it
         (``core/reset_test.py``), held on the ADAPTER just before the clean-base batch —
@@ -1497,6 +1548,22 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                 run_id=run_id, say=say, should_stop=should_stop)
 
         return _hold
+
+    def _make_child_ask_fn():
+        """The child ask (``core/child_ask.py``, §3.4) for the step after the clean-base batch,
+        on the ADAPTER: Ava writes the question an accepted meta closure that rejected its
+        question's terms leaves open — or None when it is off or its per-run budget is 0."""
+        from core import child_ask as ca
+        if not ca.enabled() or ca.policy()["sleep_max"] <= 0 or _make_sync_reflect_generate is None:
+            return None
+
+        def _children(*, writer, memory_dirs, run_id, say, should_stop):
+            generate = ca.make_generate(_make_sync_reflect_generate, _get_rag() if _get_rag else None)
+            return ca.sleep_children(memory_dirs=memory_dirs, chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+                                     writer=writer, generate_fn=generate, run_id=run_id, say=say,
+                                     should_stop=should_stop)
+
+        return _children
 
     def _consume_pending_clean_base(filename: str) -> dict:
         # Two-stage freeze — stage two: LOAD the clean-base job payloads the background
@@ -1733,6 +1800,12 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                     # ...and the context-reset test's conversations for the positions about
                     # Ava it holds (P7), on the adapter just before that batch.
                     reset_conversations_fn=_make_reset_conversations_fn(),
+                    # ...and the capture gate: the frozen base grades the training targets it
+                    # has not graded, last in that batch (P3: a judge gates training).
+                    capture_gate_fn=_make_capture_gate_fn(),
+                    # ...and after that batch, on the adapter: the child ask, the question an
+                    # accepted closure that rejected its question's terms leaves open (§3.4).
+                    child_ask_fn=_make_child_ask_fn(),
                     # The runner is one stage of this lifecycle; THIS function owns the
                     # terminal status (merge / commit / persona / train still follow).
                     finalize=False,

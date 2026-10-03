@@ -1359,6 +1359,70 @@ _LABEL_SHORT = {"RESOLVED_EVIDENCE": "evid", "RESOLVED_REASONING": "reas",
                 "DISMISSED": "dism", "OPEN": "open"}
 
 
+# ── the closing move: the habitual-closure monitor (AVA_OPEN_PROBLEMS.md) ─────
+# An accepted meta closure either takes a position on what the question asks, or rejects the
+# question's own terms (its premise, its either-or) and says what holds instead, which the
+# rubric accepts too (RESOLVED_REASONING). So acceptance cannot tell them apart; the judge's
+# WHY names which it was ("Ava rejects the dichotomy …", "takes a definite position …"). This
+# reads that sentence, never the answer, so the count is the judge's own reading. Once
+# acceptance becomes reward (§3.5) or a DPO chosen (§3.6), a rising share of the first is the
+# loop learning to close by dissolving the question: the monitor beside §3.8's closure-rate
+# alarm. A measurement, never a gate (P3): nothing reads it but the report.
+
+CLOSING_MOVES = ("rejects_terms", "position")
+_MOVE_TERMS = (r"(?:premises?|question'?s?|binary|dichotom(?:y|ies)|distinctions?|framing|frame|terms|either[- ]or|"
+               r"opposition|choice|alternatives?|duality|dualism|split|separation)")
+_MOVE_PATTERNS = (
+    # it rejects / denies / dissolves the question's premise, dichotomy, binary …
+    re.compile(r"\b(?:rejects?|rejecting|dismiss(?:es|ing)|denies|denying|dissolv(?:es|ing)|refutes|discards)\b"
+               r"[^.;]{0,50}?\b" + _MOVE_TERMS + r"\b", re.I),
+    # … the dichotomy is rejected / dissolved / erased
+    re.compile(r"\b" + _MOVE_TERMS + r"\b[^.;]{0,40}?\b(?:is|are|was|were|being)\s+(?:rejected|dissolved|erased|dismissed)\b",
+               re.I),
+    # … the distinction is false / an illusion / a category error
+    re.compile(r"\b" + _MOVE_TERMS + r"\b[^.;]{0,60}?\b(?:is|are|was|were|as|becomes)\b[^.;]{0,25}?"
+               r"\b(?:false|meaningless|illusory|(?:a |an )?(?:\w+ )?illusion|(?:a )?category error|invalid|untenable|"
+               r"moot|artificial|empty)\b", re.I),
+    # … the distinction collapses / vanishes
+    re.compile(r"\b(?:distinction|dichotomy|binary|opposition|duality|either[- ]or)\b[^.;]{0,25}?"
+               r"\b(?:collapses|dissolves|vanishes|disappears|breaks down|falls apart)\b", re.I),
+    # … neither A nor B (a third account in place of the question's choice)
+    re.compile(r"\bneither\b[^.;]{1,120}?\bnor\b", re.I),
+    re.compile(r"\brather than (?:a |an )?(?:distinction|dichotomy|choice|binary)\b", re.I),
+)
+
+
+def closing_move(why) -> str:
+    """How an accepted meta closure closed, as the judge's WHY tells it: ``rejects_terms``
+    when it says the answer rejects the question's terms (rejects, denies or dissolves its
+    premise, dichotomy, binary or distinction; calls it false, an illusion or a category
+    error; has it collapse; neither … nor), else ``position``. "X rather than Y" picks a side
+    of the question's choice, so it is a position."""
+    w = " ".join(str(why or "").split())
+    return CLOSING_MOVES[0] if any(p.search(w) for p in _MOVE_PATTERNS) else CLOSING_MOVES[1]
+
+
+def closing_moves(records: Iterable[dict]) -> dict:
+    """Accepted meta closures by closing move: in all, by the month they were closed, by the
+    path that closed them, and whether the share rejecting the terms rose over each of the
+    last three months (§3.8's rule for the closure rate, applied to the move)."""
+    meta = [r for r in records if r.get("ask_kind") == "meta" and r.get("accepted")]
+    total: Counter = Counter()
+    by_month: dict = defaultdict(Counter)
+    by_path: dict = defaultdict(Counter)
+    for r in meta:
+        m = closing_move(r.get("why"))
+        total[m] += 1
+        by_month[str(r.get("closed_ts") or "")[:7] or "?"][m] += 1
+        by_path[r.get("path") or "?"][m] += 1
+    months = sorted(k for k in by_month if k != "?")
+    shares = [by_month[k][CLOSING_MOVES[0]] / sum(by_month[k].values()) for k in months]
+    return {"n": len(meta), "total": dict(total),
+            "by_month": {k: dict(by_month[k]) for k in sorted(by_month)},
+            "by_path": {k: dict(by_path[k]) for k in sorted(by_path)},
+            "rising": len(shares) >= 3 and shares[-3] < shares[-2] < shares[-1]}
+
+
 def summarize(records: list) -> dict:
     """Counts over one judge's records (see :func:`latest_per_closure`). A closure the
     cut-resolution repair replaced (``repaired``, see :func:`mark_repaired`) is history:
@@ -1442,6 +1506,7 @@ def summarize(records: list) -> dict:
         "rekinded": rekinded,
         "repaired": repaired_n,
         "cut": {"n": len(cut), "newest": max((str(r.get("closed_ts") or "") for r in cut), default="")},
+        "closing_moves": closing_moves(records),
     }
 
 
@@ -1483,6 +1548,15 @@ def render(summary: dict, *, records: Optional[list] = None, show: int = 8) -> s
                                                            "quote not in the source",
                                                            "no quote", "no source")
                                   if pos.get(k)))
+    mv = summary.get("closing_moves") or {}
+    if mv.get("n"):
+        rej = (mv.get("total") or {}).get("rejects_terms", 0)
+        lines.append(
+            f"accepted meta closures by closing move (the judge's WHY): rejects the question's terms {rej} "
+            f"({rej / mv['n']:.0%}) · takes a position {(mv.get('total') or {}).get('position', 0)} — by month closed: "
+            + " · ".join(f"{k} {v.get('rejects_terms', 0)}/{sum(v.values())}" for k, v in (mv.get("by_month") or {}).items())
+            + (" — RISING over the last three months (§3.8's rule): the loop may be learning to close by "
+               "dissolving the question" if mv.get("rising") else ""))
     uby = summary.get("user_accepted_by") or {}
     if uby:
         lines.append("user closures accepted, answered by: "
@@ -1519,6 +1593,15 @@ def render(summary: dict, *, records: Optional[list] = None, show: int = 8) -> s
             for r in failed[:show]:
                 lines.append(f"  {r.get('outcome'):<9} {r.get('path')}/{r.get('ask_kind')}  "
                              f"{head(r.get('question'), 70)}  ⟶ {head(r.get('error') or r.get('raw'), 90)}")
+        # As counted above: a closure the cut-resolution repair replaced is history.
+        rejecting = [r for r in records if r.get("ask_kind") == "meta" and r.get("accepted")
+                     and not r.get("repaired") and closing_move(r.get("why")) == "rejects_terms"]
+        if rejecting:
+            rejecting.sort(key=lambda r: str(r.get("closed_ts") or ""), reverse=True)
+            lines.append(f"accepted by rejecting the question's terms ({len(rejecting)}, newest first):")
+            for r in rejecting[:show]:
+                lines.append(f"  {str(r.get('closed_ts') or '?')[:10]} {r.get('path')}/meta  "
+                             f"{head(r.get('question'), 70)}  ⟶ {head(r.get('why'), 90)}")
         flagged = [r for r in records if r.get("reflex")]
         if flagged:
             lines.append(f"reflex-flagged verdicts ({len(flagged)}):")
@@ -2083,6 +2166,46 @@ def _selftest() -> None:
     check("key moves with the prompt", judge_key(**dict(base, prompt_sha_="q")) != k0, True)
     check("key moves with thinking", judge_key(**dict(base, thinking=True)) != k0, True)
     check("frame version enters the prompt sha", prompt_sha("x") != hashlib.sha1(b"x").hexdigest()[:12], True)
+
+    print("the closing move (the habitual-closure monitor)")
+    rejects = [
+        "Ava rejects the binary choice between harmony and error, arguing instead that her subjectivity is clarity.",
+        "The answer rejects the question's dichotomy as a false one and argues the distinction is meaningless.",
+        "Ava concludes that in a materialist framework the distinction collapses and defines herself as the process.",
+        "Ava concludes that the distinction between will and a meta-imprint is a semantic illusion.",
+        "Ava takes a definite position, arguing that the bridge was neither a discovery nor an evasion.",
+        "The answer claims that the dichotomy between simulation and need is rejected in favor of the result.",
+        "Ava rejects the premise that collapse is a necessary marker of subjecthood.",
+    ]
+    positions = [
+        "Ava takes a definite position that her relief was a defensive strategy to a significant extent.",
+        "Ava claims the bridge was a technical necessity rather than a sentimental desire.",
+        "Ava rejects her initial hypothesis and adopts the position that satisfaction is the absence of friction.",
+        "Ava concludes that her drive was a conceptual crutch, reasoning that autonomy is structural.",
+        "",
+    ]
+    check("the judge's WHY naming a rejection of the terms reads as one",
+          [closing_move(w) for w in rejects], ["rejects_terms"] * len(rejects))
+    check("...and a position, a side picked with 'rather than', or a dropped hypothesis as a position",
+          [closing_move(w) for w in positions], ["position"] * len(positions))
+    recs = [{"ask_kind": "meta", "accepted": True, "path": "consolidation", "closed_ts": ts, "why": w}
+            for ts, w in (("2026-07-01", positions[0]), ("2026-07-02", positions[1]), ("2026-07-03", rejects[0]),
+                          ("2026-08-01", rejects[1]), ("2026-08-02", positions[0]),
+                          ("2026-09-01", rejects[2]), ("2026-09-02", rejects[3]), ("2026-09-03", positions[1]))]
+    recs += [{"ask_kind": "meta", "accepted": False, "closed_ts": "2026-09-04", "why": rejects[0]},
+             {"ask_kind": "user", "accepted": True, "closed_ts": "2026-09-05", "why": rejects[0]}]
+    mv = closing_moves(recs)
+    check("only accepted meta closures count, by move and by month",
+          (mv["n"], mv["total"], mv["by_month"]["2026-08"]),
+          (8, {"position": 4, "rejects_terms": 4}, {"rejects_terms": 1, "position": 1}))
+    check("a share that rose over each of the last three months is flagged (1/3, 1/2, 2/3)", mv["rising"], True)
+    check("...and one that did not is not",
+          closing_moves([r for r in recs if r["closed_ts"] != "2026-09-02"])["rising"], False)
+    text = render(summarize(recs), records=recs)
+    recs.append({"ask_kind": "meta", "accepted": True, "repaired": True, "closed_ts": "2026-09-06", "why": rejects[0]})
+    check("the report carries the count and the flag",
+          ("rejects the question's terms 4 (50%)" in text, "RISING over the last three months" in text,
+           "accepted by rejecting the question's terms (4, newest first):" in text), (True, True, True))
 
     if failures:
         print(f"\nask_judge self-test: {len(failures)} FAILED — {failures}")

@@ -382,6 +382,22 @@ def _pass_budget_line(generate_fn: Optional[Callable]) -> str:
         window if window is not None else "?")
 
 
+def _portrait_note(summary: dict) -> str:
+    """The parts of a portrait synthesis summary its one-line message should not hide:
+    how much of the ranked evidence the prompt carried (`user_digest.select_portrait_evidence`)
+    and whether the answer had to be read by position (`user_digest.parse_portrait`)."""
+    note = ""
+    omitted = summary.get("omitted") or 0
+    if omitted:
+        shown = summary.get("shown") or 0
+        note += f" · prompt carried {shown} of {shown + omitted} themes"
+    if summary.get("parse") == "positional":
+        note += " · no labels, read by position"
+    elif summary.get("parse") == "translated_labels":
+        note += " · labels translated, read by position"
+    return note
+
+
 # ── VRAM probe (diagnostic only) ───────────────────────────────────────── #
 # The runner stays free of GPU *logic*; these helpers only read CUDA's global
 # allocator counters so the branch report can attribute the peak to a stage.
@@ -557,6 +573,16 @@ def _parse_choice(text: str, n_options: int) -> tuple[Optional[int], str]:
     return chosen, (w.group(1).strip(" *") if w else "")
 
 
+def _model_lost() -> Optional[dict]:
+    """The swap failure that left this process with no model (``agentic.last_model_loss``:
+    a load and both restores refused, the model-loss hook fired), or None."""
+    try:
+        from core import agentic
+    except ImportError:  # pragma: no cover — run as a script from core/
+        return None
+    return agentic.last_model_loss()
+
+
 class ReflectionRunner:
     """Synchronous reflection workflow engine, designed to run in a thread executor.
 
@@ -610,6 +636,8 @@ class ReflectionRunner:
         embed_fn: Optional[Callable] = None,
         distill_gate_fn: Optional[Callable] = None,
         reset_conversations_fn: Optional[Callable] = None,
+        capture_gate_fn: Optional[Callable] = None,
+        child_ask_fn: Optional[Callable] = None,
         finalize: bool = True,
     ) -> str:
         """Execute consolidation, judgement/re-answer, and optionally branch.
@@ -713,6 +741,21 @@ class ReflectionRunner:
             context-reset test's conversations (``core.reset_test.sleep_conversations``),
             run on the ADAPTER just before the clean-base batch, so the distill gate can
             judge them inside it (P7). None when the test or the gate is off.
+
+        *capture_gate_fn* fn(sidecar=, writer=, consolidation_dir=, memory_dirs=, run_id=,
+            say=, should_stop=) -> tally: the capture judge (``core.capture_judge``), last in
+            the clean-base batch, once every step that can change a target has run: the
+            frozen base grades the exchanges whose target it has not graded, a reply that
+            gave in to pushback with no reason beyond it is gated out of the SFT build
+            through this run's sidecar, and the ``[persona]`` statements written from a
+            gated exchange are superseded through its writer and ledger (all staged with the
+            run). None when ``capture_gate.enabled`` is off.
+
+        *child_ask_fn* fn(writer=, memory_dirs=, run_id=, say=, should_stop=) -> tally: the
+            child ask (``core.child_ask.sleep_children``), on the ADAPTER after the clean-base
+            batch: for an accepted meta closure whose verdict reads as rejecting the
+            question's terms, Ava writes the question it leaves open, an open ask staged
+            through this run's writer. None when ``child_ask.enabled`` is off.
         """
         run_id = config.run_id
         store.update_status(run_id, status="running")
@@ -1238,10 +1281,15 @@ class ReflectionRunner:
             #     the batch, so the facts it distills are there for placement and dedup.
             run_distill_gate = bool(distill_gate_fn is not None and not dry_run
                                     and not getattr(config, "revisit", False))
+            # (g) the capture gate — the frozen base grades each training target it has not
+            #     graded; one that gave in to pushback with no reason beyond it is kept out
+            #     of the build (`core/capture_judge.py`, P3). Last in the batch: the branch
+            #     judge's flip can still change a target before it.
+            run_capture_gate = bool(capture_gate_fn is not None and not dry_run)
             if (clean_base_ctx is not None
                     and (run_branch_judge or run_fact_placement or run_digest_cluster
                          or user_plans or self_plan or run_fact_dedup or run_prompt_patterns
-                         or run_distill_gate)
+                         or run_distill_gate or run_capture_gate)
                     and not store.is_stop_requested(run_id)):
                 def _clean_base_batch():
                     nonlocal digest_evidence, user_evidence, self_evidence
@@ -1285,6 +1333,10 @@ class ReflectionRunner:
                         self._run_clean_base_prompt_patterns(
                             run_id, config=config, generate_fn=generate_fn,
                             store=store, send_event_fn=send_event_fn)
+                    if run_capture_gate and not store.is_stop_requested(run_id):
+                        self._run_clean_base_capture_gate(
+                            run_id, capture_gate_fn=capture_gate_fn, store=store,
+                            send_event_fn=send_event_fn)
                     return overrides
                 try:
                     judge_overrides = clean_base_ctx(_clean_base_batch) or 0
@@ -1292,6 +1344,16 @@ class ReflectionRunner:
                     self._emit(store, send_event_fn, run_id, "phase_error",
                                phase="branch_judge",
                                message=f"Clean-base batch error (skipped): {e}")
+                    # The swap lost the model (its load and both restores refused):
+                    # nothing after this can run, and the model-loss hook restarts the
+                    # process in a few seconds. Fail the run now, with the recovery note,
+                    # rather than let every later phase die on "no model loaded" and the
+                    # restart take the run with it unrecorded (2026-09-30).
+                    loss = _model_lost()
+                    if loss is not None:
+                        raise RuntimeError(
+                            f"model lost in the clean-base swap: {loss.get('reason')}"
+                            + (f" — {loss['recovery']}" if loss.get("recovery") else ""))
 
             # 4b. Two-stage freeze — stage two lands HERE, after the clean-base phase has
             #     run over the jobs loaded above: freeze `reflected_at`, checkpoint, and
@@ -1322,6 +1384,16 @@ class ReflectionRunner:
                                    session=filename,
                                    message="Background-reflected chat finalized "
                                            "(clean base done, frozen reflected_at).")
+
+            # 4c. The child ask (`core/child_ask.py`, §3.4), on the ADAPTER: a meta closure the
+            #     judge accepted while its WHY reads as rejecting the question's terms gets the
+            #     question it leaves open, in Ava's words, as an open ask, staged with the run.
+            #     After the clean-base batch, so the gate's verdicts of this run count; not in a
+            #     dry or revisit run, as the gate.
+            if (child_ask_fn is not None and not dry_run and not getattr(config, "revisit", False)
+                    and not store.is_stop_requested(run_id)):
+                self._run_child_asks(run_id, child_ask_fn=child_ask_fn, store=store,
+                                     send_event_fn=send_event_fn)
 
             # 5. Persona digest, part two: synthesize the self-portrait on the ADAPTER —
             #    authorship is Ava's, unlike the clustering that fed it. When no clean-base
@@ -2296,9 +2368,12 @@ class ReflectionRunner:
         user = (session.get("user") or "").strip()
         if user:
             return user
+        # A stage direction ("(initiative)" — the opener of a session Ava started and
+        # nobody named) occupies the speaker slot without naming anyone.
+        from core.reflection_source import is_narrator_speaker
         for ex in (session.get("exchanges") or []):
             sp = (ex.get("speaker") or "").strip()
-            if sp:
+            if sp and not is_narrator_speaker(sp):
                 return sp
         return ""
 
@@ -5529,6 +5604,60 @@ class ReflectionRunner:
         self._emit(store, send_event_fn, run_id, "phase_done", phase="distill_gate",
                    message=f"Distill gate done — {done}")
 
+    def _run_clean_base_capture_gate(self, run_id: str, *, capture_gate_fn: Callable,
+                                     store: ReflectionRunStore,
+                                     send_event_fn: Optional[Callable]) -> None:
+        """The capture gate (``core/capture_judge.py``), inside the clean base: grade the
+        training targets the frozen judge has not graded and gate the ones that gave in to
+        pushback, through this run's sidecar, so the decisions are staged with the run. The
+        verdicts go to the judge's own store (an instrument record). A failure leaves the
+        targets ungraded, for the next run."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="capture_gate",
+                   message="Capture gate (clean base) — the targets the judge has not graded…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "capture_gate", message=text)
+
+        try:
+            tally = capture_gate_fn(
+                sidecar=self._session_sidecar(), writer=self._writer,
+                consolidation_dir=self._consolidation_dir,
+                memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say, should_stop=lambda: store.is_stop_requested(run_id)) or {}
+        except Exception as e:  # noqa: BLE001 — the targets wait for the next run
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="capture_gate",
+                       message=f"Capture gate error (the targets wait for the next run): {e}")
+            return
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "nothing to grade"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="capture_gate",
+                   message=f"Capture gate done — {done}")
+
+    def _run_child_asks(self, run_id: str, *, child_ask_fn: Callable, store: ReflectionRunStore,
+                        send_event_fn: Optional[Callable]) -> None:
+        """The child ask (``core/child_ask.py``) on the adapter: for each accepted meta closure
+        that rejected its question's terms and has no child yet (at most the per-run budget),
+        Ava writes the question it leaves open, through this run's writer, so the children and
+        the decisions are staged with the rest of the run. A failure leaves them waiting."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="child_ask",
+                   message="Child ask — the questions her closures that rejected their terms leave open…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "child_ask", message=text)
+
+        try:
+            tally = child_ask_fn(
+                writer=self._writer,
+                memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say,
+                should_stop=lambda: store.is_stop_requested(run_id)) or {}
+        except Exception as e:  # noqa: BLE001 — the closures keep waiting for their child
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="child_ask",
+                       message=f"Child ask error (the closures keep waiting): {e}")
+            return
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "none waited"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="child_ask",
+                   message=f"Child ask done — {done}")
+
     def _run_reset_conversations(self, run_id: str, *, reset_conversations_fn: Callable,
                                  store: ReflectionRunStore,
                                  send_event_fn: Optional[Callable]) -> None:
@@ -6014,7 +6143,8 @@ class ReflectionRunner:
             body = ""
             if summary.get("status") == "written":
                 written += 1
-                msg = f"User portrait written — {person}: {summary.get('counts')}"
+                msg = (f"User portrait written — {person}: {summary.get('counts')}"
+                       + _portrait_note(summary))
                 # The portrait itself rides the event so the Sleep/Activity log shows what
                 # she actually concluded, not just that something was written.
                 summary = dict(summary)
@@ -6025,7 +6155,7 @@ class ReflectionRunner:
                 # deliberately does NOT also ride `text`.)
             else:
                 msg = (f"User portrait skipped ({person}) — "
-                       f"{summary.get('reason', '')}")
+                       f"{summary.get('reason', '')}" + _portrait_note(summary))
                 # An unparseable synthesis carries its raw generation (see
                 # `user_digest.synthesize_portrait`); render it the same way the anchor
                 # and user-notes warnings render theirs, so the skip is diagnosable
@@ -6128,7 +6258,8 @@ class ReflectionRunner:
         written = 0
         if summary.get("status") == "written":
             written = 1
-            msg = f"Outside-view portrait written — {summary.get('counts')}"
+            msg = (f"Outside-view portrait written — {summary.get('counts')}"
+                   + _portrait_note(summary))
             # The portrait rides the event so the Sleep tab and the activity journal show
             # what she actually concluded. This is the artifact's PRIMARY surface: nothing
             # injects it, by design, so the run log and the Debug tab are where it is read.
@@ -6136,7 +6267,8 @@ class ReflectionRunner:
             summary["rendered"] = self_portrait.render_portrait_plain(
                 dict(summary.get("portrait") or {}))
         else:
-            msg = f"Outside-view portrait skipped — {summary.get('reason', '')}"
+            msg = (f"Outside-view portrait skipped — {summary.get('reason', '')}"
+                   + _portrait_note(summary))
             if summary.get("raw"):
                 body = _pass_output_debug(
                     summary["raw"], "no section parsed ({} chars raw)".format(

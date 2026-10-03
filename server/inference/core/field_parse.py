@@ -87,6 +87,14 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 # the match at sentence punctuation so a clause cannot pose as a label, and the length cap
 # keeps it to a marker rather than a sentence.
 _UNKNOWN_LABEL = r"[^\n:：.!?…,;]{1,32}"
+# The same for a HEADING (:func:`any_heading`), with a longer cap: a translated heading is
+# a gloss of the prompt's description rather than a one-word marker (the UNSURE heading on
+# record ran to 27 chars), and it must fill its line, which no clause does.
+_UNKNOWN_HEADING = r"[^\n:：.!?…,;]{1,48}"
+# A list item is not a heading, however short and colon-ended: a list marker and then
+# whitespace, including the dashes a Russian list uses. Bold (`**Кто он:**`) puts no
+# whitespace after its stars, so it is not caught here.
+_LIST_ITEM = r"(?:[-*+•–—]|\d+[.)])[ \t]"
 
 
 def _expand(names: tuple[str, ...]) -> list[str]:
@@ -137,6 +145,26 @@ def any_label(anchored: bool = True) -> str:
     return rf"{head}{_UNKNOWN_LABEL}{_MID}{_COLON}{_TAIL}"
 
 
+def any_heading() -> str:
+    """Regex matching a line that is nothing but *some* label and its colon — the name unread.
+
+    The heading counterpart of :func:`any_label`, for a section whose heading was written
+    in a language nobody listed: a Russian gloss such as ``Каким я его знаю:`` on a line
+    of its own, where the prompt asked for ``WHO`` (2026-10-01, the user portrait). Like
+    ``any_label`` it never reads the name, so it cannot say which section a heading opens.
+    The one caller (``user_digest._translated_sections``) takes that from the prompt's
+    fixed ORDER, and only when the count of such lines matches it exactly.
+
+    Nothing may follow the colon but closing emphasis, and the line must not be a list item
+    (``— Свобода:`` stays an item), so a colon-ended item in a section's list is not taken
+    for a heading. Use with ``re.M``.
+    """
+    # The list check looks past the indentation itself: after a `[ \t]*`, backtracking
+    # would retry it one space short of the marker, where it always passes.
+    return (rf"^(?![ \t]*{_LIST_ITEM})[ \t]*{_EMPH}(?:\#{{1,6}}[ \t]*)?{_EMPH}"
+            rf"{_UNKNOWN_HEADING}{_MID}{_COLON}{_TAIL}$")
+
+
 def section(*names: str, hash_required: bool = False) -> str:
     """Regex matching a section HEADING line, capturing the name in group 1.
 
@@ -153,7 +181,8 @@ def section(*names: str, hash_required: bool = False) -> str:
     Deliberately does NOT expand ``_ALIASES``: a section name is captured in group 1 and
     read back as an identity (the digest maps it to a facet key), so a translated heading
     would have to be mapped home rather than merely matched. A drifted section header
-    still fails to split, as it always has.
+    still fails to split here; the user portrait maps a colon-ended one home by position
+    (:func:`any_heading`).
     """
     alt = "|".join(sorted((n for n in names), key=len, reverse=True))
     hashes = r"\#{1,6}[ \t]*" if hash_required else r"(?:\#{1,6}[ \t]*)?"
@@ -241,4 +270,22 @@ if __name__ == "__main__":  # pragma: no cover - GPU-free self-test
         assert H.search(form), form
     assert not H.search("RAG retrieval was noisy")   # bare prose is not a header
     assert not H.search("WEIGHTS")                   # …nor a bare name, without a hash
+
+    # A heading in any language: a line that is nothing but a label and its colon.
+    G = re.compile(any_heading(), re.M)
+    for form in ("Каким я его знаю:", "**Каким я его знаю:**", "**Каким я его знаю**:",
+                 "### Каким я его знаю:", "Каким я его знаю：", "  Чего я пока не знаю: ",
+                 "Wie ich ihn kenne :"):
+        assert G.search(form), form
+    for form in (
+        "Каким я его знаю",                    # no colon
+        "Кто он: инженер",                     # a value follows — a field, not a heading
+        "— Его привычки:",                     # a list item, however short
+        "- Его привычки:", "* Его привычки:", "1. Его привычки:",
+        "   — Его привычки:", "  * Его привычки:", "\t2) Его привычки:",   # …indented
+        "Он, как обычно, начинает с возражения:",   # a clause
+        "Вот что я успела заметить о нём за все эти долгие месяцы разговоров:",  # too long
+    ):
+        assert not G.search(form), form
+    assert len(G.findall("Кто он:\n\nабзац\n\nЧто ему важно:\n— пункт\n")) == 2
     print("field_parse self-test OK")

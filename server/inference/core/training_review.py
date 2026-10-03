@@ -38,6 +38,7 @@ path with no server dependencies on its side.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -163,6 +164,16 @@ def _load_live_sidecar(dirs: list, source_session: str, cache: dict) -> Optional
 # ---------------------------------------------------------------------- #
 
 WANDER_PREFIX = "wander:"
+
+
+def _capture_gated(rec: dict) -> bool:
+    """``core.chat_sidecar.capture_gated``, inlined (this module is loaded by path, offline,
+    with no ``core`` on the path): the capture judge keeps the exchange out of the build
+    while its ``capture`` field names the target the record holds."""
+    cap = rec.get("capture")
+    target = str(rec.get("target") or "")
+    return (isinstance(cap, dict) and cap.get("response") == "yields"
+            and cap.get("target_sha") == hashlib.sha256(target.encode("utf-8")).hexdigest()[:16])
 
 
 def banned_wander_timestamps(server_root: Path) -> set:
@@ -378,7 +389,7 @@ def build_payload(*, source: str = "snapshot",
     reviewed *exchange* — duplicate render rows are collapsed onto ``copies`` — carrying
     the frozen render's ``cot``/``answer``, the live sidecar's ``live_cot``/``live_answer``
     when the exchange is ``locked``, its ``kind`` (``"chat"``/``"wander"``) and ``banned``
-    state, its ``preview`` flag (an untrained fresh-chat row rendered for early repair —
+    state, whether the capture judge gates it (``capture``, with its ``capture_why``), its ``preview`` flag (an untrained fresh-chat row rendered for early repair —
     Sleep's "Include fresh chats"), and the ``source_session``/``exchange_index``
     provenance the repair RPCs need. Entries stay in file order == training order
     (preview rows trail the trained corpus).
@@ -434,6 +445,8 @@ def build_payload(*, source: str = "snapshot",
             # flag the row frozen.
             locked = False
             banned = False
+            capture = False
+            capture_why = ""
             live_cot = live_answer = None
             # A wander row's live state lives in the wander corpus, not a sidecar — it is a
             # one-shot capture with no chat behind it, which is also why it can only ever be
@@ -447,6 +460,10 @@ def build_payload(*, source: str = "snapshot",
                     rec = (doc.get("exchanges") or {}).get(str(idx))
                     if isinstance(rec, dict):
                         banned = bool(rec.get("banned"))
+                        # Gated by the capture judge (core/capture_judge.py): the next
+                        # build leaves it out, as it does a banned one.
+                        capture = _capture_gated(rec)
+                        capture_why = str((rec.get("capture") or {}).get("why") or "") if capture else ""
                         if rec.get("locked"):
                             locked = True
                             tgt = rec.get("target")
@@ -461,6 +478,7 @@ def build_payload(*, source: str = "snapshot",
                             "live_cot": live_cot or "", "live_answer": live_answer or "",
                             "has_live": has_live, "locked": locked,
                             "banned": banned, "kind": kind,
+                            "capture": capture, "capture_why": capture_why,
                             # A fresh preview row (Sleep → "Include fresh chats"): rendered
                             # at LR multiplier 0 so it is reviewable/repairable BEFORE it
                             # ages into a real build — this build did NOT train it.

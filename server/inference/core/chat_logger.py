@@ -30,6 +30,16 @@ from uuid import uuid4
 CHAT_SCHEMA_VERSION = 6
 REFLECTION_FEEDBACK_MAX_CHARS = 2000
 
+# How an Ava-initiated opener addresses someone the box cannot name ("You decided to
+# raise this with your friend…"). Display text for the drives' prompts, never a session's
+# recorded user: `start_session` records it as "" and the first human reply names the
+# session instead (`log_exchange`). Recorded as a name it became a person of its own —
+# the first-token key "your" — and by 2026-09-27 102 of the owner's sessions were filed
+# under it: their readings formed a portrait of nobody, and check-in counted a second
+# person to check in on. With more than one user it pools everyone a drive could not
+# name into that one phantom.
+UNKNOWN_ADDRESSEE = "your friend"
+
 
 class ChatLogger:
     """Manages a single chat session file and appends exchanges to it."""
@@ -126,6 +136,8 @@ class ChatLogger:
         from?", and the answer-side ASK ORIGIN injection (`core.ask_origin`) needs it
         for the whole life of the session. Persists across an in-place reply
         (``resume_session`` loads the whole dict).
+        *user* equal to :data:`UNKNOWN_ADDRESSEE` is recorded as ``""``: the placeholder
+        addresses someone, it names nobody.
         """
         now = datetime.now()
         # Second-granularity stem. Two sessions started in the same second (e.g. a
@@ -144,7 +156,7 @@ class ChatLogger:
             "schema_version": CHAT_SCHEMA_VERSION,
             "timestamp": now.isoformat(),
             "system_prompt": system_prompt,
-            "user": user,
+            "user": "" if (user or "").strip() == UNKNOWN_ADDRESSEE else user,
             "model_id": model_id,
             "adapter_id": adapter_id,
             "notes": notes,
@@ -234,11 +246,23 @@ class ChatLogger:
         # provisionally at session start (e.g. via clear_context) by an operator
         # who then switched the active user before sending anything. Only the
         # first exchange sets it; later speaker changes are tracked per-exchange.
-        # An ``initiated_by`` session is exempt: exchange 0 is Ava's own opener under
-        # a stage-direction speaker (e.g. "(initiative)"), so stamping from it would
-        # misname the session — the human set at start_session must stand.
-        if speaker and not self._session_data["exchanges"] and not self._session_data.get("initiated_by"):
+        exchanges = self._session_data["exchanges"]
+        if speaker and not exchanges and not self._session_data.get("initiated_by"):
             self._session_data["user"] = speaker
+        # An ``initiated_by`` session opens on Ava's own turn under a stage-direction
+        # speaker ("(initiative)"), which must not name it, and its user at start is only
+        # the drive's guess: the last active user, or nobody. So the first HUMAN reply
+        # names it, keeping the guess as ``addressed_to`` when someone else answered —
+        # what was said is the speaker's, and every reader of ``user`` (attribution, the
+        # portraits, check-in's per-person clock) has to see who actually spoke.
+        elif speaker and self._session_data.get("initiated_by"):
+            from core.reflection_source import is_narrator_speaker
+            if not is_narrator_speaker(speaker) and all(
+                    is_narrator_speaker(ex.get("speaker")) for ex in exchanges):
+                guess = (self._session_data.get("user") or "").strip()
+                if guess and guess != speaker:
+                    self._session_data["addressed_to"] = guess
+                self._session_data["user"] = speaker
 
         cot, response = self._parse_cot(assistant_full_response)
         entry: dict = {
@@ -583,3 +607,66 @@ def mark_exchange_corrupt(
         "corrupt_cot": bool(entry.get("corrupt_cot")),
         "corrupt_response": bool(entry.get("corrupt_response")),
     }
+
+
+# ── GPU-free self-test: python -m core.chat_logger ────────────────────────────── #
+
+def _selftest() -> None:
+    import tempfile
+
+    def header(logger: ChatLogger) -> dict:
+        return json.loads(logger.current_file.read_text(encoding="utf-8"))
+
+    with tempfile.TemporaryDirectory() as td:
+        chats = Path(td)
+
+        # A session the user started is named by its first speaker, not the value set
+        # at start, and a later speaker does not rename it.
+        lg = ChatLogger(chats)
+        lg.start_session("sys", user="Dana")
+        lg.log_exchange("hi", "hello", speaker="Sam")
+        lg.log_exchange("and me", "hello", speaker="Dana")
+        assert header(lg)["user"] == "Sam" and "addressed_to" not in header(lg)
+
+        # Ava-initiated, addressed to nobody: the placeholder is not recorded, the
+        # "(initiative)" opener names nobody, the first human reply names the session and
+        # a second one does not rename it.
+        lg = ChatLogger(chats)
+        lg.start_session("sys", user=UNKNOWN_ADDRESSEE, initiated_by="ava")
+        lg.log_exchange("impulse", "opener", speaker="(initiative)")
+        assert header(lg)["user"] == ""
+        path = lg.current_file
+        resumed = ChatLogger(chats)                   # the reply lands in place
+        resumed.resume_session(path)
+        resumed.log_exchange("reply", "answer", speaker="Sam")
+        resumed.log_exchange("more", "answer", speaker="Dana")
+        assert header(resumed)["user"] == "Sam" and "addressed_to" not in header(resumed)
+
+        # Addressed to one person, answered by another: the reply is the speaker's, and
+        # whom Ava meant to reach is kept.
+        lg = ChatLogger(chats)
+        lg.start_session("sys", user="Dana", initiated_by="ava")
+        lg.log_exchange("impulse", "opener", speaker="(initiative)")
+        assert header(lg)["user"] == "Dana"            # unanswered: still her guess
+        lg.log_exchange("reply", "answer", speaker="Sam")
+        assert header(lg)["user"] == "Sam" and header(lg)["addressed_to"] == "Dana"
+
+        # ...and answered by the person addressed: nothing to keep.
+        lg = ChatLogger(chats)
+        lg.start_session("sys", user="Dana", initiated_by="ava")
+        lg.log_exchange("impulse", "opener", speaker="(initiative)")
+        lg.log_exchange("reply", "answer", speaker="Dana")
+        assert header(lg)["user"] == "Dana" and "addressed_to" not in header(lg)
+
+        # A reply with no speaker names nobody.
+        lg = ChatLogger(chats)
+        lg.start_session("sys", user=UNKNOWN_ADDRESSEE, initiated_by="ava")
+        lg.log_exchange("impulse", "opener", speaker="(initiative)")
+        lg.log_exchange("reply", "answer", speaker="")
+        assert header(lg)["user"] == ""
+
+    print("chat_logger selftest OK")
+
+
+if __name__ == "__main__":
+    _selftest()

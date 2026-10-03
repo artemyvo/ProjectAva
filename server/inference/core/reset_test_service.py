@@ -151,8 +151,7 @@ def _load() -> dict:
     """Everything the page and a run plan from, read fresh: the closures, the ask judge's
     current verdicts (what the gate decides on), the test's store and its current key."""
     rag, weights = dg.read_oplogs([_MEMORY_DIR])
-    closures = aj.collect_closures(rag)
-    aj.mark_distilled(closures, aj.distilled_index(weights))
+    closures = dg.gate_closures(rag, weights)
     verdict_records = aj.read_jsonl(aj.store_path(_CHATS_DIR))
     try:
         ask_key = dg.current_judge_key(verdict_records,
@@ -209,7 +208,7 @@ def item_payload(it: dict) -> dict:
             "ask_kind": c.get("ask_kind"), "question": c.get("question"),
             "position": c.get("answer"), "closed_ts": c.get("closed_ts"), "who": c.get("who"),
             "answered_in": c.get("answered_in") or c.get("source_session"),
-            "distilled": c.get("distilled"),
+            "distilled": c.get("distilled"), "requeued": c.get("requeued"),
             "gate": {"reason": gate.get("reason"), "kind": gate.get("kind")} if gate else None,
             "conversation": _brief_conv(it.get("conversation")),
             "verdict": _brief_verdict(it.get("verdict")),

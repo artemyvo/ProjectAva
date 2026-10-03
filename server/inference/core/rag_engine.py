@@ -23,6 +23,7 @@ except ImportError as _exc:
         "Install with: pip install sentence-transformers faiss-cpu numpy"
     ) from _exc
 
+from core import load_lock
 from core.chat_sidecar import ChatSidecar, gist_excerpt, iter_chat_json_files
 from core.exchange_anchor import (build_tag_stats, query_tokens, tag_matches,
                                   tag_weight, words_match)
@@ -1655,9 +1656,14 @@ class RagEngine:
         if self._embedder is None:
             # Keep RAG embeddings on CPU so index rebuilds never contend with the
             # inference model for VRAM or kernel launch bandwidth. The wrapper applies
-            # multilingual MiniLM and pools bounded chunks for long text.
-            model = SentenceTransformer(self._EMBED_MODEL, device="cpu")
-            self._embedder = _RetrievalEmbedder(model)
+            # multilingual MiniLM and pools bounded chunks for long text. Loaded under the
+            # process-wide load lock: this runs in an index-build thread, and a load that
+            # overlaps the model's own (a Sleep run's staging RAG right before its
+            # clean-base swap) can leave transformers' tie_weights stubbed for good.
+            with load_lock.LOCK:
+                if self._embedder is None:
+                    model = SentenceTransformer(self._EMBED_MODEL, device="cpu")
+                    self._embedder = _RetrievalEmbedder(model)
         return self._embedder
 
     def _reflected_at_for_session(self, source_session: str) -> Optional[str]:

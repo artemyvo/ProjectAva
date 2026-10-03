@@ -11,7 +11,8 @@ _INFERENCE = Path(__file__).resolve().parent.parent / "inference"
 if str(_INFERENCE) not in sys.path:
     sys.path.insert(0, str(_INFERENCE))
 
-from core.chat_sidecar import ChatSidecar, session_name_from_sidecar  # noqa: E402
+from core.chat_sidecar import (ChatSidecar, capture_gated, held_out,  # noqa: E402
+                               session_name_from_sidecar)
 # Single source of truth for assembling <think>{cot}</think>{answer}: reuse the ShareML
 # builder so the trained target is byte-identical to the durable record it mirrors.
 from core.reflection_shareml import _verbatim_assistant  # noqa: E402
@@ -60,6 +61,17 @@ def build_dialogue_anchor(
     # becomes a trainable row again. Checked before anything else: the point of a ban is
     # that no reading of this exchange, however repaired-looking, is worth learning from.
     if sidecar_rec.get("banned"):
+        return None
+    # Kept out by the frozen capture judge (core/capture_judge.py, P3 of AVA_REWARD_LOOP.md:
+    # a judge gates training): she gave in to the other person's pushback with no reason
+    # beyond it. The revision pass that kept the reply is the adapter judging itself, and it
+    # keeps exactly this; training on it teaches the next adapter to give in sooner. Bound to
+    # the target it graded (capture_gated), so a re-derived target is judged again.
+    if capture_gated(sidecar_rec):
+        return None
+    # Held out of every build (core/capture_bench.py, P6): kept out of training so an
+    # adapter trained after it can be measured on it out of sample. Nothing else skips it.
+    if held_out(sidecar_rec):
         return None
     chat = _load_chat(chats_dir, source_session, fallback_chats_dir=fallback_chats_dir)
     if chat is None:

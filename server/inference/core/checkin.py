@@ -65,12 +65,14 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 from core.runtime_state import (runtime as _runtime, session as _session,
                                 reflect_output_reserve as _reserve)
 from core.field_parse import label as _label
 from core import reasoning_text
-from core.chat_logger import ChatLogger
+from core.chat_logger import UNKNOWN_ADDRESSEE, ChatLogger
+from core import hidden_capture
 from core.chat_sidecar import ChatSidecar, is_chat_session_json
 from core.chat_sidecar import gist_excerpt as sidecar_gist_excerpt
 from core import reachout_gate
@@ -883,11 +885,15 @@ def _render_digests(digests: list[dict]) -> str:
 
 
 def _target_user() -> str:
-    """Name Ava would address — the last known speaker, or a neutral fallback."""
-    return (_session.user or "").strip() or "your friend"
+    """Name Ava would address — the last known speaker, or a neutral fallback.
+
+    The fallback is display text for the prompts; the session writer records it as
+    nobody, and the first human reply names the session (`chat_logger`)."""
+    return (_session.user or "").strip() or UNKNOWN_ADDRESSEE
 
 
-def _write_checkin_session(*, opener: str, human: str, hours: float) -> str:
+def _write_checkin_session(*, opener: str, human: str, hours: float,
+                           hidden: Optional[dict] = None) -> str:
     """Write the reversed check-in session to hot/chats and return its filename.
 
     Same shape as outreach/synthesis: exchange 0 is Ava's opener under ``(initiative)``
@@ -905,10 +911,16 @@ def _write_checkin_session(*, opener: str, human: str, hours: float) -> str:
                f"her own accord after reviewing recent chats."),
         initiated_by="ava",
     )
+    opener_id = uuid4().hex
     logger.log_exchange(
         impulse, opener, speaker=_INITIATIVE_SPEAKER,
-        system_content=_session.system_prompt,
+        system_content=_session.system_prompt, exchange_id=opener_id,
     )
+    # The decision pass that wrote the opener, captured
+    # (`hidden_capture.write_opener_capture`): a session's first state, which live
+    # capture never sees. Telemetry, best-effort.
+    hidden_capture.write_opener_capture(logger.current_file, opener_id, hidden, opener,
+                                        drive="checkin", tokenizer=_runtime.tokenizer)
     return logger.current_file.name if logger.current_file else ""
 
 
@@ -1066,7 +1078,9 @@ def _decide_for_user(
             disable_rag=True, on_chunk=on_chunk,
             on_prompt_debug=(None if on_prompt is None
                              else (lambda info: on_prompt("decision", info))),
+            capture_hidden=hidden_capture.drive_openers_enabled(),
         )
+        hidden = getattr(generate, "last_hidden_capture", None)
         decision, opener = _parse_decision(raw)
 
         # Refuse a generation cut off before it closed its reasoning, BEFORE the write path
@@ -1140,7 +1154,8 @@ def _decide_for_user(
                     "silence_hours": hours, "simulated": simulated,
                     "standing": len(standing), "user": human}
 
-        filename = _write_checkin_session(opener=opener, human=human, hours=hours)
+        filename = _write_checkin_session(opener=opener, human=human, hours=hours,
+                                          hidden=hidden)
         # A reach-out was written → start the shared cool-down so outreach/synthesis
         # don't pile a second unprompted message on top of it in the same window.
         reachout_gate.mark_reachout(gate_user)
@@ -1661,6 +1676,30 @@ def _selftest() -> None:
         globals()["_decide_for_user"] = real_decide
         globals()["known_users"] = real_known
         _runtime.model = None
+
+    # The decision pass's capture is filed under the opener's exchange, marked as a drive's.
+    import numpy as _np
+    with tempfile.TemporaryDirectory() as td:
+        chats = Path(td) / "chats"
+        chats.mkdir()
+        configure(get_rag=lambda: None, make_sync_reflect_generate=lambda rag: None,
+                  load_server_config=lambda: {}, chats_dir=chats, prompts_dir=Path(td))
+        cap = {"positions": [0, 2], "residuals": {2: _np.zeros((2, 4), _np.float16)},
+               "axes": {"pain": [0.1, 0.2, 0.3]}, "layers": [2], "hidden_dim": 4,
+               "n_tokens": 3, "token_ids": [5, 6, 7]}
+        name = _write_checkin_session(
+            opener="Hi.", human="Dana", hours=30.0,
+            hidden={"capture": cap, "layer_spec": "2", "model_id": "m", "adapter_id": ""})
+        doc = json.loads((chats / name).read_text(encoding="utf-8"))
+        opener_id = doc["exchanges"][0]["exchange_id"]
+        groups = hidden_capture.read_sidecar(hidden_capture.sidecar_path(chats / name))
+        check("the opener's capture is filed under its exchange", list(groups), [opener_id])
+        check("…as a drive's, with the pass's ids",
+              (groups[opener_id]["meta"]["seam"], groups[opener_id]["meta"]["drive"],
+               groups[opener_id]["token_ids"]), ("drive", "checkin", [5, 6, 7]))
+        name = _write_checkin_session(opener="Hi.", human="Dana", hours=30.0)
+        check("no capture, no sidecar",
+              hidden_capture.sidecar_path(chats / name).exists(), False)
 
     print("checkin selftest: OK")
 

@@ -389,6 +389,22 @@ class SettingsWindow(QMainWindow):
                             f"Restart the server for it to take effect.")
 
 
+def _apply_client_theme(app: "QApplication") -> None:
+    """The client's dark theme (``client/ui/theme.py``), loaded by path so the editor
+    looks like the app it configures. Absent (a server-only checkout) → the system look."""
+    import importlib.util
+    path = _SERVER_DIR.parent / "client" / "ui" / "theme.py"
+    if not path.exists():
+        return
+    try:
+        spec = importlib.util.spec_from_file_location("ava_client_theme", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.apply_dark_theme(app)
+    except Exception:
+        pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Ava server settings editor (GUI).")
     ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
@@ -396,6 +412,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     app = QApplication(sys.argv[:1])
+    _apply_client_theme(app)
     win = SettingsWindow(args.config.resolve())
     win.show()
     return app.exec()
