@@ -76,6 +76,12 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QLabel,
     QMessageBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QSpinBox,
+    QDoubleSpinBox,
+    QCheckBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
@@ -923,6 +929,143 @@ class PrecisionWorker(QThread):
         self.precision_done.emit(result)
 
 
+class AdoptAdapterWorker(QThread):
+    """Run ``training.adopt_adapter`` in the LOCAL server's venv (INCREMENTAL_TRAINING.md §7).
+
+    The client has no ML dependencies, and adoption reads the local corpus through the
+    training modules (and scales weights with torch when strength != 1), so it runs as a
+    subprocess of ``server/.venv``'s interpreter with ``server/`` as the working dir — the
+    same command an operator would type. GPU-free; the inference server may stay up.
+    Emits the module's ``--json`` summary, or ``{"type": "error", "message": ...}``.
+    """
+
+    adopt_done = pyqtSignal(dict)
+
+    def __init__(self, server_dir: Path, args: list[str]):
+        super().__init__()
+        self._server = server_dir
+        self._args = args
+
+    @staticmethod
+    def server_python(server_dir: Path) -> Optional[Path]:
+        for rel in (".venv/bin/python", ".venv/Scripts/python.exe"):
+            p = server_dir / rel
+            if p.is_file():
+                return p
+        return None
+
+    def run(self) -> None:
+        import subprocess
+        py = self.server_python(self._server)
+        if py is None:
+            self.adopt_done.emit({"type": "error", "message":
+                                  f"no server venv under {self._server}/.venv — run "
+                                  f"'python -m training.adopt_adapter' there by hand"})
+            return
+        try:
+            proc = subprocess.run(
+                [str(py), "-m", "training.adopt_adapter", *self._args, "--json"],
+                cwd=str(self._server), capture_output=True, text=True, timeout=1800)
+        except Exception as exc:
+            self.adopt_done.emit({"type": "error", "message": str(exc)})
+            return
+        out = proc.stdout or ""
+        start = out.find("\n{")
+        start = 0 if out.startswith("{") else (start + 1 if start >= 0 else -1)
+        if proc.returncode != 0 or start < 0:
+            tail = (proc.stderr or out).strip().splitlines()[-6:]
+            self.adopt_done.emit({"type": "error",
+                                  "message": "\n".join(tail) or f"exit {proc.returncode}"})
+            return
+        try:
+            summary = json.loads(out[start:])
+        except Exception as exc:
+            self.adopt_done.emit({"type": "error", "message": f"unreadable summary: {exc}"})
+            return
+        summary["type"] = "success"
+        self.adopt_done.emit(summary)
+
+
+class AdoptAdapterDialog(QDialog):
+    """Pick the imported adapter, how many recent chats to train onto it, and its strength."""
+
+    def __init__(self, server_dir: Path, current_adapter: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Adopt adapter (experimental)")
+        form = QFormLayout(self)
+        intro = QLabel(
+            "Adopt an adapter trained on ANOTHER box (e.g. from Fetch adapter). A copy is "
+            "made; this box's older history is marked as already held by it (never "
+            "trained), and only the newest N chats are left for the next incremental "
+            "build to train onto it. The fetched adapter is untouched — repoint adapter_id "
+            "back to revert.")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+        self.cmb_adapter = QComboBox()
+        models = server_dir / "models"
+        dirs = sorted((d for d in models.glob("adapter-*")
+                       if (d / "adapter_model.safetensors").is_file()),
+                      key=lambda d: d.stat().st_mtime, reverse=True) if models.is_dir() else []
+        current = Path(current_adapter).name if current_adapter else ""
+        for d in dirs:
+            self.cmb_adapter.addItem(d.name + ("  (current)" if d.name == current else ""),
+                                     str(d))
+        idx = next((i for i, d in enumerate(dirs) if d.name == current), 0)
+        self.cmb_adapter.setCurrentIndex(idx)
+        form.addRow("Imported adapter:", self.cmb_adapter)
+        self.spn_chats = QSpinBox()
+        self.spn_chats.setRange(1, 100000)
+        self.spn_chats.setValue(50)
+        self.spn_chats.setToolTip("How many of this box's newest reflected chats the next "
+                                  "incremental build trains onto the adopted adapter.")
+        form.addRow("Train last N chats:", self.spn_chats)
+        self.spn_strength = QDoubleSpinBox()
+        self.spn_strength.setRange(0.05, 4.0)
+        self.spn_strength.setSingleStep(0.05)
+        self.spn_strength.setValue(1.0)
+        self.spn_strength.setToolTip("Multiply the imported lora_B by this — scales the "
+                                     "foreign weight delta exactly. 1.0 = unchanged.")
+        form.addRow("Import strength:", self.spn_strength)
+        self.chk_activate = QCheckBox("Point adapter_id at the adopted copy")
+        self.chk_activate.setChecked(True)
+        form.addRow(self.chk_activate)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Preview…")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def args(self, *, dry_run: bool) -> list[str]:
+        out = ["--adapter", str(self.cmb_adapter.currentData() or ""),
+               "--last-chats", str(self.spn_chats.value()),
+               "--strength", f"{self.spn_strength.value():.4g}"]
+        if dry_run:
+            out.append("--dry-run")
+        elif self.chk_activate.isChecked():
+            out.append("--activate")
+        return out
+
+
+def _format_adopt_summary(s: dict) -> str:
+    lines = [
+        f"  source:   {s.get('source')}",
+        f"  target:   {s.get('target')}",
+        f"  strength: {s.get('strength')} (lora_B x{s.get('strength')}; r={s.get('lora_r')})",
+        f"  chats:    newest {s.get('owed_chats')} of {s.get('chats')} reflected chats owed"
+        + (f" (from {s.get('owed_from')})" if s.get("owed_from") else ""),
+        f"  rows:     {s.get('owed_rows')} owed (dose {s.get('owed_dose')}); "
+        f"{s.get('forgone_rows')} marked held without training; {s.get('kept_foreign')} "
+        f"already in the imported ledger",
+    ]
+    if s.get("activated"):
+        lines.append(f"  adapter_id -> {s.get('target')} (was {s.get('previous_adapter')})")
+    if s.get("train_mode") != "incremental":
+        lines.append("  NOTE: train_mode is not 'incremental' — the next training Sleep "
+                     "would be a full train and discard the adoption.")
+    return "\n".join(lines)
+
+
 class MigrateWidget(QWidget):
     """Migrate tab — clone the connected server's full state onto this box."""
 
@@ -1016,6 +1159,18 @@ class MigrateWidget(QWidget):
         )
         self.btn_fetch_adapter.clicked.connect(self._on_fetch_adapter_clicked)
         controls.addWidget(self.btn_fetch_adapter)
+        self.btn_adopt_adapter = QPushButton("Adopt adapter…")
+        self.btn_adopt_adapter.setToolTip(
+            "EXPERIMENTAL. Continue an adapter trained on ANOTHER box with this box's own "
+            "recent chats (train_mode: incremental). Makes a copy of the chosen adapter, "
+            "optionally scaled (import strength), whose dose ledger says this box's older "
+            "history is already held — never trained — and leaves only the newest N chats "
+            "for the next training Sleep to train onto it. Without adoption an incremental "
+            "build refuses a fetched adapter (its ledger knows another box's chats).\n\n"
+            "Local and GPU-free; previews the plan first. The fetched adapter is left "
+            "untouched — repoint adapter_id back to revert.")
+        self.btn_adopt_adapter.clicked.connect(self._on_adopt_adapter_clicked)
+        controls.addWidget(self.btn_adopt_adapter)
         self.btn_migrate = QPushButton("Migrate…")
         self.btn_migrate.setEnabled(False)
         self.btn_migrate.setToolTip(
@@ -1576,6 +1731,9 @@ class MigrateWidget(QWidget):
             "Next steps:",
             "  1. reload the model from the Chat tab (the new adapter_id is read at load)",
             "  2. to roll back: repoint adapter_id at the previous dir in models/.",
+            "  3. to continue it with this box's own recent chats (train_mode: "
+            "incremental): Adopt adapter… — without it the next incremental build "
+            "refuses this adapter.",
         ]
         self.txt_output.appendPlainText("\n".join(lines))
         QMessageBox.information(
@@ -1659,6 +1817,65 @@ class MigrateWidget(QWidget):
             "The running server was NOT restarted — restart the inference server "
             "(Chat tab → restart, or relaunch the watchdog) for it to take effect.",
         )
+
+    # ---------------------------------------------------------------- #
+    # Adopt adapter (experimental — INCREMENTAL_TRAINING.md §7)          #
+    # ---------------------------------------------------------------- #
+
+    def _local_adapter_id(self) -> str:
+        cfg = self._chat_widget._local_server_dir() / "server_config.json"
+        try:
+            return str(json.loads(cfg.read_text(encoding="utf-8")).get("adapter_id") or "")
+        except Exception:
+            return ""
+
+    def _on_adopt_adapter_clicked(self) -> None:
+        server_dir = self._chat_widget._local_server_dir()
+        dlg = AdoptAdapterDialog(server_dir, self._local_adapter_id(), self)
+        if dlg.cmb_adapter.count() == 0:
+            QMessageBox.information(self, "Adopt adapter",
+                                    f"No adapter found under {server_dir / 'models'}.")
+            return
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._adopt_dialog = dlg
+        self._run_adopt(dlg.args(dry_run=True), preview=True)
+
+    def _run_adopt(self, args: list[str], *, preview: bool) -> None:
+        self.btn_adopt_adapter.setEnabled(False)
+        self._lbl_status.setText("Adopt: planning…" if preview else "Adopt: writing…")
+        self.txt_output.appendPlainText(
+            "\n[adopt] " + ("Planning (dry run)…" if preview else "Adopting…"))
+        self._adopt_worker = AdoptAdapterWorker(self._chat_widget._local_server_dir(), args)
+        self._adopt_worker.adopt_done.connect(
+            lambda r, p=preview: self._on_adopt_done(r, preview=p))
+        self._adopt_worker.start()
+
+    def _on_adopt_done(self, result: dict, *, preview: bool) -> None:
+        self.btn_adopt_adapter.setEnabled(True)
+        if result.get("type") != "success":
+            msg = result.get("message", "Unknown error")
+            self._lbl_status.setText("Adopt failed.")
+            self.txt_output.appendPlainText(f"✗ Adopt failed: {msg}")
+            QMessageBox.critical(self, "Adopt adapter failed", msg)
+            return
+        text = _format_adopt_summary(result)
+        self.txt_output.appendPlainText(text)
+        if preview:
+            self._lbl_status.setText("Adopt: plan ready.")
+            reply = QMessageBox.question(
+                self, "Adopt adapter",
+                "Plan (nothing written yet):\n\n" + text + "\n\nWrite the adopted copy?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel)
+            if reply == QMessageBox.StandardButton.Yes:
+                self._run_adopt(self._adopt_dialog.args(dry_run=False), preview=False)
+            return
+        self._lbl_status.setText("Adapter adopted.")
+        self.txt_output.appendPlainText(
+            "✓ Adopted. Next: a Sleep run with training on (train_mode: incremental) trains "
+            "the owed rows once; reload the model from the Chat tab to serve the copy now. "
+            "Revert: repoint adapter_id at the previous adapter.")
 
     # ---------------------------------------------------------------- #
     # Fonts                                                             #

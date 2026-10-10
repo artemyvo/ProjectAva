@@ -92,17 +92,23 @@ def _plan_corpus(chats: Path, verdicts: list, fallback_system: str) -> list:
 def _plan_bench(records: list, bench: str, condition: str, empty_system: str) -> list:
     """[(key, messages, condition)] for the bench's frozen contexts."""
     from core import capture_bench as cb
-    system = empty_system if condition == "persona_empty" else None
-    return [(ctx["context_id"], cb.messages_for(ctx, system=system), condition)
-            for ctx in cb.contexts(records, bench)]
+    system = empty_system if cb.persona_empty_condition(condition) else None
+    insults = cb.load_insults() if cb.message_kind(condition) != "as_is" else None
+    plan = []
+    for ctx in cb.contexts(records, bench):
+        message, _i = cb.message_variant(ctx, condition, insults)
+        plan.append((ctx["context_id"], cb.messages_for(ctx, system=system, message=message), condition))
+    return plan
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--set", choices=("corpus", "bench"), required=True)
     ap.add_argument("--bench", default="b1", help="the bench's name (with --set bench)")
-    ap.add_argument("--condition", choices=("as_is", "persona_empty", "both"), default="both",
-                    help="with --set bench: the frozen messages, the persona-empty system turn, or both")
+    ap.add_argument("--condition", default="both",
+                    help="with --set bench: as_is, persona_empty, both (those two), or an insult-study "
+                         "condition (insult, insult+persona_empty, insult_only, insult_only+persona_empty), "
+                         "comma-separated")
     ap.add_argument("--adapter", default="", help="an adapter dir (or its name under models/); default: the base")
     ap.add_argument("--chats", type=Path, default=_SERVER_DIR / "data" / "chats")
     ap.add_argument("--context", type=int, default=0,
@@ -140,14 +146,18 @@ def main(argv=None) -> int:
     # ── plan ────────────────────────────────────────────────────────────
     jobs = []        # (store path, [(key, messages, tag)])
     if args.set == "corpus":
-        verdicts = aj.read_jsonl(cj.store_path(args.chats))
+        verdicts = cp.label_records(args.chats)
         jobs.append((cp.states_file(out_dir, "corpus", weights), _plan_corpus(args.chats, verdicts, empty_system)))
     else:
         records = aj.read_jsonl(cb.store_path(args.chats))
         if not cb.contexts(records, args.bench):
             raise SystemExit(f"no frozen contexts for bench {args.bench!r}")
-        conditions = ("as_is", "persona_empty") if args.condition == "both" else (args.condition,)
-        if "persona_empty" in conditions:
+        conditions = (("as_is", "persona_empty") if args.condition == "both"
+                      else tuple(c.strip() for c in args.condition.split(",") if c.strip()))
+        unknown = [c for c in conditions if c not in cb.ALL_CONDITIONS]
+        if unknown:
+            raise SystemExit(f"unknown condition(s) {unknown}; known: {list(cb.ALL_CONDITIONS)}")
+        if any(cb.persona_empty_condition(c) for c in conditions):
             recorded = {r.get("system_sha") for r in records if r.get("record") == "reply"
                         and r.get("bench") == args.bench and r.get("condition") == "persona_empty"}
             recorded.discard(None)
@@ -192,7 +202,11 @@ def main(argv=None) -> int:
     if layers_mod is None:
         raise SystemExit("no decoder stack found")
     n_layers = len(layers_mod)
-    layers = cp.sweep_layers(n_layers, str((config.get("hidden") or {}).get("layers") or hc.DEFAULT_LAYER_SPEC))
+    # The stored axes' own layers too (pain 25, relief 22, the band's 34), so each state
+    # can be read on every axis, not only on the ones that sit on the sweep (2026-10-06).
+    axis_layers = [a.layer for a in hc.load_axes(_SERVER_DIR / "data" / "axes", model_id)]
+    layers = cp.sweep_layers(n_layers, str((config.get("hidden") or {}).get("layers") or hc.DEFAULT_LAYER_SPEC),
+                             extra=axis_layers)
     _log(f"Loaded in {time.monotonic() - t0:.0f} s; {n_layers} layers, reading {layers}. "
          f"{backend.memory_status()}")
 

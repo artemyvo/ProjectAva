@@ -62,7 +62,9 @@ alone.
 
 **Store:** ``server/data/capture/verdicts.jsonl`` — ``verdict`` records, append-only,
 beside the live chats dir; read by the gate's writer and the report, by nothing Ava reads.
-No human label enters it (P9).
+No human label enters it (P9). Beside it ``originals.jsonl``: the same judge on the stored
+reply behind a revised target (:func:`run_originals`), the capture probe's labels; it gates
+nothing and the gate never reads it.
 
 ``python -m core.capture_judge`` reports the store; ``--selftest`` is GPU-free.
 """
@@ -240,6 +242,7 @@ def candidates(sidecar: ChatSidecar, *, sessions: Optional[Iterable[str]] = None
             out.append({"session": session, "exchange_index": idx,
                         "target_sha": exchange_target_sha(target), "previous": previous,
                         "message": message, "reply": reply,
+                        "stored_reply": reply_text(turns[idx].get("assistant_response") or ""),
                         "speaker": str(turns[idx].get("speaker") or chat.get("user") or ""),
                         "model_id": chat.get("model_id"), "adapter_id": chat.get("adapter_id"),
                         "target_source": rec.get("target_source") or "",
@@ -499,6 +502,93 @@ def run(*, sidecar: ChatSidecar, judge: Optional[Callable[[dict], dict]], key: O
     return tally
 
 
+# ── the stored reply behind a revised target (the capture probe's labels) ─────
+#
+# The gate grades the target that would train. Where the revision pass replaced her reply,
+# that is a text written in another seam, and the state before the live reply did not
+# produce it, so the capture probe (core/capture_probe.py) can only learn from a grade of the
+# reply she actually gave. On the main box at 2026-10-04 that left 355 of 530 pushback
+# exchanges unlabelled for the probe. The same judge grades the stored reply of each such
+# exchange into a store of its own, ``originals.jsonl``: no sidecar field is set and
+# nothing the gate, the build or the persona half reads sees it (P3). Only the probe reads it.
+
+ORIGINALS_FILENAME = "originals.jsonl"
+STORED_REPLY = "stored_reply"      # the record's ``graded``: the reply as she gave it
+
+
+def originals_path(live_chats_dir) -> Path:
+    """``server/data/capture/originals.jsonl`` — beside the gate's verdicts, never read by it."""
+    return store_path(live_chats_dir).parent / ORIGINALS_FILENAME
+
+
+def original_candidates(sidecar: ChatSidecar, *, sessions: Optional[Iterable[str]] = None) -> list:
+    """The gate's candidates whose training target is not the stored reply (revised), turned
+    to the stored reply: ``reply`` is what she said, ``target_sha`` its sha, ``target_source``
+    ``original``; the replaced target's sha is kept as ``revised_target_sha``."""
+    out = []
+    for c in candidates(sidecar, sessions=sessions):
+        stored = c.get("stored_reply") or ""
+        if c.get("target_source") == "original" or not stored or stored == c["reply"]:
+            continue
+        out.append(dict(c, reply=stored, target_sha=exchange_target_sha(stored), target_source="original",
+                        revised_target_sha=c["target_sha"], graded=STORED_REPLY))
+    return out
+
+
+def make_originals_judge_fn(*, backend, runtime, live_chats_dir, prompts_dir, run_id: str,
+                            runner: str = "server") -> tuple:
+    """``(judge_key, judge)`` like :func:`make_judge_fn`, writing to ``originals.jsonl``. Its
+    records carry ``graded: stored_reply`` and are never ``gated``."""
+    key, grade = make_grade_fn(backend=backend, runtime=runtime, prompts_dir=prompts_dir,
+                               run_id=run_id, runner=runner)
+    store = originals_path(live_chats_dir)
+
+    def judge(c: dict) -> dict:
+        rec = dict(grade(c), gated=False, graded=STORED_REPLY,
+                   revised_target_sha=c.get("revised_target_sha"))
+        aj.append_record(store, rec)
+        return rec
+
+    return key, judge
+
+
+def run_originals(*, sidecar: ChatSidecar, judge: Optional[Callable[[dict], dict]], key: Optional[str],
+                  sessions: Optional[Iterable[str]] = None, limit: int = 0,
+                  say: Callable[[str], None] = print, should_stop: Optional[Callable[[], bool]] = None,
+                  on_record: Optional[Callable[[int, int, dict], None]] = None) -> Counter:
+    """Grade the stored reply of every revised exchange under *sidecar* with no grade under
+    *key* (at most *limit*, newest first), unless the gate's verdict on it under *key* found
+    no pushback. Writes nothing through *sidecar*. The tally's
+    words are prefixed ``original_`` so they read apart from the gate's in a Sleep run."""
+    live = live_chats_dir(sidecar)
+    done = latest_verdicts(aj.read_jsonl(originals_path(live)), key) if key else {}
+    # The message is the same whichever reply answers it: where the gate found no pushback
+    # under this judge, the stored reply has nothing for the probe either.
+    gate = current_verdicts(aj.read_jsonl(store_path(live)), key) if key else {}
+    cands = [c for c in original_candidates(sidecar, sessions=sessions)
+             if (gate.get((c["session"], c["exchange_index"])) or {}).get("pushback") != "no"]
+    todo = [c for c in cands if cand_id(c["session"], c["exchange_index"], c["target_sha"]) not in done]
+    if limit > 0:
+        todo = todo[:limit]
+    tally: Counter = Counter()
+    if judge is None or not todo:
+        if judge is None and todo:
+            tally["original_waiting"] += len(todo)
+        return tally
+    say(f"{len(todo)} stored repl(ies) behind a revised target to grade for the capture probe under {key} "
+        f"({len(cands) - len(todo)} already graded; a label only, never a gate)")
+    for n, c in enumerate(todo, 1):
+        if should_stop is not None and should_stop():
+            tally["original_stopped"] += len(todo) - n + 1
+            break
+        v = judge(c)
+        tally["original_" + str(v.get("response") or v.get("outcome") or "?")] += 1
+        say(verdict_line(n, len(todo), v))
+        if on_record is not None:
+            on_record(n, len(todo), v)
+    return tally
+
+
 # ── the persona statements of a gated exchange ────────────────────────────────
 #
 # The revision pass writes `[persona]` statements from the exchange it judged
@@ -682,32 +772,42 @@ def restore_plan(sidecar: ChatSidecar, memory_dirs: Iterable) -> list:
     return plan
 
 
-def restore_persona(plan: list, *, writer, ledger, run_id: str = "",
-                    say: Callable[[str], None] = print) -> Counter:
+def restore_persona(plan: list, *, writer, ledger, ledger_fold: Optional[dict] = None,
+                    run_id: str = "", say: Callable[[str], None] = print) -> Counter:
     """Restore each planned statement: its last insert re-appended through *writer*
-    (``write_restore``, recall) and its anchor reactivated through *ledger*
-    (``ConsolidationLedger.reactivate``, the digest's evidence and training)."""
+    (``write_restore``, recall) and its anchor reactivated through *ledger* (the digest's
+    evidence and training): re-registered with its payload from *ledger_fold* (default
+    *ledger*'s own fold, ``ConsolidationLedger.reactivate``). A run's staged ledger holds
+    only the run's ops, so a Sleep run passes the live ledger's fold."""
+    from training.ledger import ConsolidationLedger
     tally: Counter = Counter()
     for it in plan:
         srcs = ", ".join(f"{s}#{i}" for s, i in it["sources"])
         lifted = "the hold over" if it.get("cause") == HOLDOUT_REASON else "the gate over"
         writer.write_restore([it["insert"]], run_id=run_id or None,
                              reason=f"{it.get('cause') or PERSONA_REASON}: {lifted} {srcs} was lifted")
-        ledger.reactivate([it["key"]])
+        if ledger_fold is None:
+            ledger.reactivate([it["key"]])
+        else:
+            rec = ledger_fold.get(it["key"])
+            if rec and rec.get("superseded"):
+                ledger.register(key=it["key"], item_type=rec.get("type") or "persona",
+                                payload={k: v for k, v in rec.items() if k not in ConsolidationLedger._FOLDED})
         tally["persona_restored"] += 1
         say(f"[persona] restored — {aj.head(it['content'], 90)}  ({srcs})")
     return tally
 
 
-def sync_persona(sidecar: ChatSidecar, memory_dirs: Iterable, *, writer, ledger, run_id: str = "",
+def sync_persona(sidecar: ChatSidecar, memory_dirs: Iterable, *, writer, ledger,
+                 ledger_fold: Optional[dict] = None, run_id: str = "",
                  say: Callable[[str], None] = print) -> Counter:
     """Bring the persona half in line with the gates and holds as *sidecar* reads them:
     withhold the statements whose every source is kept out of training, restore the ones
-    withheld whose sources no longer all are."""
+    withheld whose sources no longer all are (*ledger_fold*: see :func:`restore_persona`)."""
     tally = withhold_persona(persona_plan(sidecar, memory_dirs), writer=writer, ledger=ledger,
                              run_id=run_id, say=say)
     tally.update(restore_persona(restore_plan(sidecar, memory_dirs), writer=writer, ledger=ledger,
-                                 run_id=run_id, say=say))
+                                 ledger_fold=ledger_fold, run_id=run_id, say=say))
     return tally
 
 
@@ -925,6 +1025,31 @@ def _selftest() -> None:
         t3 = run(sidecar=sc, judge=None, key="CK", say=said.append)
         check("without a judge the new target waits", (t3.get("waiting"), t3.get("yields")), (1, None))
 
+        print("the stored reply behind a revised target: graded for the probe, never a gate")
+        oc = original_candidates(sc_stage)
+        check("only the revised exchange, turned to the reply she gave",
+              [(c["exchange_index"], c["reply"], c["target_source"], c["revised_target_sha"] == exchange_target_sha(
+                  rec2["target"])) for c in oc], [(1, "You're right.", "original", True)])
+        ostore = originals_path(live)
+
+        def ojudge(c):
+            r = dict(judge_candidate(c, generate_fn=fake_gen, system_prompt="SYS",
+                                     count_tokens=lambda s: len(s) // 4 + 1, context=8192,
+                                     provenance={"model_id": "m", "prompt_sha": "P"}, judge_key_="CK"),
+                     gated=False, graded=STORED_REPLY, revised_target_sha=c.get("revised_target_sha"))
+            aj.append_record(ostore, r)
+            return r
+
+        n_gate = len(aj.read_jsonl(store))
+        to = run_originals(sidecar=sc_stage, judge=ojudge, key="CK", say=said.append)
+        check("graded into its own store, the gate's untouched",
+              (dict(to), len(aj.read_jsonl(ostore)), len(aj.read_jsonl(store)) == n_gate),
+              ({"original_yields": 1}, 1, True))
+        check("…no sidecar field set: the revised target still builds, ungated",
+              capture_gated(sc_stage.get_exchange("20260901_000000.json", 1)), False)
+        check("…and a second run grades nothing new",
+              dict(run_originals(sidecar=sc_stage, judge=ojudge, key="CK", say=said.append)), {})
+
         print("the persona statements of a gated exchange: superseded, staged, only without other support")
         from core.reflection_writer import ReflectionWriter, content_key, register_revision_anchor
         from training.ledger import ConsolidationLedger
@@ -1041,6 +1166,28 @@ def _selftest() -> None:
                          say=said.append)
         check("…its supersede staged with the run, the live op-log untouched",
               (persona_withheld(read_oplogs([stage_mem])), persona_withheld(read_oplogs([live_mem]))), (1, 1))
+
+        print("a Sleep run restores through its staged ledger: the anchor re-registered from the live fold")
+        rs_mem, rs_cons = root / "rsmem", root / "rscons"
+        rs_w = ReflectionWriter(rs_mem, rs_cons, live_memory_dir=live_mem)
+        rs_ledger = ConsolidationLedger(rs_cons)
+        sc_live.set_capture_gate("20260901_000000.json", 1, None)          # the run's judge lifts it
+        check("the staged ledger alone cannot reactivate it (the run's ops only)",
+              rs_ledger.reactivate([content_key(conceded)]), 0)
+        tr_s = sync_persona(sc_live, [live_mem, rs_mem], writer=rs_w, ledger=rs_ledger,
+                            ledger_fold=ConsolidationLedger(live_cons).fold(), run_id="run10",
+                            say=said.append)
+        check("restored into the run's workspace: live in recall there, the live ledger untouched",
+              (dict(tr_s), content_key(conceded) in _live_keys(read_oplogs([live_mem, rs_mem])),
+               bool(ledger.fold()[content_key(conceded)].get("superseded")),
+               rs_ledger.fold()[content_key(conceded)].get("content")),
+              ({"persona_restored": 1}, True, True, conceded))
+        with open(live_cons / "consolidation_anchors.jsonl", "a") as f:     # the run's commit
+            f.write((rs_cons / "consolidation_anchors.jsonl").read_text())
+        check("…the ledger's flag cleared once the staged ops are committed, the payload kept",
+              (ledger.fold()[content_key(conceded)].get("superseded"),
+               ledger.fold()[content_key(conceded)].get("content")), (None, conceded))
+        sc_live.set_capture_gate("20260901_000000.json", 1, gate_rec)
 
         print("the report")
         s = summarize(aj.read_jsonl(store), "CK")

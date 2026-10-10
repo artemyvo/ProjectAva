@@ -637,7 +637,10 @@ class ReflectionRunner:
         distill_gate_fn: Optional[Callable] = None,
         reset_conversations_fn: Optional[Callable] = None,
         capture_gate_fn: Optional[Callable] = None,
+        thought_hygiene_fn: Optional[Callable] = None,
+        persona_hygiene_fn: Optional[Callable] = None,
         child_ask_fn: Optional[Callable] = None,
+        aspiration_fn: Optional[Callable] = None,
         finalize: bool = True,
     ) -> str:
         """Execute consolidation, judgement/re-answer, and optionally branch.
@@ -750,6 +753,26 @@ class ReflectionRunner:
             through this run's sidecar, and the ``[persona]`` statements written from a
             gated exchange are superseded through its writer and ledger (all staged with the
             run). None when ``capture_gate.enabled`` is off.
+
+        *thought_hygiene_fn* fn(sidecar=, run_id=, say=, should_stop=) -> tally: thought
+            hygiene (``core.thought_hygiene``), in the clean-base batch just before the capture
+            gate: the frozen base marks the lines of each training target's thought that only
+            recite her description, and they are cut from the target through this run's
+            sidecar (staged). None when ``thought_hygiene.enabled`` is off.
+
+        *persona_hygiene_fn* fn(writer=, consolidation_dir=, memory_dirs=, run_id=, say=,
+            should_stop=) -> (tally, withheld keys): persona hygiene
+            (``core.persona_hygiene``), in the clean-base batch before the persona digest is
+            grouped: the frozen base reads each ``[persona]`` statement it has not read, and
+            one that describes a habit of hers instead of a disposition she stands by is
+            superseded through this run's writer and ledger (staged); the withheld keys leave
+            this run's digest evidence. None when ``persona_hygiene.enabled`` is off.
+
+        *aspiration_fn* fn(writer=, memory_dirs=, run_id=, say=, should_stop=) -> tally: what
+            she wants to become (``core.aspiration``), on the ADAPTER after the child ask: her
+            self-review of a few portrait items and the aspirations she writes from a habit she
+            caught herself in, through this run's writer (staged; op-log ops nothing recalls).
+            None when ``aspiration.enabled`` is off.
 
         *child_ask_fn* fn(writer=, memory_dirs=, run_id=, say=, should_stop=) -> tally: the
             child ask (``core.child_ask.sleep_children``), on the ADAPTER after the clean-base
@@ -1171,7 +1194,10 @@ class ReflectionRunner:
                 digest_plan = self._plan_persona_digest(
                     run_id, store, send_event_fn,
                     force=bool(getattr(config.overrides,
-                                       "force_persona_digest", False)),
+                                       "force_persona_digest", False))
+                    # a self-review decision the portrait on disk has not heard of
+                    # (`core/aspiration.py`): rewrite it even on unchanged evidence
+                    or self._portrait_unheard_decisions() > 0,
                 )
             run_digest_cluster = bool(digest_plan.get("should_run"))
             # Kill-switch for the blocked clustering (mirrors apply_branch_judge): when
@@ -1286,10 +1312,22 @@ class ReflectionRunner:
             #     of the build (`core/capture_judge.py`, P3). Last in the batch: the branch
             #     judge's flip can still change a target before it.
             run_capture_gate = bool(capture_gate_fn is not None and not dry_run)
+            # (f') thought hygiene — the frozen base marks the lines of each training target's
+            #     thought that only recite her description, cut from what trains
+            #     (`core/thought_hygiene.py`). Just before the capture gate: a target the
+            #     branch judge flipped is read here, and the gate's verdict moves with a cut.
+            run_thought_hygiene = bool(thought_hygiene_fn is not None and not dry_run)
+            # (f'') persona hygiene — the frozen base reads each [persona] statement, and one
+            #     that describes a habit of hers instead of a disposition she stands by is
+            #     withheld (`core/persona_hygiene.py`). Before the digest is grouped, so what
+            #     it withholds is not grouped into her portrait in this run.
+            run_persona_hygiene = bool(persona_hygiene_fn is not None and not dry_run
+                                       and not getattr(config, "revisit", False))
             if (clean_base_ctx is not None
                     and (run_branch_judge or run_fact_placement or run_digest_cluster
                          or user_plans or self_plan or run_fact_dedup or run_prompt_patterns
-                         or run_distill_gate or run_capture_gate)
+                         or run_distill_gate or run_capture_gate or run_thought_hygiene
+                         or run_persona_hygiene)
                     and not store.is_stop_requested(run_id)):
                 def _clean_base_batch():
                     nonlocal digest_evidence, user_evidence, self_evidence
@@ -1312,6 +1350,15 @@ class ReflectionRunner:
                             fact_candidates, run_id, config=config,
                             generate_fn=generate_fn, store=store,
                             send_event_fn=send_event_fn, stats=stats, tokenizer=tokenizer)
+                    if run_persona_hygiene and not store.is_stop_requested(run_id):
+                        withheld = self._run_clean_base_persona_hygiene(
+                            run_id, persona_hygiene_fn=persona_hygiene_fn, store=store,
+                            send_event_fn=send_event_fn)
+                        if withheld and digest_plan.get("base"):
+                            from core import reflection_digest as _rd
+                            digest_plan["base"] = [e for e in digest_plan["base"]
+                                                   if e.get("key") not in withheld]
+                            digest_plan["raw_fp"] = _rd.raw_fingerprint(digest_plan["base"])
                     if run_digest_cluster and not store.is_stop_requested(run_id):
                         digest_evidence = self._cluster_persona_digest(
                             digest_plan, run_id, generate_fn, store, send_event_fn,
@@ -1333,6 +1380,10 @@ class ReflectionRunner:
                         self._run_clean_base_prompt_patterns(
                             run_id, config=config, generate_fn=generate_fn,
                             store=store, send_event_fn=send_event_fn)
+                    if run_thought_hygiene and not store.is_stop_requested(run_id):
+                        self._run_clean_base_thought_hygiene(
+                            run_id, thought_hygiene_fn=thought_hygiene_fn, store=store,
+                            send_event_fn=send_event_fn)
                     if run_capture_gate and not store.is_stop_requested(run_id):
                         self._run_clean_base_capture_gate(
                             run_id, capture_gate_fn=capture_gate_fn, store=store,
@@ -1394,6 +1445,14 @@ class ReflectionRunner:
                     and not store.is_stop_requested(run_id)):
                 self._run_child_asks(run_id, child_ask_fn=child_ask_fn, store=store,
                                      send_event_fn=send_event_fn)
+            # 4d. What she wants to become (`core/aspiration.py`, §4.10), on the ADAPTER: her
+            #     self-review of a few items of her portrait, and the aspirations she writes from
+            #     a habit she caught herself in (persona hygiene's HABIT verdicts, this run's
+            #     included). Staged with the run; recorded only (phase 1), nothing acts on it.
+            if (aspiration_fn is not None and not dry_run and not getattr(config, "revisit", False)
+                    and not store.is_stop_requested(run_id)):
+                self._run_aspirations(run_id, aspiration_fn=aspiration_fn, store=store,
+                                      send_event_fn=send_event_fn)
 
             # 5. Persona digest, part two: synthesize the self-portrait on the ADAPTER —
             #    authorship is Ava's, unlike the clustering that fed it. When no clean-base
@@ -5604,6 +5663,57 @@ class ReflectionRunner:
         self._emit(store, send_event_fn, run_id, "phase_done", phase="distill_gate",
                    message=f"Distill gate done — {done}")
 
+    def _run_clean_base_thought_hygiene(self, run_id: str, *, thought_hygiene_fn: Callable,
+                                        store: ReflectionRunStore,
+                                        send_event_fn: Optional[Callable]) -> None:
+        """Thought hygiene (``core/thought_hygiene.py``), inside the clean base: the lines of
+        each unread training target's thought that only recite her description are cut,
+        through this run's sidecar (staged with the run). A failure leaves the targets
+        unread, for the next run."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="thought_hygiene",
+                   message="Thought hygiene (clean base) — the thoughts of the targets not yet read…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "thought_hygiene", message=text)
+
+        try:
+            tally = thought_hygiene_fn(sidecar=self._session_sidecar(), run_id=run_id, say=_say,
+                                       should_stop=lambda: store.is_stop_requested(run_id)) or {}
+        except Exception as e:  # noqa: BLE001 — the targets wait for the next run
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="thought_hygiene",
+                       message=f"Thought hygiene error (the targets wait for the next run): {e}")
+            return
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "nothing to read"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="thought_hygiene",
+                   message=f"Thought hygiene done — {done}")
+
+    def _run_clean_base_persona_hygiene(self, run_id: str, *, persona_hygiene_fn: Callable,
+                                        store: ReflectionRunStore,
+                                        send_event_fn: Optional[Callable]) -> set:
+        """Persona hygiene (``core/persona_hygiene.py``), inside the clean base: the
+        ``[persona]`` statements the judge reads as a habit of hers are withheld through this
+        run's writer and ledger (staged with the run). Returns the withheld keys. A failure
+        leaves the statements unread, for the next run."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="persona_hygiene",
+                   message="Persona hygiene (clean base) — the [persona] statements not yet read…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "persona_hygiene", message=text)
+
+        try:
+            tally, withheld = persona_hygiene_fn(
+                writer=self._writer, consolidation_dir=self._consolidation_dir,
+                memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say, should_stop=lambda: store.is_stop_requested(run_id))
+        except Exception as e:  # noqa: BLE001 — the statements wait for the next run
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="persona_hygiene",
+                       message=f"Persona hygiene error (the statements wait for the next run): {e}")
+            return set()
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally or {}).items())) or "nothing to read"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="persona_hygiene",
+                   message=f"Persona hygiene done — {done}")
+        return set(withheld or ())
+
     def _run_clean_base_capture_gate(self, run_id: str, *, capture_gate_fn: Callable,
                                      store: ReflectionRunStore,
                                      send_event_fn: Optional[Callable]) -> None:
@@ -5657,6 +5767,31 @@ class ReflectionRunner:
         done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "none waited"
         self._emit(store, send_event_fn, run_id, "phase_done", phase="child_ask",
                    message=f"Child ask done — {done}")
+
+    def _run_aspirations(self, run_id: str, *, aspiration_fn: Callable, store: ReflectionRunStore,
+                         send_event_fn: Optional[Callable]) -> None:
+        """What she wants to become (``core/aspiration.py``) on the adapter: her self-review of
+        a few portrait items and the aspirations she writes from a habit she caught herself in,
+        through this run's writer (staged). A failure leaves them waiting."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="aspiration",
+                   message="What I want to become — a self-review of her portrait and the habits she caught…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "aspiration", message=text)
+
+        try:
+            tally = aspiration_fn(
+                writer=self._writer,
+                memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say,
+                should_stop=lambda: store.is_stop_requested(run_id)) or {}
+        except Exception as e:  # noqa: BLE001 — the items and habits keep waiting
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="aspiration",
+                       message=f"Aspiration error (the items and habits keep waiting): {e}")
+            return
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally).items())) or "nothing waited"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="aspiration",
+                   message=f"What I want to become done — {done}")
 
     def _run_reset_conversations(self, run_id: str, *, reset_conversations_fn: Callable,
                                  store: ReflectionRunStore,
@@ -6015,9 +6150,15 @@ class ReflectionRunner:
         self._emit(store, send_event_fn, run_id, "phase_started",
                    phase="persona_digest",
                    message="Persona digest: synthesizing self-portrait")
+        left = self._portrait_left_behind()
+        if left:
+            self._emit(store, send_event_fn, run_id, "persona_digest",
+                       message=f"Persona digest: {len(left)} line(s) she chose in self-review "
+                               "not to carry forward are handed to the synthesis")
         summary = reflection_digest.synthesize_digest(
             evidence, generate_fn=generate_fn, persona_dir=persona_dir(),
-            run_id=run_id, raw_fp=plan.get("raw_fp"), gate_screen=gate_screen)
+            run_id=run_id, raw_fp=plan.get("raw_fp"), gate_screen=gate_screen,
+            left_behind=left)
         if summary.get("status") == "written":
             msg = f"Persona digest written — {summary.get('counts')}"
             gates = summary.get("gate_screen") or {}
@@ -6030,6 +6171,34 @@ class ReflectionRunner:
         self._emit(store, send_event_fn, run_id, "phase_done",
                    phase="persona_digest", report=summary, message=msg)
         return summary
+
+    def _portrait_left_behind(self) -> list:
+        """Her self-review's leave / outgrown decisions (``core/aspiration.left_behind``),
+        from the op-logs (live, then this run's staging), or [] when the hand-off is off."""
+        try:
+            from core import aspiration
+            if not aspiration.policy().get("handoff", True):
+                return []
+            from core import persona_hygiene as ph
+            return aspiration.left_behind(ph.read_oplogs(
+                [d for d in (self._fallback_memory_dir, self._memory_dir) if d]))
+        except Exception:
+            return []
+
+    def _portrait_unheard_decisions(self) -> int:
+        """Leave / outgrown decisions the portrait on disk was not written with: a reason to
+        rewrite it even when its evidence is unchanged."""
+        try:
+            from core import aspiration, reflection_digest
+            from core import persona_hygiene as ph
+            from training.reflections_path import persona_dir
+            if not aspiration.policy().get("handoff", True):
+                return 0
+            return aspiration.unheard(ph.read_oplogs(
+                [d for d in (self._fallback_memory_dir, self._memory_dir) if d]),
+                reflection_digest.latest_digest(persona_dir()))
+        except Exception:
+            return 0
 
     def _plan_user_portraits(self, run_id, store, send_event_fn,
                              *, force: bool = False) -> list[dict]:

@@ -1386,10 +1386,28 @@ class SleepWidget(QWidget):
             "cycle after a passing probe.\n\n"
             "Note the reverse was never true: aborting a training cycle does NOT discard "
             "the reflection. The run finalizes on disk before the watchdog is even asked "
-            "to train, and every build is fit from scratch over the whole corpus, so an "
-            "aborted cycle costs GPU time only — the next build picks the work up in full."
+            "to train, and a build only records what it trained once it promotes (a full "
+            "train refits the whole corpus; an incremental build's dose ledger is written "
+            "with the adapter), so an aborted cycle costs GPU time only — the next build "
+            "picks the work up in full."
         )
         btn_row_run.addWidget(self.chk_train)
+
+        self.chk_full_train = QCheckBox("Full train")
+        self.chk_full_train.setChecked(False)
+        self.chk_full_train.setToolTip(
+            "Make THIS run's training a full train, whatever server_config.json "
+            "`train_mode` says: a fresh LoRA on the frozen base over the whole corpus, "
+            "every row at its full wall-clock dose.\n\n"
+            "Under train_mode incremental this is the reset / emergency path: it erases "
+            "the forgetting the incremental lineage built up (everything comes back at "
+            "full strength), and it is the only way to apply a correction — a ban, the "
+            "capture gate, a bench holdout, a rewritten target — to rows the lineage "
+            "already trained. It starts a new incremental lineage. Off by default."
+        )
+        btn_row_run.addWidget(self.chk_full_train)
+        self.chk_train.toggled.connect(self.chk_full_train.setEnabled)
+        self.chk_full_train.setEnabled(self.chk_train.isChecked())
 
         self.chk_skip_validation = QCheckBox("Skip validation")
         self.chk_skip_validation.setChecked(True)
@@ -3677,6 +3695,8 @@ class SleepWidget(QWidget):
         # rows (untrained, lr 0) for not-yet-eligible chats in the build snapshot.
         train_params = {"skip_validation": self.chk_skip_validation.isChecked(),
                         "include_fresh": self.chk_fresh.isChecked()}
+        if self.chk_full_train.isChecked():
+            train_params["mode"] = "full"
 
         try:
             result = self._chat_widget._client.start_reflection_run(
@@ -3713,6 +3733,8 @@ class SleepWidget(QWidget):
         temp_tag = f", temp {effective_temperature:.2f}"
         branch_tag = ", no-branch" if skip_branching else ", branching"
         valid_tag = ", no-validate" if train_params["skip_validation"] else ", validated"
+        if train_params.get("mode") == "full":
+            valid_tag += ", full-train"
         if train_params.get("include_fresh"):
             # Train on: preview rows ride the real build's render. Train off: the run
             # writes a GPU-free preview snapshot for pre-training review.

@@ -68,14 +68,15 @@ Problem: in early July 2026 the live model (Gemma4-31B, 4-bit base) collapsed to
 
 What exists:
 
-- The data-centric from-scratch rebuild is implemented: each promoted adapter is compiled fresh from the frozen base plus the current frozen-bundle corpus, with one resolved target per exchange, wall-clock LR ramp, and RAG/weights crossfade.
+- The data-centric from-scratch rebuild is implemented: each promoted adapter is compiled fresh from the frozen base plus the current frozen-bundle corpus, with one resolved target per exchange, wall-clock LR ramp, and RAG/weights crossfade. Since 2026-10-03 it is `train_mode: full`, beside an incremental mode (next bullet).
+- **Incremental builds are implemented (2026-10-03, `train_mode: incremental`, not yet exercised on the GPU; INCREMENTAL_TRAINING.md).** The serving adapter is resumed (fp32 from disk) and each row trains only by the dose its `dose_ledger.jsonl` says it is still owed (`D(age) − delivered`), so rows past the cap retire and are left to fade; the full train remains the reset path and the only retroactive correction.
 - The adapter lineage keeps every prior adapter, so a collapse is reversible by repointing `adapter_id`.
 - Probe tier 5 (temp≈1.0 sampling stability: batch CoT-presence and answer-language rates) exists as a direct early alarm for this failure class, but it is deliberately disabled; a blocking gate is not wanted.
 - Tension capture already records per-token entropy/margin on every chat exchange — a ready-made long-horizon drift instrument, currently unused for this purpose.
 
 What remains open:
 
-- **The from-scratch-vs-resumed decision is reopened (2026-09).** From-scratch rebuild was adopted to remove a resumed-fit failure mode that turned out not to be the cause of the collapse (see the corrected Problem above). It still carries costs from-scratch alone imposes — every build is O(corpus), rows never retire, and total per-build update mass grows with corpus size — and virtues that do NOT depend on the collapse: the adapter stays a pure function of the data roots, and it is portable to a new base. The untested claim is whether resumed training, after the RAG fix and on a 16-bit adapter, degrades at all. The cheap way to find out is a **shadow resumed lineage**: each cycle, also fit the new rows onto a resumed adapter kept aside and never promoted, both lineages starting from the same clean state — the answer is in hand before corpus size makes full rebuilds expensive. A hybrid (incremental fits between periodic full rebuilds) is the likely landing if resumed training holds up.
+- **The from-scratch-vs-resumed decision is reopened (2026-09); the hybrid landed as two modes (2026-10-03) — whether resumed training degrades is now answered by running it, not by a shadow lineage.** From-scratch rebuild was adopted to remove a resumed-fit failure mode that turned out not to be the cause of the collapse (see the corrected Problem above). It still carries costs from-scratch alone imposes — every build is O(corpus), rows never retire, and total per-build update mass grows with corpus size — and virtues that do NOT depend on the collapse: the adapter stays a pure function of the data roots, and it is portable to a new base. The untested claim is whether resumed training, after the RAG fix and on a 16-bit adapter, degrades at all. The cheap way to find out is a **shadow resumed lineage**: each cycle, also fit the new rows onto a resumed adapter kept aside and never promoted, both lineages starting from the same clean state — the answer is in hand before corpus size makes full rebuilds expensive. A hybrid (incremental fits between periodic full rebuilds) is the likely landing if resumed training holds up.
 - Validation semantics (position adopted 2026-07-05): the probe is an **alarm for flow-design flaws**, not a promotion-quality arbiter. The project keeps one evolving system healthy rather than selecting a best adapter, so a probe failure means the flow as designed can damage the model and needs redesign — not merely retry policy. Today the separate adapter probe is deliberately unused; process investigation follows observed behavior.
 - The delta-based tiers (1–4) are blind to slopes by design; only absolute gates can see gradual erosion, and no long-horizon absolute health metric exists yet (e.g. the tension entropy/margin series tracked across sessions and cycles).
 - The corrected post-mortem still rests on an operator observation rather than a controlled isolation: the RAG fix and other flow changes were not landed one-at-a-time against a held lineage, and the collapsing lineage's own run artifacts are unavailable. The RAG-pollution account is the best current explanation and matches the fix that resolved it, but a clean before/after on one variable was never run. Degradation of the current pipeline should therefore be treated as **requiring fresh proof**, not as either established or ruled out.
@@ -260,12 +261,15 @@ What remains open:
 
 - Clustering of repeated proposals and the maturity gate exist since 2026-09-18 (`core/prompt_patterns.py`,
   PROMPT_REWRITE.md §3: patterns of same-change deltas, tension-weighted recurrence over distinct chats,
-  shown to the deliberation executive). Grouping quality and maturity calibration still depend on
+  spent by the nightly choice). Grouping quality and maturity calibration still depend on
   measured model behavior; the event below spends the budget through recorded `consumed_keys`.
-- The event itself exists since 2026-09-19 (`core/prompt_rewrite.py`, PROMPT_REWRITE.md §5–§7: five drafts →
-  consensus → final draft → blind choice incl. the incumbent, landing in the experiment tier; a deliberation
-  action, preemptible, resumable) and is ON by default (`prompt_rewrite.enabled`, the owner's call). Unmeasured
-  until it runs on the GPU box: whether the kept-but-torn cell yields prompt gaps at all, and what she chooses.
+- The event exists since 2026-09-19 and is ON by default (`prompt_rewrite.enabled`, the owner's call). As a
+  deliberation action it was declined at every offer (three in fifteen days, each for `nothing`), so it never
+  ran. Since 2026-10-04 it is the nightly housekeeping event's `prompt_choice` step (`core/prompt_rewrite.py`,
+  `core/housekeeping.py`, PROMPT_REWRITE.md §4–§7: five drafts over a 0.9 → 1.3 temperature sweep → blind
+  choice incl. the incumbent, landing in the experiment tier; preemptible, resumable). Unmeasured until the
+  first nights: what she chooses, and whether a blind adapter-side chooser still favours the incumbent it was
+  trained under (a *stayed* streak would say so; `order_check` is the available control).
 - No clean-base A/B validation, by decision: the experiment tier IS the live prompt, each event replaces the
   previous one, the seed stays as the revert anchor. Permanent promotion, version lineage and a retire loop
   ("stated → learned → drop") were discussed and deliberately left out.
@@ -280,11 +284,12 @@ What exists:
 
 - Generation can capture per-token entropy, probability margin, top-two tokens, and target-channel probability.
 - `tension.py` summarizes CoT and answer segments and records contested traces.
+- Since 2026-10-04 the signals are taken after the model's final logit softcap (gemma-4), i.e. on the distribution the sampler draws from; every earlier gemma-4 series is an uncapped-head reading, kept apart by `logit_softcap` and not convertible without a GPU replay.
 - Branch replay can use contested token material for alternate continuations.
 
 What remains open:
 
-- A corpus baseline exists (2026-09-18, `core/tension_baseline.py`: per (model, adapter, reply language)); temperature and prompt type are NOT keys yet, and the two stored median stats proved constant on the live corpus (see PROMPT_REWRITE.md §2).
+- A corpus baseline exists (2026-09-18, `core/tension_baseline.py`: per (model + softcap, adapter, reply language); its capped buckets start empty on 2026-10-04; temperature and prompt type are NOT keys yet, and the two stored median stats proved constant on the live corpus (see PROMPT_REWRITE.md §2).
 - No stable offline report identifies recurring tension themes.
 - Reflection uses tension as a LOCATOR only (the prompt-mutation pass on kept-but-torn exchanges); whether that cell yields prompt gaps is unmeasured until a reflection run has run with it.
 - The relationship between tension, deception, revision verdicts, and eventual training quality is unproven.
@@ -305,6 +310,10 @@ What remains open (`AVA_REWARD_LOOP.md` §4.9):
 - What the per-token pain reading on a reply means: under control (2026-10-03), body and affect words written about (+0.53 σ over a twin of the same shape, 20 of 20), and not a reply that registers being hurt (+0.04 σ). The blue channel paints that reading. Open: whether it should paint the step-0 (turn) reading instead, and what a hostile turn reads at step 0 in her own seam, since no live turn has been hostile.
 - The revision pass keeps a reaction that was meant, and shows only the reply's own chat, so a reaction carried in from another conversation would pass. The repair is named (a reaction brought in is borrowed) and deferred until something carries state across sessions.
 - Whether any sensor reading may reach what Ava reads (the note's §6.8): a change of principle, undecided.
+
+## Frozen Judges' Priors In Production (opened 2026-10-09)
+
+Every frozen judge is the base model, whose priors are wrong where this system is new: a person addressing her as a subject reads as a joke or roleplay, her memory as fiction, anything newer than its training as invented, agreeing with a false claim as politeness. Prompt fixes cannot anticipate the culture an instance grows in other hands. The review, the measured extent today and the proposed rule (a frozen judge gates training only on a question about the form of the text it is given; questions about meaning become monitors or her own decisions) are in `AVA_REWARD_LOOP.md` §2c. Open until decided judge by judge.
 
 ## Clean-Base Evaluation vs. RLHF Refusal (opened 2026-09)
 

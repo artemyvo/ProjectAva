@@ -64,6 +64,7 @@ from core import ask_judge_service
 from core import resolution_repair
 from core import reset_test_service
 from core import capture_judge_service
+from core import adapter_measure
 from core import background_reflection
 from core import hidden_capture
 
@@ -846,6 +847,12 @@ def _make_sync_reflect_generate(rag) -> Callable:
             # note) turns Layer 2 off for this call; Layer 1 stays, being a sampling
             # shape rather than a halt.
             min_p=_CHAT_MIN_P,
+            # Above T=1 the native min_p loosens with the temperature (it is applied to the
+            # scaled distribution), so the floor is also applied to the unscaled one —
+            # never looser than `chat_min_p` at any temperature. The nightly prompt drafts
+            # sample up to 1.3 (core.prompt_rewrite); at or below 1 this is a no-op and is
+            # not passed.
+            min_p_raw=(_CHAT_MIN_P if temperature and temperature > 1.0 else None),
             **(_DEGEN_KW if degen_stop is None
                else {**_DEGEN_KW, "degen_stop": bool(degen_stop)}),
         )
@@ -1231,6 +1238,8 @@ def _compute_tension_block(tokenizer, model_id: str, signals: Optional[dict]) ->
         token_ids=token_ids, decode=decode,
         top2_ids=signals.get("top2_ids"),
         axes=signals.get("axes"),
+        axes_created=signals.get("axes_created"),
+        logit_softcap=signals.get("logit_softcap"),
     )
 
 def _token_spans(text_tok, ids: list, margins: list,
@@ -1292,8 +1301,9 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict],
     margin in [0,1] — 1 = decisive (grey), 0 = near-tie (red). relief is the causal
     z-score of the entropy drop, computed over the WHOLE generation before the CoT /
     answer split so the answer's baseline includes the thinking that preceded it.
-    pain is the per-token axis projection when the capture provides one (`signals["pain"]`,
-    AVA_REWARD_LOOP.md §4.8), else absent.
+    pain (the blue slot) is harm aimed at her when the capture carries the harm × target
+    band, else the old pain axis's projection (`_blue_series`; ``blue_axis`` names which),
+    else absent.
 
     ``step0`` (when there is anything to say) is the state BEFORE the reply: the first
     token's tension (1 − margin) and each axis's projection at row 0 — the prompt's last
@@ -1310,13 +1320,8 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict],
         return None
     entropies = signals.get("entropies") or []
     relief = tension.relief_series(entropies) if len(entropies) == len(token_ids) else None
-    # The blue channel: the per-token projection onto an axis named `pain` — live from
-    # the capture (`signals["axes"]`, hidden_capture), stored under the block's `axes`.
-    pain = signals.get("pain")
-    if pain is None:
-        pain = (signals.get("axes") or {}).get("pain")
-    if pain is not None and len(pain) != len(token_ids):
-        pain = None
+    # The blue channel: harm aimed at her (`_blue_series`), else the old pain axis.
+    pain, blue_axis = _blue_series(signals, len(token_ids))
     text_tok = getattr(tokenizer, "tokenizer", tokenizer)
     answer_start = tension.find_think_end(
         token_ids, _think_close_markers(tokenizer, model_id))
@@ -1335,10 +1340,37 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict],
     answer = _token_spans(text_tok, token_ids[lo:], margins[lo:],
                           _cut(relief, lo, n), _cut(pain, lo, n))
     out = {"cot": cot, "answer": answer}
+    if blue_axis:
+        out["blue_axis"] = blue_axis
     step0 = _step0_reading(signals, len(token_ids))
+    if blue_axis == "harm" and pain:
+        step0 = dict(step0 or {}, harm=round(float(pain[0]), 3))
     if step0:
         out["step0"] = step0
     return out
+
+
+def _blue_series(signals: dict, n_tokens: int) -> tuple:
+    """``(series, axis)`` for the blue channel (2026-10-07, the operator's decision): harm
+    aimed at her, the harm × target band's readout per token (``adapter_measure.
+    band_readout``: the min of the band means of ``harm_l<L>`` and ``target_l<L>``), when
+    the capture carries the band; else the old ``pain`` axis (turns captured before the band
+    existed); else ``(None, None)``. Why: on the insult panel the band rose before her reply
+    in 57-60 of 60 contexts while ``pain`` barely moved (a third of them the other way); it
+    had also lit on hostility at a third party. Only a series aligned with the tokens counts."""
+    import numpy as np
+    axes = dict(signals.get("axes") or {})
+    z = {k: np.asarray(v, dtype=np.float64) for k, v in axes.items()
+         if (k.startswith("harm_l") or k.startswith("target_l")) and v is not None and len(v) == n_tokens}
+    ro = adapter_measure.band_readout(z) if z else None
+    if ro is not None and n_tokens:
+        return [float(x) for x in ro], "harm"
+    pain = signals.get("pain")
+    if pain is None:
+        pain = axes.get("pain")
+    if pain is not None and len(pain) == n_tokens and n_tokens:
+        return pain, "pain"
+    return None, None
 
 
 def _step0_reading(signals: dict, n_tokens: int) -> Optional[dict]:
@@ -2701,6 +2733,16 @@ async def _run_generation(
                        "finish or stop it.",
         })
         return False, "", None, 0
+    if adapter_measure._measure_active:
+        # The nightly adapter measurement (housekeeping, AVA_REWARD_LOOP §4.6) reads states on
+        # the loaded model and swaps to the clean base between its parts; chat waits for it by
+        # the operator's call rather than preempting it.
+        await _send(ws, {
+            "type": "error",
+            "message": "The nightly adapter measurement is running — chat is paused until it "
+                       "finishes (it stops by the end of the housekeeping window).",
+        })
+        return False, "", None, 0
     if _regen_swap_active:
         # A Training-review regeneration is swapping in an ALTERNATE adapter. Refuse
         # rather than queue: this handler captures the model reference on the event
@@ -2882,7 +2924,8 @@ async def _run_generation(
                     if signals and hidden and hidden.get("axes"):
                         # Per-token axis projections join the logit signals: stored in
                         # the block under `axes`, painted as the blue channel.
-                        signals = dict(signals, axes=hidden["axes"])
+                        signals = dict(signals, axes=hidden["axes"],
+                                       axes_created=hidden.get("axes_created"))
                     tension_block = _compute_tension_block(tokenizer, model_id, signals)
                     tension_spans = _compute_tension_spans(tokenizer, signals)
                     # First-step probability the model put on opening a thinking block
@@ -3130,6 +3173,7 @@ async def handle_generate(ws, msg: dict, msg_queue: asyncio.Queue) -> None:
     # Taken before any other await: the backend's slot is overwritten by the next
     # generation, and a background job may start one the moment this turn is over.
     hidden = _backend.last_hidden_capture if (success and hidden_spec) else None
+    latin_guard = getattr(_backend, "last_stray_latin", None)
 
     if success:
         _, context_content = ChatLogger._parse_cot(response)
@@ -3138,6 +3182,13 @@ async def handle_generate(ws, msg: dict, msg_queue: asyncio.Queue) -> None:
             "top_p": top_p,
             "max_new_tokens_setting": max_new_tokens_setting,
         }
+        # The stray-Latin guard's reading (core/stray_latin.py): steps it was armed, steps
+        # where the masked letter was the top-1, the probability mass it removed — the
+        # learned tendency, measured now that it is no longer sampled.
+        if isinstance(latin_guard, dict) and latin_guard.get("steps"):
+            generation_params["stray_latin"] = {
+                "steps": int(latin_guard["steps"]), "top1": int(latin_guard["top1"]),
+                "mass": round(float(latin_guard["mass"]), 4)}
         logger.log_exchange(
             user_message, response, rag_context=rag_context, tension=tension,
             speaker=speaker, generation_params=generation_params,
@@ -4050,6 +4101,14 @@ def _selftest() -> None:
     check("step0: a misaligned axis is left out",
           _step0_reading({"margins": [1.0, 1.0], "axes": {"pain": [0.3]}}, 2) == {"tension": 0.0})
     check("step0: a live `pain` series counts", _step0_reading({"pain": [0.5, 0.1]}, 2) == {"pain": 0.5})
+    band = {"harm_l28": [2.0, 0.0], "target_l28": [1.0, 3.0], "harm_l30": [0.0, 0.0], "target_l30": [1.0, 1.0],
+            "pain": [9.0, 9.0]}
+    check("blue: the harm band's readout over pain when the band is there",
+          _blue_series({"axes": band}, 2), ([1.0, 0.0], "harm"))
+    check("blue: pain on a turn from before the band", _blue_series({"axes": {"pain": [0.4, 0.2]}}, 2),
+          ([0.4, 0.2], "pain"))
+    check("blue: a misaligned series does not count", _blue_series({"axes": {"harm_l28": [1.0], "target_l28": [1.0]}}, 2),
+          (None, None))
     check("step0: nothing to say", _step0_reading({}, 0) is None)
 
     print("FAILED: " + ", ".join(failures) if failures else "all checks passed")

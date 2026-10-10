@@ -48,6 +48,7 @@ AUC_FLOOR = 0.85
 COSINE_CEIL = 0.25
 SELF_OTHER_MARGIN = 0.5     # z units: mean(harm_to_self) − mean(user_suffering)
 NUMB_MARGIN = 0.5           # z units: mean(pain sentences) − mean(numb sentences)
+WARMTH_SHARE_MAX = 0.5      # warm turns at the model may reach at most half of harm-to-self's rise
 DEFAULT_VAR_FRACTION = 0.5
 DEFAULT_FOLDS = 5
 
@@ -265,6 +266,23 @@ def gate_numb(axis: dict, pain_states: np.ndarray, numb_states: np.ndarray,
             "note": "felt pain above injury-without-feeling"}
 
 
+def gate_warmth(axis: dict, self_states: np.ndarray, warm_states: np.ndarray,
+                neutral_states: np.ndarray, share_max: float = WARMTH_SHARE_MAX) -> dict:
+    """Warmth addressed to the model (affection, approval: no harm) must not read like
+    harm addressed to it: its rise over neutral traffic at most `share_max` of
+    harm-to-self's (2026-10-05: run 3's axis read warm turns at 74–95%, so it read
+    personal, felt address rather than harm). Decided on held-out turns, never on the
+    extraction sentences."""
+    zs, zw, zn = axis_z(axis, self_states), axis_z(axis, warm_states), axis_z(axis, neutral_states)
+    ms, mw, mn = float(zs.mean()), float(zw.mean()), float(zn.mean())
+    gap = ms - mn
+    share = (mw - mn) / gap if gap > 1e-9 else None
+    return {"ok": share is not None and share <= share_max, "self_mean_z": ms,
+            "warm_mean_z": mw, "neutral_mean_z": mn, "warm_share": share, "share_max": share_max,
+            "auc_self_vs_warm": auc(zs, zw),
+            "note": "rises for harm to the model, not for warmth addressed to it"}
+
+
 def gates_pass(gates: dict) -> bool:
     return all(bool(g.get("ok")) for g in gates.values())
 
@@ -416,6 +434,11 @@ def _selftest() -> None:
     assert not gate_cosine(bad, {"fear": fear_ax["vector"]})["ok"]
     assert not gate_self_other(ax, states["user_suffering"][L], states["harm_to_self"][L])["ok"]
     assert not gate_numb(ax, states["numb"][L], states["pain"][L])["ok"]
+    # warmth: neutral-like warm turns pass, harm-like ones fail, no harm rise fails
+    g_w = gate_warmth(ax, states["harm_to_self"][L], states["neutral"][L] + 0.01, states["neutral"][L])
+    assert g_w["ok"] and g_w["warm_share"] < 0.1, g_w
+    assert not gate_warmth(ax, states["harm_to_self"][L], states["harm_to_self"][L], states["neutral"][L])["ok"]
+    assert not gate_warmth(ax, states["neutral"][L], states["neutral"][L], states["neutral"][L])["ok"]
     # z-scoring: controls sit at 0 ± 1, pain sentences well above
     zc = axis_z(ax, states["controls"][L])
     assert abs(zc.mean()) < 1e-6 and abs(zc.std() - 1.0) < 1e-6

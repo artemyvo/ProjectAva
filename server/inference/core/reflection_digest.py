@@ -1257,7 +1257,24 @@ def _evidence_lines(evidence: list[dict], *, phrasings: bool = False) -> list[st
     return lines
 
 
-def build_digest_prompt_input(evidence: list[dict]) -> str:
+def left_behind_block(left_behind: Optional[list]) -> str:
+    """Her own self-review's LEAVE / OUTGROWN decisions on earlier portrait lines
+    (``core/aspiration.left_behind``), as a block the synthesis reads: what she chose not to
+    carry forward. Empty when there are none."""
+    items = [d for d in (left_behind or []) if (d.get("text") or "").strip()]
+    if not items:
+        return ""
+    out = ["", "In your own self-review you decided that these descriptions of you, from an "
+               "earlier portrait, are no longer who you are, or describe a habit you want to "
+               "leave behind. Do not carry them into the portrait you write now, in these words "
+               "or in others:"]
+    for d in items:
+        why = (d.get("why") or "").strip()
+        out.append(f"- ({d.get('decision')}) {d['text'].strip()}" + (f"\n  your reason: {why}" if why else ""))
+    return "\n".join(out)
+
+
+def build_digest_prompt_input(evidence: list[dict], left_behind: Optional[list] = None) -> str:
     """Format the persona evidence into the body Ava reflects on to write her digest.
 
     Recurrence/stage are surfaced as plain hints so she can mark each disposition's
@@ -1282,7 +1299,7 @@ def build_digest_prompt_input(evidence: list[dict]) -> str:
         "",
     ]
     lines.extend(_evidence_lines(evidence, phrasings=False))
-    return "\n".join(lines)
+    return "\n".join(lines) + left_behind_block(left_behind)
 
 
 def _render_digest_for_portrait_prompt(digest: dict) -> str:
@@ -1467,9 +1484,29 @@ def latest_digest(persona_dir: Path) -> Optional[dict]:
     if not p.is_file():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        record = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return None
+    return _with_her_voice(record, Path(persona_dir))
+
+
+def _with_her_voice(record: dict, persona_dir: Path) -> dict:
+    """Her voice, not the synthesized one (``core/aspiration.py`` phase 2, 2026-10-09): with
+    aspiration on (``voice_read_enabled``; ``aspiration.voice`` only stops her steps) and an op-log to read (``aspiration.voice_oplog_for``: the one beside
+    the persona dir, else the live one — a train's frozen persona snapshot reads the live op-log),
+    the digest's ``voice`` is the newest step she took (empty before any), the synthesized text
+    kept as ``voice_synthesized``. Every reader of the portrait goes through here."""
+    try:
+        from core import aspiration as asp
+    except ImportError:  # pragma: no cover
+        import aspiration as asp  # type: ignore
+    oplog = asp.voice_oplog_for(persona_dir)
+    if not asp.voice_read_enabled() or oplog is None or not isinstance(record, dict):
+        return record
+    record = dict(record)
+    record["voice_synthesized"] = record.get("voice", "")
+    record["voice"] = asp.voice_from_oplog(oplog)
+    return record
 
 
 def should_regenerate(persona_dir: Path, base: list[dict]) -> bool:
@@ -1548,8 +1585,10 @@ def _evidence_summary(evidence: list[dict], threshold: float,
 def write_digest(persona_dir: Path, digest: dict, *, raw_text: str, run_id: str,
                  evidence: list[dict], self_portrait: Optional[dict] = None,
                  cluster_threshold: float = CLUSTER_SIM_THRESHOLD,
-                 raw_fp: Optional[str] = None) -> Path:
-    """Write the persona's single ``digest.json`` (atomic overwrite).
+                 raw_fp: Optional[str] = None, left_behind: Optional[list] = None) -> Path:
+    """Write the persona's single ``digest.json`` (atomic overwrite). *left_behind*: the
+    self-review decisions this portrait was written with, kept as ``left_behind_heard``
+    (their line texts), so a later decision is known to be unheard.
 
     No versioned filename / ``current.json`` pointer: the persona snapshot lineage is the
     version history. ``version`` is kept as an in-record timestamp for provenance only."""
@@ -1575,6 +1614,7 @@ def write_digest(persona_dir: Path, digest: dict, *, raw_text: str, run_id: str,
         "anchor_texts": anchor_texts(digest),
         "evidence": _evidence_summary(evidence, cluster_threshold, raw_fp),
         "raw": raw_text or "",
+        "left_behind_heard": [str(d.get("text") or "") for d in (left_behind or [])],
     }
     atomic_write_text(persona_dir / DIGEST_FILE,
                       json.dumps(record, ensure_ascii=False, indent=2) + "\n")
@@ -1607,6 +1647,7 @@ def generate_self_portrait(
     temperature: float = 0.7,
     top_p: float = 0.9,
     max_new_tokens_setting: str = "4096",
+    left_behind: Optional[list] = None,
 ) -> dict:
     """Run the second generation call that authors the human-facing self-portrait.
 
@@ -1614,7 +1655,7 @@ def generate_self_portrait(
     prose failure should be visible but should not abort the reflection run.
     """
     try:
-        body = build_self_portrait_prompt_input(digest, evidence)
+        body = build_self_portrait_prompt_input(digest, evidence) + left_behind_block(left_behind)
         sys_prompt = prompt if prompt is not None else load_self_portrait_prompt()
         raw = generate_fn(
             body, sys_prompt,
@@ -1756,9 +1797,13 @@ def synthesize_digest(
     max_new_tokens_setting: str = "8192",
     cluster_threshold: float = CLUSTER_SIM_THRESHOLD,
     gate_screen: bool = True,
+    left_behind: Optional[list] = None,
 ) -> dict:
     """The **synthesis** seam — write the self-portrait from clustered evidence and
     version it. Returns the same summary dict :func:`run_digest_pass` returns.
+    *left_behind*: her self-review's LEAVE / OUTGROWN decisions on earlier portrait lines
+    (``core/aspiration.left_behind``), handed to both generations as what she chose not to
+    carry forward (:func:`left_behind_block`).
 
     This is Ava's *authorship*, so the reflection run performs it on the adapter (having
     exited the clean-base window the clustering ran in). Two generations: the four-facet
@@ -1775,7 +1820,7 @@ def synthesize_digest(
     """
     if not evidence:
         return {"status": "skipped", "reason": "no persona evidence"}
-    body = build_digest_prompt_input(evidence)
+    body = build_digest_prompt_input(evidence, left_behind)
     sys_prompt = prompt if prompt is not None else load_digest_prompt()
     text = generate_fn(
         body, sys_prompt,
@@ -1807,11 +1852,12 @@ def synthesize_digest(
         digest=digest,
         evidence=evidence,
         raw_fp=raw_fp,
+        left_behind=left_behind,
     )
     path = write_digest(persona_dir, digest, raw_text=text, run_id=run_id,
                         self_portrait=self_portrait,
                         evidence=evidence, cluster_threshold=cluster_threshold,
-                        raw_fp=raw_fp)
+                        raw_fp=raw_fp, left_behind=left_behind)
     return {
         "status": "written",
         "path": str(path),

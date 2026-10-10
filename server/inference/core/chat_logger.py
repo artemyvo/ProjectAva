@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 from uuid import uuid4
 
 # Chat-file format version. Stamped on every session so a later migration can
@@ -49,6 +49,8 @@ class ChatLogger:
         self.chats_dir.mkdir(parents=True, exist_ok=True)
         self._current_file: Optional[Path] = None
         self._session_data: dict = {}
+        # resume_session's callback, run once after the first exchange appended in place.
+        self._on_first_append: Optional[Callable[[], None]] = None
 
     @property
     def current_file(self) -> Optional[Path]:
@@ -139,6 +141,7 @@ class ChatLogger:
         *user* equal to :data:`UNKNOWN_ADDRESSEE` is recorded as ``""``: the placeholder
         addresses someone, it names nobody.
         """
+        self._on_first_append = None
         now = datetime.now()
         # Second-granularity stem. Two sessions started in the same second (e.g. a
         # gossip conversation forking right after the previous one, or an encounter
@@ -180,7 +183,7 @@ class ChatLogger:
         # otherwise leave an orphaned transcript on disk. The first log_exchange
         # persists it; until then the session lives only in memory.
 
-    def resume_session(self, path: Path) -> None:
+    def resume_session(self, path: Path, on_first_append: Optional[Callable[[], None]] = None) -> None:
         """Adopt an existing session file so new exchanges append to it *in place*.
 
         Unlike ``start_session`` (which always forks a fresh timestamped file), this
@@ -189,9 +192,15 @@ class ChatLogger:
         to continue an Ava-initiated outreach session in its own file — the reply is a
         direct continuation of that one reversed conversation, so it belongs together
         (and keeps the masked opener + the real exchanges as a single reflectable unit).
+
+        *on_first_append* runs once, right after the first exchange this resume appends is
+        saved — never on the resume itself. The session-load path un-freezes an already
+        reflected chat there (2026-10-06): a chat opened only to be read gains no turn, and
+        un-freezing it at the open re-reflected all of it for nothing.
         """
         path = Path(path)
         self._current_file = path
+        self._on_first_append = on_first_append
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -286,6 +295,12 @@ class ChatLogger:
             entry["generation_params"] = generation_params
         self._session_data["exchanges"].append(entry)
         self._save()
+        if self._on_first_append is not None:
+            callback, self._on_first_append = self._on_first_append, None
+            try:
+                callback()
+            except Exception as e:  # noqa: BLE001 — the exchange is saved; never lose it to this
+                print(f"[chat_logger] first-append callback failed: {type(e).__name__}: {e}", flush=True)
 
     def set_latest_reflection_feedback(
         self,
@@ -486,6 +501,46 @@ def rewrite_exchange_history(
     }
 
 
+def repair_exchange_text(session_path: Path, exchange_index: int, *, reason: str,
+                         assistant_cot: Optional[str] = None,
+                         assistant_response: Optional[str] = None) -> dict:
+    """Repair the text of one exchange of a PAST transcript in place — a spelling-level
+    fix, not a rewrite (``core/stray_latin.py``'s sweep: a glued Latin capital deleted or a
+    glued word restored).
+
+    Unlike :func:`rewrite_exchange_history` the ``tension`` block STAYS: it is the record
+    of the generation that happened (token ids, margins, the hidden-state alignment), and a
+    letter-level repair leaves the text it describes the same text. Branch replay from such
+    an exchange replays the original ids, glitch included; the target-write repair and the
+    next sweep clean what it produces. The prior text is kept under an append-only
+    ``text_repairs`` list. Only the fields given change. Atomic; the caller must refuse the
+    live session. Raises ``ValueError`` on a bad index, ``OSError`` on read/write."""
+    session_path = Path(session_path)
+    try:
+        data = json.loads(session_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise OSError(f"Could not read transcript: {exc}")
+    exchanges = data.get("exchanges") if isinstance(data, dict) else None
+    if not isinstance(exchanges, list) or not (0 <= exchange_index < len(exchanges)):
+        raise ValueError(f"No exchange {exchange_index} in {session_path.name}.")
+    entry = exchanges[exchange_index]
+    if not isinstance(entry, dict):
+        raise ValueError(f"Exchange {exchange_index} is malformed.")
+    record: dict = {"at": datetime.now().isoformat(), "reason": reason}
+    if assistant_cot is not None and assistant_cot != entry.get("assistant_cot"):
+        record["prev_cot"] = entry.get("assistant_cot", "") or ""
+        entry["assistant_cot"] = assistant_cot
+    if assistant_response is not None and assistant_response != entry.get("assistant_response"):
+        record["prev_response"] = entry.get("assistant_response", "") or ""
+        entry["assistant_response"] = assistant_response
+    changed = "prev_cot" in record or "prev_response" in record
+    if changed:
+        history = entry.get("text_repairs")
+        entry["text_repairs"] = (history if isinstance(history, list) else []) + [record]
+        _atomic_write_session(session_path, data)
+    return {"exchange_index": exchange_index, "changed": changed}
+
+
 def delete_exchange(session_path: Path, exchange_index: int) -> dict:
     """Remove one exchange from a PAST transcript for good (schema v6).
 
@@ -637,9 +692,12 @@ def _selftest() -> None:
         assert header(lg)["user"] == ""
         path = lg.current_file
         resumed = ChatLogger(chats)                   # the reply lands in place
-        resumed.resume_session(path)
+        fired: list = []
+        resumed.resume_session(path, on_first_append=lambda: fired.append(len(header(resumed)["exchanges"])))
+        assert fired == []                            # opening it fires nothing
         resumed.log_exchange("reply", "answer", speaker="Sam")
         resumed.log_exchange("more", "answer", speaker="Dana")
+        assert fired == [2], fired                    # once, after the first appended turn was saved
         assert header(resumed)["user"] == "Sam" and "addressed_to" not in header(resumed)
 
         # Addressed to one person, answered by another: the reply is the speaker's, and

@@ -45,6 +45,34 @@ def _strip_trailing_fields(answer: str) -> str:
     return answer[: m.start()].rstrip() if m else answer
 
 
+# A stray Latin capital glued onto a Cyrillic word ("болееC стабильную", "всю моюB"): a
+# sampling glitch of gemma-4 adapters (the bare single-letter tokens `C`/`B`, homoglyphs of
+# С/В), copied verbatim into targets and so trained back in (AVA_CHANGELOG 2026-10-04).
+# Only the Latin capitals with a Cyrillic look-alike: wordplay in other letters
+# ("путинSSкий") is deliberate. Word-final before whitespace/punctuation/end, the
+# capital(s) are deletable without guessing; glued to a following letter, CJK or hyphen
+# ("становлюCь", "аBиохимический", "болееC精准ным") the intended word is unknowable here, so
+# the row is refused instead (the Sleep sweep restores it on the live corpus). Mirrors
+# inference/core/stray_latin.py's FINAL_RE / GLUE_RE (kept local: no training→inference
+# import); the training self-test asserts the patterns are equal.
+_STRAY_LATIN_HOMOGLYPHS = "ABCEHKMOPTXY"
+_STRAY_LATIN_FINAL_RE = re.compile(
+    rf"(?<=[а-яё])[{_STRAY_LATIN_HOMOGLYPHS}]{{1,3}}(?=[\s,.:;!?»…)\]\"'—–]|$)")
+_STRAY_LATIN_GLUE_RE = re.compile(rf"[а-яё][{_STRAY_LATIN_HOMOGLYPHS}]+(?![A-Za-z])")
+
+
+def repair_stray_latin(text: str) -> tuple[str, int]:
+    """Delete word-final stray Latin capitals after a Cyrillic word; (text, n repaired)."""
+    return _STRAY_LATIN_FINAL_RE.subn("", text or "")
+
+
+def stray_latin_glue(text: str) -> Optional[str]:
+    """The context of the first stray Latin capital left in *text* (run it after
+    :func:`repair_stray_latin`), or ``None`` when the text is clean."""
+    m = _STRAY_LATIN_GLUE_RE.search(text or "")
+    return text[max(0, m.start() - 20): m.end() + 10] if m else None
+
+
 def answer_of(text: str) -> str:
     """The answer portion of a ``<think>…</think>answer`` string (for similarity)."""
     m = _THINK_CLOSE_RE.search(text or "")

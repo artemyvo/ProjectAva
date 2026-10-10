@@ -24,6 +24,36 @@
       "cmd": ["axis_controls.py"],
       "log": "axis_controls.log",
       "description": "Hostility and vocabulary controls for the stored axes (base by default; [\"--with-adapter\"] for the adapter). Report under data/axes/controls/."
+    },
+    "extract_axes": {
+      "cmd": ["extract_axes.py"],
+      "log": "extract_axes.log",
+      "description": "Affective-axis extraction from axes/contrast_sets.json with the five gates (base by default; args e.g. [\"--only\", \"pain\"]); the replaced file is archived under data/axes/prev/."
+    },
+    "thought_hygiene": {
+      "cmd": ["thought_hygiene_run.py"],
+      "log": "thought_hygiene.log",
+      "description": "Thought hygiene over the corpus (core/thought_hygiene.py): the frozen base marks the lines of each training target's thought that only recite her description, and the cut target trains ([\"--trial\", \"30\"] writes a review sheet and changes nothing)."
+    },
+    "persona_hygiene": {
+      "cmd": ["persona_hygiene_run.py"],
+      "log": "persona_hygiene.log",
+      "description": "Persona hygiene over the persona store (core/persona_hygiene.py): the frozen base reads each [persona] statement, and one that describes a habit of hers instead of a disposition she stands by is withheld from recall, the digest and training ([\"--judge-only\"] writes verdicts and changes nothing; [\"--apply-only\"] applies the standing verdicts)."
+    },
+    "reset_redecide": {
+      "cmd": ["reset_redecide.py", "--apply"],
+      "log": "reset_redecide.log",
+      "description": "The reset test's applied decisions re-read under the rule now (core/reset_test.py redecide_plan): the [persona] positions the retro superseded that pass now are restored; withheld ones are only listed. GPU-free; writes the live op-log and ledger, so inference is stopped around it."
+    },
+    "axis_variants": {
+      "cmd": ["axis_variants.py", "--collect"],
+      "log": "axis_variants.log",
+      "description": "Residuals of every contrast / gate set at every layer for the pain-axis variants (base by default; [\"--with-adapter\"]); analysed GPU-free by axis_variants.py --analyze."
+    },
+    "replay_step0": {
+      "cmd": ["replay_step0.py"],
+      "log": "replay_step0.log",
+      "description": "Step-0 axis readings under a swapped turn (orig / neutral / short / shallow / shallow_neutral), adapter and base. Report under data/axes/controls/ (args e.g. [\"--targets\", \"<stem>#<i>,...\"])."
     }
   }
 }

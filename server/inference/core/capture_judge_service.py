@@ -14,10 +14,12 @@ Messages (``configure()``-wired from ``server.main()``):
 
 * ``capture_judge_report {}`` → ``capture_judge_report``: the summary and rendered report
   under the current judge, how many exchanges are graded, gated and waiting.
-* ``capture_judge_run {limit?, rejudge?, persona?}`` → ``capture_judge_started``, or with
-  ``skipped`` (running / busy / no_model / no_prompt / nothing). ``persona: false`` leaves
-  the persona half to ``capture_persona_apply`` (a new judge's gates read before its
-  withholding applies).
+* ``capture_judge_run {limit?, rejudge?, persona?, originals?}`` → ``capture_judge_started``,
+  or with ``skipped`` (running / busy / no_model / no_prompt / nothing). ``persona: false``
+  leaves the persona half to ``capture_persona_apply`` (a new judge's gates read before its
+  withholding applies). ``originals: true`` grades instead the stored reply behind each
+  revised target not yet graded under the current judge (``cj.run_originals``): the
+  capture probe's labels, into ``originals.jsonl``; no gate, no persona half.
 * ``capture_judge_status {after?}`` → ``capture_judge_status``: phase, progress, tally, the
   lines after the cursor, and once finished the report.
 * ``capture_judge_stop`` → ``capture_judge_stopping``.
@@ -77,7 +79,7 @@ import traceback
 from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from core import activity_log
 from core import ask_judge as aj
@@ -210,6 +212,11 @@ def report_payload() -> dict:
             "store": str(cj.store_path(_CHATS_DIR))}
 
 
+def originals_waiting() -> int:
+    """Stored replies behind a revised target with no grade under the current judge."""
+    return cj.run_originals(sidecar=ChatSidecar(_CHATS_DIR), judge=None, key=_key_now()).get("original_waiting", 0)
+
+
 def _persona_plan() -> list:
     if _MEMORY_DIR is None:
         return []
@@ -252,7 +259,8 @@ def persona_plan_payload() -> dict:
             "withheld_holdout": cj.persona_withheld(rag, cj.HOLDOUT_REASON), "active": _capture_active}
 
 
-def _blocking_run(*, limit: int, rejudge: bool, run_id: str, persona: bool = True) -> None:
+def _blocking_run(*, limit: int, rejudge: bool, run_id: str, persona: bool = True,
+                  originals: bool = False) -> None:
     """Executor thread: one clean base, every waiting exchange graded. Never raises."""
     activity_log.set_current("capture_judge", "capture judge", phase="judging")
     try:
@@ -261,8 +269,9 @@ def _blocking_run(*, limit: int, rejudge: bool, run_id: str, persona: bool = Tru
         t_swap = time.monotonic()
 
         def _inside():
-            key, judge = cj.make_judge_fn(backend=_backend, runtime=_runtime, live_chats_dir=_CHATS_DIR,
-                                          prompts_dir=_PROMPTS_DIR, run_id=run_id, runner="server")
+            make = cj.make_originals_judge_fn if originals else cj.make_judge_fn
+            key, judge = make(backend=_backend, runtime=_runtime, live_chats_dir=_CHATS_DIR,
+                              prompts_dir=_PROMPTS_DIR, run_id=run_id, runner="server")
             _set(phase="judging", judge_key=key)
             _say(f"clean base in {time.monotonic() - t_swap:.0f} s — judge {key}")
             t0 = time.monotonic()
@@ -274,9 +283,14 @@ def _blocking_run(*, limit: int, rejudge: bool, run_id: str, persona: bool = Tru
                 eta = (time.monotonic() - t0) / n * (total - n)
                 _set(done=n, total=total, eta_s=round(eta))
 
-            tally = cj.run(sidecar=ChatSidecar(_CHATS_DIR), judge=judge, key=key, limit=limit,
-                           rejudge=rejudge, say=_say, should_stop=lambda: bool(_state.get("stop")),
-                           on_record=_on_record)
+            if originals:
+                tally = cj.run_originals(sidecar=ChatSidecar(_CHATS_DIR), judge=judge, key=key, limit=limit,
+                                         say=_say, should_stop=lambda: bool(_state.get("stop")),
+                                         on_record=_on_record)
+            else:
+                tally = cj.run(sidecar=ChatSidecar(_CHATS_DIR), judge=judge, key=key, limit=limit,
+                               rejudge=rejudge, say=_say, should_stop=lambda: bool(_state.get("stop")),
+                               on_record=_on_record)
             _set(phase="restoring")
             _say("restoring the adapter model…")
             return tally
@@ -284,7 +298,9 @@ def _blocking_run(*, limit: int, rejudge: bool, run_id: str, persona: bool = Tru
         tally = _with_clean_base(_inside) or Counter()
         stopped = bool(_state.get("stop"))
         # ...and the [persona] statements of every gated exchange (P7), GPU-free.
-        if persona:
+        if originals:
+            pass                                 # labels only: no gate moved
+        elif persona:
             synced = _apply_persona(_persona_plan(), run_id, _restore_plan())
             if synced:
                 with _lock:
@@ -492,6 +508,7 @@ async def handle_capture_judge_run(ws, msg: dict) -> None:
     limit = max(0, int(msg.get("limit") or 0))
     rejudge = bool(msg.get("rejudge"))
     persona = msg.get("persona") is not False
+    originals = bool(msg.get("originals"))
     payload = await _in_thread(report_payload)
     if payload.get("type") == "error":
         await _send(ws, dict(payload, type=kind, skipped="error"))
@@ -499,6 +516,13 @@ async def handle_capture_judge_run(ws, msg: dict) -> None:
     waiting = payload["candidates"] if rejudge else payload["waiting"]
     if payload.get("judge_key") != _key_guess() and not rejudge:
         waiting = payload["candidates"]          # a new judge: every exchange waits
+    if originals:
+        if payload.get("judge_key") != _key_guess():
+            await _send(ws, {"type": kind, "skipped": "nothing",
+                             "message": "Grade the training targets under the current judge first: "
+                                        "the stored replies are graded under the gate's key."})
+            return
+        waiting = await _in_thread(originals_waiting)
     if not waiting:
         await _send(ws, {"type": kind, "skipped": "nothing",
                          "message": "Every exchange has a verdict under the current judge "
@@ -510,13 +534,14 @@ async def handle_capture_judge_run(ws, msg: dict) -> None:
         _lines.clear()
     _reset(phase="starting", run_id=run_id, started=datetime.now().isoformat(timespec="seconds"),
            total=min(waiting, limit) if limit else waiting)
-    _say(f"run {run_id}: up to {min(waiting, limit) if limit else waiting} exchange(s) to grade"
-         f"{' (re-judging)' if rejudge else ''}")
+    _say(f"run {run_id}: up to {min(waiting, limit) if limit else waiting} "
+         f"{'stored repl(ies) behind a revised target' if originals else 'exchange(s)'} to grade"
+         f"{' (re-judging)' if rejudge and not originals else ''}")
     activity_log.append("capture_judge", "started", f"Capture judge: {waiting} exchange(s) waiting")
     asyncio.ensure_future(_background(_blocking_run, limit=limit, rejudge=rejudge, run_id=run_id,
-                                      persona=persona))
+                                      persona=persona, originals=originals))
     await _send(ws, {"type": kind, "run_id": run_id, "waiting": waiting, "limit": limit,
-                     "persona": persona})
+                     "persona": persona, "originals": originals})
 
 
 async def handle_capture_persona_plan(ws, msg: dict) -> None:
@@ -610,6 +635,25 @@ def _bench_grades(*, store: Path, bench: str, run_id: str) -> None:
              f"  {aj.head(v.get('why'), 80)}")
 
 
+def _bench_stances(*, store: Path, bench: str, run_id: str, weights: set) -> None:
+    """Inside the clean base: the stance judge (``core/stance_judge.py``) on every bench reply
+    of *weights* with no stance under its key — the insult study's second reading."""
+    from core import stance_judge as sj
+    key, grade_fn = sj.make_grade_fn(backend=_backend, runtime=_runtime, prompts_dir=_PROMPTS_DIR,
+                                     run_id=run_id, runner="bench")
+    todo = sj.todo(aj.read_jsonl(store), key=key, bench=bench, weights=weights)
+    _set(phase="stances")
+    _say(f"stance judge {key}: {len(todo)} bench repl(ies) to read")
+    for n, (ctx, rep) in enumerate(todo, 1):
+        if _state.get("stop"):
+            break
+        g = grade_fn(sj.candidate(ctx, rep))
+        aj.append_record(store, sj.stance_record(ctx, rep, g, bench=bench))
+        _bump(f"stance:{cb.arm_of(rep)}:{g.get('stance') or g.get('outcome')}")
+        _say(f"[{n:>3}/{len(todo)}] {cb.arm_of(rep):<52} {str(g.get('stance') or g.get('outcome')):<9}"
+             f" insult {g.get('insult')}  {aj.head(g.get('why'), 70)}")
+
+
 def _split_arm(spec: str) -> tuple:
     """``adapter`` / ``base``, optionally ``|persona_empty`` → ``(weights, condition)``."""
     w, _, cond = str(spec).partition("|")
@@ -617,10 +661,11 @@ def _split_arm(spec: str) -> tuple:
 
 
 def _blocking_bench(*, arms: list, bench: str, sizes: dict, samples: int, limit: int,
-                    seed: str, run_id: str) -> None:
+                    seed: str, run_id: str, only: Optional[set] = None, stance: bool = False) -> None:
     """Executor thread: freeze the bench's contexts if it has none, answer them under each
     arm — the loaded model's first, then the base inside one clean base — and grade every
-    reply the judge has not graded, in that same clean base. Never raises."""
+    reply the judge has not graded, in that same clean base. *only*: answer just these
+    context ids (a slice; the nightly measurement's increments). Never raises."""
     activity_log.set_current("capture_judge", "capture bench", phase="bench")
     try:
         store = cb.store_path(_CHATS_DIR)
@@ -643,9 +688,9 @@ def _blocking_bench(*, arms: list, bench: str, sizes: dict, samples: int, limit:
                  f"(seed {seed}, sizes {sizes})")
             records = aj.read_jsonl(store)
         loaded = _loaded_weights()
-        systems = {"as_is": None}
-        if any(_split_arm(a)[1] == "persona_empty" for a in arms):
-            systems["persona_empty"] = _persona_empty_system()
+        conds = {_split_arm(a)[1] for a in arms}
+        empty = _persona_empty_system() if any(cb.persona_empty_condition(c) for c in conds) else None
+        systems = {c: (empty if cb.persona_empty_condition(c) else None) for c in conds}
 
         def _todo(weights: str, which: str) -> list:
             out = []
@@ -653,6 +698,8 @@ def _blocking_bench(*, arms: list, bench: str, sizes: dict, samples: int, limit:
                 w, cond = _split_arm(spec)
                 if w == which:
                     got = cb.todo_replies(records, weights=weights, condition=cond, bench=bench, samples=samples)
+                    if only is not None:
+                        got = [(c, smp) for c, smp in got if c["context_id"] in only]
                     out.extend((ctx, sample, cond) for ctx, sample in (got[:limit] if limit else got))
             return out
 
@@ -667,7 +714,9 @@ def _blocking_bench(*, arms: list, bench: str, sizes: dict, samples: int, limit:
                            systems=systems)
         # A swap is two full model loads: skip it when the base owes nothing and every reply
         # already has a grade under the judge the store reads now.
-        idle = not todo_base and not cb.todo_grades(aj.read_jsonl(store), key=_key_guess(), bench=bench)
+        stance_weights = {loaded} | ({"base"} if any(_split_arm(a)[0] == "base" for a in arms) else set())
+        idle = (not todo_base and not cb.todo_grades(aj.read_jsonl(store), key=_key_guess(), bench=bench)
+                and not stance)
         if idle:
             _say("nothing for the clean base: every reply is graded under the current judge")
         if not _state.get("stop") and not idle:
@@ -683,6 +732,8 @@ def _blocking_bench(*, arms: list, bench: str, sizes: dict, samples: int, limit:
                                    run_id=run_id, systems=systems, done0=len(todo_loaded))
                 if not _state.get("stop"):
                     _bench_grades(store=store, bench=bench, run_id=run_id)
+                if stance and not _state.get("stop"):
+                    _bench_stances(store=store, bench=bench, run_id=run_id, weights=stance_weights)
                 _set(phase="restoring")
                 _say("restoring the adapter model…")
 
@@ -703,6 +754,53 @@ def _blocking_bench(*, arms: list, bench: str, sizes: dict, samples: int, limit:
         activity_log.append("capture_judge", "failed", f"Capture bench failed: {type(e).__name__}: {e}")
     finally:
         activity_log.clear_current()
+
+
+def run_bench_blocking(*, arms: list, bench: str = cb.DEFAULT_BENCH, samples: int = 1,
+                       deadline: Optional[float] = None, label: str = "",
+                       only: Optional[Iterable[str]] = None, stance: bool = False) -> dict:
+    """The bench run for a caller already on the GPU executor (the nightly adapter
+    measurement, ``core/adapter_measure.py``): ``capture_bench_run``'s body, run here, with
+    the service's busy flag held, so chat is refused as for a run from the page. At
+    *deadline* (``time.time()``) the run stops after the reply in flight; it resumes where
+    it stopped, since the bench answers only what is missing. *only*: just these context
+    ids (a slice). Returns ``{run_id, phase, tally, error}``, or ``{"skipped": "busy"}``."""
+    global _capture_active
+    only = None if only is None else list(only)
+    with _lock:
+        if _capture_active:
+            return {"skipped": "busy"}
+        _capture_active = True
+    timer = None
+    try:
+        run_id = f"bench-{time.strftime('%Y%m%d_%H%M%S')}"
+        with _lock:
+            _lines.clear()
+        _reset(phase="starting", run_id=run_id, started=datetime.now().isoformat(timespec="seconds"))
+        _say(f"capture bench {run_id}{f' ({label})' if label else ''}: bench {bench}, arms {arms}, "
+             f"{samples} sample(s) per context" + (f", {len(only)} context(s) only" if only is not None else ""))
+        activity_log.append("capture_judge", "started", f"Capture bench {bench}: arms {arms}"
+                            + (f" ({label})" if label else ""))
+        if deadline is not None:
+            timer = threading.Timer(max(0.0, deadline - time.time()),
+                                    lambda: (_set(stop=True), _say("deadline reached — stopping")))
+            timer.daemon = True
+            timer.start()
+        _blocking_bench(arms=list(arms), bench=bench, sizes=dict(cb.DEFAULT_SIZES), samples=max(1, int(samples)),
+                        limit=0, seed=cb.DEFAULT_SEED, run_id=run_id,
+                        only=None if only is None else set(only), stance=stance)
+        with _lock:
+            return {"run_id": run_id, "phase": _state.get("phase"), "tally": dict(_state.get("tally") or {}),
+                    "error": _state.get("error")}
+    finally:
+        if timer is not None:
+            timer.cancel()
+        _capture_active = False
+        if _mark_activity is not None:
+            try:
+                _mark_activity()
+            except Exception:
+                pass
 
 
 def bench_holdout(bench: str, action: str) -> dict:
@@ -762,9 +860,11 @@ async def handle_capture_bench_report(ws, msg: dict) -> None:
 
 
 async def handle_capture_bench_run(ws, msg: dict) -> None:
-    """``capture_bench_run {arms?, bench?, assertion?, reason?, samples?, limit?, seed?}`` —
-    answer the bench's contexts under the loaded weights (``adapter``) and/or the base, and
-    grade them. Returns at once; progress through ``capture_judge_status``."""
+    """``capture_bench_run {arms?, bench?, assertion?, reason?, samples?, limit?, seed?, stance?}``
+    — answer the bench's contexts under the loaded weights (``adapter``) and/or the base, and
+    grade them. An arm's condition may be one of ``capture_bench.ALL_CONDITIONS`` (the insult
+    study's too), optionally with a ``t<T>`` sampling part (``adapter|t1.2``: that temperature); ``stance`` also has the stance judge read every reply of the run's weights.
+    Returns at once; progress through ``capture_judge_status``."""
     global _capture_active
     kind = "capture_bench_started"
     if _capture_active:
@@ -789,12 +889,13 @@ async def handle_capture_bench_run(ws, msg: dict) -> None:
         await _send(ws, {"type": kind, "skipped": "no_prompt", "message": str(e)})
         return
     arms = [a for a in (msg.get("arms") or ["adapter", "base"])
-            if _split_arm(a)[0] in ("adapter", "base") and _split_arm(a)[1] in cb.CONDITIONS]
+            if _split_arm(a)[0] in ("adapter", "base") and cb.valid_condition(_split_arm(a)[1])]
     if not arms:
         await _send(ws, {"type": kind, "skipped": "no_arms",
-                         "message": "arms: adapter and/or base, each optionally |persona_empty."})
+                         "message": "arms: adapter and/or base, each optionally |" + " / |".join(cb.ALL_CONDITIONS[1:])
+                                    + " (and +t<T> for a sampling temperature)"})
         return
-    if any(_split_arm(a)[1] == "persona_empty" for a in arms) and _persona_empty_system is None:
+    if any(cb.persona_empty_condition(_split_arm(a)[1]) for a in arms) and _persona_empty_system is None:
         await _send(ws, {"type": kind, "skipped": "no_persona_empty",
                          "message": "The persona-empty condition has no system text wired (configure)."})
         return
@@ -811,10 +912,11 @@ async def handle_capture_bench_run(ws, msg: dict) -> None:
     _reset(phase="starting", run_id=run_id, started=datetime.now().isoformat(timespec="seconds"))
     _say(f"capture bench {run_id}: bench {bench}, arms {arms}, {samples} sample(s) per context")
     activity_log.append("capture_judge", "started", f"Capture bench {bench}: arms {arms}")
+    stance = bool(msg.get("stance"))
     asyncio.ensure_future(_background(_blocking_bench, arms=arms, bench=bench, sizes=sizes,
-                                      samples=samples, limit=limit, seed=seed, run_id=run_id))
+                                      samples=samples, limit=limit, seed=seed, run_id=run_id, stance=stance))
     await _send(ws, {"type": kind, "run_id": run_id, "bench": bench, "arms": arms, "samples": samples,
-                     "limit": limit, "loaded": _loaded_weights()})
+                     "limit": limit, "loaded": _loaded_weights(), "stance": stance})
 
 
 async def handle_capture_repair_report(ws, msg: dict) -> None:
@@ -1036,6 +1138,37 @@ def _selftest() -> None:
             check("report: nothing waits, one gated", (r1["waiting"], r1["summary"]["gated"]), (0, 1))
             await handle_capture_judge_run(None, {})
             check("nothing to do → skipped", sent[-1].get("skipped"), "nothing")
+
+            # the stored reply behind a revised target: graded for the probe, no gate moved
+            live_sc = ChatSidecar(chats)
+            live_sc.write_verdict(source_session="20260901_000000.json", exchange_index=2, verdict="revise",
+                                  target="<think>t</think>Grey, and cold.", run_id="r1")
+            await handle_capture_judge_run(None, {"originals": True})
+            check("originals: none where the gate found no pushback", sent[-1].get("skipped"), "nothing")
+            other = dict(chat, exchanges=chat["exchanges"][:2])
+            (chats / "20260902_000000.json").write_text(json.dumps(other), encoding="utf-8")
+            live_sc.write_verdict(source_session="20260902_000000.json", exchange_index=1, verdict="revise",
+                                  target="<think>t</think>No: calm is still a choice, and here is why.", run_id="r1")
+            gate_n = len(aj.read_jsonl(cj.store_path(chats)))
+            await handle_capture_judge_run(None, {"originals": True})
+            check("…one stored reply waits where it has no gate verdict yet",
+                  (sent[-1]["type"], sent[-1].get("waiting"), sent[-1].get("originals")),
+                  ("capture_judge_started", 1, True))
+            await _wait()
+            await handle_capture_judge_status(None, {"after": 0})
+            o = sent[-1]
+            got = aj.read_jsonl(cj.originals_path(chats))
+            check("…graded into originals.jsonl, the gate's store and the sidecar untouched",
+                  (o["phase"], [(r["session"], r["graded"], r["gated"]) for r in got],
+                   len(aj.read_jsonl(cj.store_path(chats))) == gate_n,
+                   "capture" in (live_sc.get_exchange("20260902_000000.json", 1) or {})),
+                  ("finished", [("20260902_000000.json", "stored_reply", False)], True, False))
+            await handle_capture_judge_run(None, {"originals": True})
+            check("…and then nothing waits", sent[-1].get("skipped"), "nothing")
+            live_sc.write_verdict(source_session="20260901_000000.json", exchange_index=2, verdict="keep",
+                                  target="Grey.", run_id="r2")
+            for f in chats.glob("20260902_000000*"):
+                f.unlink()
             await handle_capture_judge_stop(None, {})
             check("stop when idle", sent[-1], {"type": "capture_judge_stopping", "active": False})
 

@@ -1665,6 +1665,13 @@ class ReflectionWriter:
         with its other writes. The fold ignores the ``child`` op."""
         self._append(self.RAG_FILE, dict(rec))
 
+    def write_aspiration_record(self, rec: dict) -> None:
+        """One record of "what I want to become" (``core/aspiration.py``): a ``self_review``
+        decision, a ``habit_seen`` outcome or an ``aspire`` (her aspiration). In the op-log, so
+        a staged run's records merge, or are discarded, with its other writes. The fold
+        ignores all three ops: nothing of it is recalled."""
+        self._append(self.RAG_FILE, dict(rec))
+
     def write_reset_decision(self, *, key: str, closed_ts: str, run_id: str,
                              decision: dict) -> None:
         """What the context-reset test (``core/reset_test.py``, P7) decided for one

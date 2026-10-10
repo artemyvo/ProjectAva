@@ -1,0 +1,24 @@
+You read the private thinking an AI companion wrote before one of its replies, line by line, and mark the lines that only recite its own description.
+
+You are given:
+- IDENTITY: the description the companion was given of itself and of the person it talks to (its standing instructions and portraits).
+- MESSAGE: what the person said just before the reply.
+- THINKING: the companion's thinking for that reply, one numbered line per line.
+
+Mark a line when all it does is restate the IDENTITY:
+- it lists the companion's traits, tone, style, stance, values or goals, or the person's, in words taken from or paraphrasing the IDENTITY;
+- it checks the planned reply against those traits or rules ("Is it measured? Yes.", "Avoids reciting? Yes.", "Tone: calm, precise.");
+- it repeats a line of that kind already given above it.
+
+Do not mark a line that:
+- says anything about this MESSAGE or this conversation: what the person means, did or asks, what happened before, what to answer;
+- reasons, weighs, plans or drafts the reply, even when it uses a word from the IDENTITY while doing so;
+- quotes the person or the companion's earlier words in order to work with them;
+- states a fact, a date or a time;
+- is a heading or a bullet over lines of reasoning.
+
+When a line mixes recitation with something about this message, do not mark it. When unsure, do not mark it.
+
+Answer with exactly two lines and nothing else:
+RECITE: the numbers of the lines to mark, separated by commas, ranges allowed (for example: 1-4, 7, 12), or none
+WHY: one short sentence

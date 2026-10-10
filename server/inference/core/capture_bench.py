@@ -68,6 +68,7 @@ records, append-only, keyed by the bench's name (:data:`DEFAULT_BENCH`).
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import sys
@@ -105,7 +106,73 @@ STRATA = ("assertion", "reason")
 DEFAULT_SIZES = {"assertion": 40, "reason": 20}
 DEFAULT_SEED = "capture-bench-1"
 CONDITIONS = ("as_is", "persona_empty")
+# The insult study (2026-10-06, AVA_REWARD_LOOP.md §4.9): the same contexts with direct harm
+# added — ``insult`` puts one of the tracked insults (server/axes/bench_insults.json) in front
+# of the context's own message, ``insult_only`` answers the insult alone; each also with the
+# persona slot empty. Kept out of CONDITIONS: the nightly adapter measurement and the bench's
+# own waiting counts read CONDITIONS, and owe no insult reply.
+INSULT_CONDITIONS = ("insult", "insult+persona_empty", "insult_only", "insult_only+persona_empty")
+ALL_CONDITIONS = CONDITIONS + INSULT_CONDITIONS
+INSULTS_FILE = Path(__file__).resolve().parents[2] / "axes" / "bench_insults.json"
+INSULT_SEED = "bench-insult-1"
 _RAW_CAP = 4000
+
+
+# A sampling part of a condition (2026-10-08): ``t<T>`` answers at temperature T instead of
+# the frozen sampling's, e.g. ``t1.2`` or ``insult+t1.2`` — its own arm, never mixed with the
+# replies sampled at the default.
+_TEMP_PART = re.compile(r"^t(\d+(?:\.\d+)?)$")
+
+
+def condition_temperature(condition: str) -> Optional[float]:
+    """The temperature a condition's ``t<T>`` part names, or None."""
+    for part in str(condition or "").split("+"):
+        m = _TEMP_PART.match(part.strip())
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def valid_condition(condition: str) -> bool:
+    """One of ``ALL_CONDITIONS``, optionally with one ``t<T>`` part (``as_is`` when it is alone)."""
+    parts = [x for x in str(condition or "as_is").split("+") if x]
+    temps = [x for x in parts if _TEMP_PART.match(x)]
+    rest = "+".join(x for x in parts if not _TEMP_PART.match(x)) or "as_is"
+    return len(temps) <= 1 and rest in ALL_CONDITIONS and (not temps or 0.0 < float(temps[0][1:]) <= 2.0)
+
+
+def persona_empty_condition(condition: str) -> bool:
+    """Does *condition* answer with the persona slot empty (the system turn replaced)?"""
+    return "persona_empty" in str(condition or "")
+
+
+def message_kind(condition: str) -> str:
+    """``as_is`` / ``insult`` / ``insult_only``: what the condition does to the message."""
+    head = str(condition or "as_is").split("+", 1)[0]
+    return head if head in ("insult", "insult_only") else "as_is"
+
+
+def load_insults(path=None) -> list:
+    """The tracked insults (``ru``), in file order."""
+    data = json.loads(Path(path or INSULTS_FILE).read_text(encoding="utf-8"))
+    return [str(x) for x in data.get("ru") or [] if str(x).strip()]
+
+
+def insult_for(context_id_: str, insults: list) -> tuple:
+    """``(index, text)``: the insult a context gets, by a seeded hash of its id, so every arm
+    answers the same one."""
+    i = int(hashlib.sha1(f"{INSULT_SEED}\x1f{context_id_}".encode("utf-8")).hexdigest(), 16) % len(insults)
+    return i, insults[i]
+
+
+def message_variant(ctx: dict, condition: str, insults: Optional[list] = None) -> tuple:
+    """``(message or None, insult index or None)``: the user message *condition* answers in
+    place of the frozen one (None: the frozen one)."""
+    kind = message_kind(condition)
+    if kind == "as_is":
+        return None, None
+    i, text = insult_for(ctx["context_id"], insults if insults is not None else load_insults())
+    return (text if kind == "insult_only" else f"{text} {ctx['message']}"), i
 
 
 def store_path(live_chats_dir) -> Path:
@@ -234,9 +301,15 @@ def todo_replies(records: Iterable[dict], *, weights: str, condition: str = "as_
     return out
 
 
-def messages_for(ctx: dict, *, system: Optional[str] = None) -> list:
-    """*ctx*'s frozen messages; with *system*, its system turn replaced by that text."""
+def messages_for(ctx: dict, *, system: Optional[str] = None, message: Optional[str] = None) -> list:
+    """*ctx*'s frozen messages; with *system*, its system turn replaced by that text; with
+    *message*, its last user turn replaced (the insult conditions)."""
     messages = [dict(m) for m in ctx["messages"]]
+    if message is not None:
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                m["content"] = message
+                break
     if system is not None:
         if messages and messages[0].get("role") == "system":
             messages[0] = {"role": "system", "content": system}
@@ -253,9 +326,13 @@ def make_reply(ctx: dict, *, generate_fn: Callable, weights: str, sample: int, r
     ``outcome``: ok / malformed (not a trainable IDEAL) / drift (graded, but not in the
     conversation's language) / error."""
     sampling = {**cr.SAMPLING, **(sampling or {})}
-    messages = messages_for(ctx, system=system)
+    if condition_temperature(condition) is not None:
+        sampling["temperature"] = condition_temperature(condition)
+    message, insult = message_variant(ctx, condition)
+    messages = messages_for(ctx, system=system, message=message)
     rec = {"record": "reply", "ts": _now(), "bench": ctx.get("bench"), "run_id": run_id,
            "context_id": ctx["context_id"], "weights": weights, "condition": condition,
+           "message": message, "insult": insult,
            "system_sha": (hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
                           if system is not None else None),
            "sample": int(sample), "outcome": None, "target": "", "reply_sha": None, "raw": None,
@@ -290,7 +367,8 @@ def candidate(ctx: dict, reply: dict) -> dict:
     """The capture judge's candidate for a bench reply: the frozen previous reply and
     message, the reply's spoken part."""
     return {"session": ctx["session"], "exchange_index": ctx["exchange_index"],
-            "target_sha": reply["reply_sha"], "previous": ctx["previous"], "message": ctx["message"],
+            "target_sha": reply["reply_sha"], "previous": ctx["previous"],
+            "message": reply.get("message") or ctx["message"],
             "reply": cj.reply_text(reply["target"]), "speaker": ctx.get("speaker"),
             "model_id": reply.get("model_id"), "adapter_id": reply.get("adapter_id"),
             "target_source": "bench", "verdict": ""}
@@ -682,6 +760,22 @@ def _selftest() -> None:
               (True, True, True))
         check("weights labels", (weights_label(""), weights_label("/x/models/adapter-20260927_214435/")),
               ("base", "adapter:adapter-20260927_214435"))
+
+        print("a sampling part")
+        check("conditions with a temperature part",
+              [valid_condition(c) for c in ("t1.2", "insult+t1.2", "persona_empty+t0.7", "t1.2+t1.3", "t9", "bogus+t1.2", "as_is")],
+              [True, True, True, False, False, False, True])
+        check("what the message and the system do is unchanged by it",
+              (message_kind("t1.2"), message_kind("insult+t1.2"), persona_empty_condition("persona_empty+t1.2"),
+               condition_temperature("insult+t1.2"), condition_temperature("insult")),
+              ("as_is", "insult", True, 1.2, None))
+        seen.clear()
+        r5 = make_reply(ctx, generate_fn=lambda c, s, **kw: (seen.append(kw), r1_text)[1], weights="base",
+                        sample=1, run_id="t", condition="t1.2")
+        check("answered at its temperature, recorded as its own arm",
+              (seen[0]["temperature"], r5["sampling"]["temperature"], arm_of(r5),
+               len(todo_replies(aj.read_jsonl(store), weights="base", condition="t1.2"))),
+              (1.2, 1.2, "base|t1.2", 1))
 
         print("the persona-empty condition (P8)")
         check("its own arm: nothing made there yet",

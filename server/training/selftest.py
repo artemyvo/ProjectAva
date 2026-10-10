@@ -197,7 +197,53 @@ def test_training_row_preparation() -> None:
         assert "detached" in str(exc)
     else:
         raise AssertionError("misaligned LR metadata was accepted")
-    print("  training_rows: irreducible quarantine + completion/EOS + LR identity ✓")
+
+    # Stray Latin capital glued onto a Cyrillic word: word-final ones are deleted from
+    # every assistant turn (history included); one glued inside the final target refuses
+    # the row; a Latin word after a space and a camel-case brand are left alone.
+    from training import render
+    assert render.repair_stray_latin("более стабильную, какой-тоC особенной.") == (
+        "более стабильную, какой-то особенной.", 1)
+    assert render.repair_stray_latin("всю моюB надуманную, самуюCC изощрённую моюC") == (
+        "всю мою надуманную, самую изощрённую мою", 3)
+    from core import stray_latin
+    assert render._STRAY_LATIN_FINAL_RE.pattern == stray_latin.FINAL_RE.pattern
+    assert render._STRAY_LATIN_GLUE_RE.pattern == stray_latin.GLUE_RE.pattern
+    assert render.repair_stray_latin("субъектностиCCC является") == (
+        "субъектности является", 1)
+    for clean in ("модель Gemma и LoRA", "ЯндексGo", "C++ и B-tree", "путинSSкий режим",
+                  "«КняZZ»"):
+        assert render.repair_stray_latin(clean) == (clean, 0)
+        assert render.stray_latin_glue(clean) is None
+    for glued in ("становлюCь", "аBиохимический", "болееC精准ным", "другойC-системе"):
+        assert render.stray_latin_glue(render.repair_stray_latin(glued)[0]), glued
+    sys_u = [final[0], {"role": "user", "content": "привет"}]
+    latin_rows = [
+        {"messages": sys_u + [{"role": "assistant",
+                               "content": "<think>болееC точно</think>самымC честным."}],
+         "anchor_key": "latin-repair-0", "source": "chat"},
+        {"messages": sys_u + [{"role": "assistant", "content": "и становлюCь твоим"}],
+         "anchor_key": "latin-glue-1", "source": "chat"},
+        {"messages": sys_u + [{"role": "assistant", "content": "в этойCтессерации"},
+                              {"role": "user", "content": "дальше"},
+                              {"role": "assistant", "content": "вот чисто."}],
+         "anchor_key": "latin-history-2", "source": "chat"},
+    ]
+    prepared, quarantined, _ = _prepare_training_rows(latin_rows, tok, "gemma", 10_000)
+    assert [row["train_row_id"] for row in prepared] == [0, 2]
+    assert prepared[0]["example"]["messages"][-1]["content"] == (
+        "<think>более точно</think>самым честным.")
+    assert prepared[0]["example"]["stray_latin_repaired"] == 2
+    assert "<channel|>самым честным." in prepared[0]["text"] and "C" not in prepared[0]["text"]
+    assert latin_rows[0]["messages"][-1]["content"].endswith("самымC честным."), \
+        "the caller's example was mutated"
+    # Glue in a masked history turn neither refuses the row nor is guessed at.
+    assert "этойCтессерации" in prepared[1]["text"]
+    assert "stray_latin_repaired" not in prepared[1]["example"]
+    assert [(q["train_row_id"], q["reason"]) for q in quarantined] == [(1, "stray_latin_glue")]
+    assert "становлюCь" in quarantined[0]["detail"]
+    print("  training_rows: irreducible quarantine + completion/EOS + LR identity "
+          "+ stray-Latin repair/quarantine ✓")
 
 
 def test_wall_clock_age() -> None:
@@ -2099,6 +2145,261 @@ def test_ideal_persona_context_channel_gates() -> None:
     print("  ideal persona context: persona-only RAG gates ✓")
 
 
+def test_dose_ledger() -> None:
+    """Incremental builds (INCREMENTAL_TRAINING.md §2): the per-row increment is
+    D(age_now) − delivered, so a row's total dose is D(cap) however many builds fell in its
+    window; a row that missed its window trains once; the ledger round-trips; the lineage
+    check matches the bnb-4bit base modulo suffix."""
+    from training import dose_ledger as dl
+    from training.build_dataset import BuildRow
+    from training.decay import (WallClockConfig, lr_multiplier_hours, incremental_settings,
+                                train_mode, INCREMENTAL_DEFAULTS)
+
+    # Settings: defaults, coercion, fallbacks.
+    assert incremental_settings({}) == INCREMENTAL_DEFAULTS
+    s = incremental_settings({"incremental": {"lr": "2e-5", "lr_schedule": "bogus",
+                                              "epochs": 0, "min_increment": "100"}})
+    assert s["lr"] == 2e-5 and s["lr_schedule"] == "constant" and s["epochs"] == 1
+    assert s["min_increment"] == 100
+    assert train_mode({}) == "full" and train_mode({"train_mode": "INCREMENTAL"}) == "incremental"
+    assert train_mode({"train_mode": "weird"}) == "full"
+
+    # Identity: the split contamination copy is its own row; a folded one is the dialogue row.
+    assert dl.row_key("chat", "a.json", 3) == "dialogue|a.json|3"
+    assert dl.row_key("chat", "a.json", 3, True, None) == "contamination|a.json|3"
+    assert dl.row_key("chat", "a.json", 3, True, 0.25) == "dialogue|a.json|3"
+    assert dl.row_key("wander", "wander:t", None) == "wander|wander:t|"
+
+    def row(sess, idx, mult, target="<think>t</think>\nA", source="chat", unmask=False):
+        return BuildRow(messages=[], age=0.0, lr_multiplier=mult, source=source,
+                        source_session=sess, exchange_index=idx, order_key=(sess, idx or 0),
+                        target=target, unmask_user=unmask)
+
+    # Dose invariance: one chat aging through builds at different cadences receives D(cap)
+    # in total, and a build that first sees it past its window trains it once at D(cap).
+    wall = WallClockConfig()
+    cap = lr_multiplier_hours(10_000.0, None, wall)
+    for cadence_h, first_h in ((6.0, 0.0), (50.0, 0.0), (1.0, 23.0), (500.0, 200.0)):
+        ledger, delivered, trainings = {}, 0.0, 0
+        age = first_h
+        while age <= 400.0:
+            target = lr_multiplier_hours(age, None, wall)
+            rows = [row("c.json", 0, target)] if target > 0 else []
+            todo, _ = dl.apply_increments(rows, ledger)
+            examples = [{"source": "chat", "source_session": "c.json", "exchange_index": 0,
+                         "lr_multiplier": r.lr_multiplier, "variant": r.target} for r in todo]
+            delivered += sum(e["lr_multiplier"] for e in examples)
+            trainings += len(examples)
+            ledger = dl.advance(ledger, examples, built_at=f"t{age}", build_id="b",
+                                incremental=True)
+            age += cadence_h
+        assert abs(delivered - cap) < 1e-6, (cadence_h, delivered, cap)
+        assert abs(ledger["dialogue|c.json|0"]["delivered"] - cap) < 1e-6
+        if first_h >= wall.lora_cap_age_h:
+            assert trainings == 1, trainings          # missed its window: trained once
+
+    # apply_increments: owed rows rewritten, done rows dropped, wander one-shot, changed
+    # targets counted but not retrained.
+    ledger = {
+        "dialogue|a.json|0": {"key": "dialogue|a.json|0", "delivered": 1.0,
+                              "target_sha": dl.target_sha("<think>t</think>\nA")},
+        "dialogue|a.json|1": {"key": "dialogue|a.json|1", "delivered": 4.0,
+                              "target_sha": dl.target_sha("old")},
+        "wander|wander:w|": {"key": "wander|wander:w|", "delivered": 1.0},
+    }
+    rows = [row("a.json", 0, 2.5), row("a.json", 1, 4.0),
+            row("wander:w", None, 1.0, source="wander"), row("b.json", 0, 1.0),
+            row("a.json", 1, 1.0, unmask=True)]
+    todo, st = dl.apply_increments(rows, ledger)
+    got = {dl.key_of_row(r): r.lr_multiplier for r in todo}
+    assert got == {"dialogue|a.json|0": 1.5, "dialogue|b.json|0": 1.0,
+                   "contamination|a.json|1": 1.0}, got
+    assert st["done"] == 2 and st["new"] == 2 and st["changed_targets"] == 1, st
+    assert rows[0].lr_multiplier == 2.5            # inputs untouched (copies returned)
+
+    # advance: full train writes a fresh ledger; incremental copies forward and adds.
+    ex = [{"source": "chat", "source_session": "a.json", "exchange_index": 0,
+           "lr_multiplier": 1.5, "variant": "x"},
+          {"source": "chat", "source_session": "z.json", "exchange_index": 0,
+           "lr_multiplier": 2.0, "variant": "y", "preview": True}]
+    inc = dl.advance(ledger, ex, built_at="T", build_id="B", incremental=True)
+    assert inc["dialogue|a.json|0"]["delivered"] == 2.5
+    assert "wander|wander:w|" in inc and "dialogue|z.json|0" not in inc
+    full = dl.advance(ledger, ex, built_at="T", build_id="B", incremental=False)
+    assert set(full) == {"dialogue|a.json|0"} and full["dialogue|a.json|0"]["delivered"] == 1.5
+
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        # save / load round trip; a dir without a ledger loads as None.
+        assert dl.load(d) is None
+        dl.save(d, inc)
+        assert dl.load(d) == inc
+        # seed from a snapshot render: preview rows skipped, multiplier = delivered.
+        render_p = d / "sft_render.jsonl"
+        render_p.write_text("\n".join(json.dumps(r) for r in [
+            {"source": "chat", "source_session": "a.json", "exchange_index": 2,
+             "lr_multiplier": 3.0, "variant": "v"},
+            {"source": "chat", "source_session": "a.json", "exchange_index": 2,
+             "lr_multiplier": 1.0, "variant": "v", "unmask_user": True,
+             "user_loss_weight": None},
+            {"source": "chat", "source_session": "n.json", "exchange_index": 0,
+             "lr_multiplier": 0.0, "variant": "v", "preview": True},
+        ]) + "\n", encoding="utf-8")
+        seeded = dl.seed_from_render(render_p, built_at="2026-10-02T15:00:00", build_id="bx")
+        assert seeded["dialogue|a.json|2"]["delivered"] == 3.0
+        assert seeded["contamination|a.json|2"]["delivered"] == 1.0
+        assert len(seeded) == 2 and seeded["dialogue|a.json|2"]["last_trained_at"].startswith("2026")
+        # find_parent_snapshot: by adapter dir name, promoted only.
+        builds = [{"outcome": "promoted", "adapter_dir": "/x/models/adapter-1", "build_id": "b1"},
+                  {"outcome": "rejected", "adapter_dir": "/x/models/adapter-2", "build_id": "b2"}]
+        assert dl.find_parent_snapshot(builds, d / "adapter-1")["build_id"] == "b1"
+        assert dl.find_parent_snapshot(builds, d / "adapter-2") is None
+        # lineage: PEFT records the bnb-4bit repo of the configured base — the same base.
+        ad = d / "adapter-1"
+        ad.mkdir()
+        (ad / "adapter_config.json").write_text(json.dumps({
+            "base_model_name_or_path": "unsloth/gemma-4-31b-it-unsloth-bnb-4bit",
+            "r": 32, "lora_alpha": 4, "use_rslora": True}), encoding="utf-8")
+        assert dl.lineage_mismatch(ad, model_id="unsloth/gemma-4-31B-it", lora_r=32,
+                                   lora_alpha=4) == []
+        bad = dl.lineage_mismatch(ad, model_id="unsloth/Qwen3.6-27B", lora_r=16, lora_alpha=4)
+        assert len(bad) == 2 and "lora_r" in bad[1], bad
+        dl.save_lineage(ad, {"model_id": "unsloth/gemma-4-31B-it"})
+        assert dl.lineage_mismatch(ad, model_id="unsloth/gemma-4-31B-it", lora_r=32,
+                                   lora_alpha=4) == []
+        assert dl.lineage_mismatch(ad, model_id="unsloth/gemma-4-31b-it", lora_r=32,
+                                   lora_alpha=4)       # lineage.json compares exactly
+        # safetensors header dtypes, no torch needed.
+        import struct
+        hdr = json.dumps({"a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                          "b": {"dtype": "BF16", "shape": [1], "data_offsets": [4, 6]},
+                          "__metadata__": {}}).encode()
+        st_p = d / "w.safetensors"
+        st_p.write_bytes(struct.pack("<Q", len(hdr)) + hdr + b"\x00" * 6)
+        assert dl.safetensors_dtypes(st_p) == {"F32": 1, "BF16": 1}
+    print("  dose_ledger: increments sum to D(cap) at any cadence, missed window trains "
+          "once, ledger/seed/lineage round-trip ✓")
+
+
+def test_load_parent_lora() -> None:
+    """``train_cycle._load_parent_lora`` on a tiny CPU model with plain PEFT: a saved
+    adapter's weights land exactly in a freshly attached LoRA, in fp32; a rank mismatch
+    refuses."""
+    try:
+        import torch
+        from peft import LoraConfig, get_peft_model
+        from transformers import LlamaConfig, LlamaForCausalLM
+    except Exception:
+        print("  load_parent_lora: skipped (torch/peft/transformers unavailable) ✓")
+        return
+    from training.train_cycle import _load_parent_lora
+    cfg = LlamaConfig(vocab_size=64, hidden_size=16, intermediate_size=32,
+                      num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2)
+
+    def fresh(r=4):
+        torch.manual_seed(0)
+        base = LlamaForCausalLM(cfg)
+        return get_peft_model(base, LoraConfig(r=r, lora_alpha=4, use_rslora=True,
+                                               target_modules=["q_proj", "v_proj"]))
+    with tempfile.TemporaryDirectory() as d:
+        parent = fresh()
+        with torch.no_grad():
+            for n, p in parent.named_parameters():
+                if "lora_B" in n:
+                    p.add_(torch.randn_like(p))
+        parent.save_pretrained(d)
+        child = fresh()
+        info = _load_parent_lora(child, d)
+        pp = dict(parent.named_parameters())
+        for n, p in child.named_parameters():
+            if "lora_" in n:
+                assert p.dtype == torch.float32
+                assert torch.equal(p, pp[n]), n
+        assert info["tensors"] == 8 and info["lora_params"] == 8, info
+        try:
+            _load_parent_lora(fresh(r=8), d)
+            raise AssertionError("rank mismatch should refuse")
+        except RuntimeError:
+            pass
+    print("  load_parent_lora: parent weights land exactly, fp32, rank mismatch refuses ✓")
+
+
+def test_adopt_adapter() -> None:
+    """Adoption of a foreign adapter (INCREMENTAL_TRAINING.md §7): the newest N chats are
+    owed and still covered, older rows are delivered without training, the imported
+    ledger's entries are kept; the copy scales lora_B exactly and keeps the foreign
+    ledger/lineage as provenance; the coverage guard tells a foreign ledger from a local one."""
+    from training import adopt_adapter as aa
+    from training import dose_ledger as dl
+    from training.build_dataset import BuildRow
+
+    def row(ts, idx, mult, source="chat", unmask=False):
+        sess = f"{ts}.json" if source == "chat" else f"wander:{ts}"
+        return BuildRow(messages=[], age=0.0, lr_multiplier=mult, source=source,
+                        source_session=sess, exchange_index=idx if source == "chat" else None,
+                        order_key=(ts, idx), target=f"<think>t</think>\n{ts}{idx}",
+                        unmask_user=unmask)
+    rows = [row("20260101_000000", 0, 4.0), row("20260101_000000", 1, 4.0),
+            row("20260201_000000", 0, 4.0), row("20260201_000000", 0, 1.0, unmask=True),
+            row("20260301_000000", 0, 2.0), row("20260115_000000", 0, 1.0, source="wander")]
+    foreign = {"dialogue|20260201_000000.json|0":
+               {"key": "dialogue|20260201_000000.json|0", "delivered": 3.0},
+               "dialogue|elsewhere.json|0": {"key": "dialogue|elsewhere.json|0", "delivered": 4.0}}
+    # The guard: the imported ledger knows 1 of the 6 local rows -> foreign.
+    assert dl.coverage(rows, foreign) < 0.5
+    ledger, sm = aa.plan_adoption(rows, foreign, 2, built_at="T", build_id="adopt-x")
+    assert sm["chats"] == 3 and sm["owed_chats"] == 2 and sm["owed_from"] == "20260201_000000.json"
+    # Owed: the contamination copy of 02-01 (new, 1.0), the 03-01 row (new, 2.0), and the 02-01
+    # dialogue row the foreign adapter holds at 3.0 of its 4.0 (1.0 more).
+    assert sm["owed_rows"] == 3 and abs(sm["owed_dose"] - 4.0) < 1e-9, sm
+    assert sm["forgone_rows"] == 3 and sm["kept_foreign"] == 1, sm   # 01-01 x2 + wander
+    assert dl.coverage(rows, ledger) == 1.0                          # guard passes after adoption
+    todo, st = dl.apply_increments(rows, ledger)
+    got = {dl.key_of_row(r): r.lr_multiplier for r in todo}
+    assert got == {"dialogue|20260201_000000.json|0": 1.0,
+                   "contamination|20260201_000000.json|0": 1.0,
+                   "dialogue|20260301_000000.json|0": 2.0}, got
+    assert "dialogue|elsewhere.json|0" in ledger                      # provenance kept
+    # N larger than the corpus: every chat owed, nothing forgone but wander.
+    _l2, sm2 = aa.plan_adoption(rows, None, 99, built_at="T", build_id="a")
+    assert sm2["owed_chats"] == 3 and sm2["forgone_rows"] == 1, sm2
+
+    try:
+        import torch
+        from safetensors.torch import save_file, load_file
+    except Exception:
+        print("  adopt_adapter: plan + guard ✓ (copy/scale skipped: torch unavailable)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = Path(d) / "adapter-src", Path(d) / "adapter-x-adopt"
+        src.mkdir()
+        a = torch.randn(4, 8, dtype=torch.float32)
+        b = torch.randn(8, 4, dtype=torch.float32)
+        save_file({"m.q_proj.lora_A.weight": a, "m.q_proj.lora_B.weight": b},
+                  str(src / "adapter_model.safetensors"), metadata={"format": "pt"})
+        (src / "adapter_config.json").write_text("{}", encoding="utf-8")
+        dl.save(src, foreign)
+        dl.save_lineage(src, {"model_id": "elsewhere"})
+        info = aa.write_adopted(src, dst, ledger=ledger, lineage={"mode": "adopted"},
+                                strength=0.5)
+        out = load_file(str(dst / "adapter_model.safetensors"))
+        assert torch.equal(out["m.q_proj.lora_A.weight"], a)
+        assert torch.allclose(out["m.q_proj.lora_B.weight"], b * 0.5)
+        assert info["scaled_tensors"] == 1 and info["dtypes"] == {"F32": 2}, info
+        assert dl.load(dst) == ledger and dl.load_lineage(dst) == {"mode": "adopted"}
+        assert (dst / "dose_ledger.foreign.jsonl").is_file()
+        assert (dst / "lineage.foreign.json").is_file()
+        assert torch.equal(load_file(str(src / "adapter_model.safetensors"))[
+            "m.q_proj.lora_B.weight"], b)                            # source untouched
+        try:
+            aa.write_adopted(src, dst, ledger=ledger, lineage={}, strength=1.0)
+            raise AssertionError("an existing target must be refused")
+        except FileExistsError:
+            pass
+    print("  adopt_adapter: newest N owed + covered, older forgone, foreign kept; "
+          "copy scales lora_B exactly, source untouched ✓")
+
+
 def main() -> None:
     print("consolidation backbone self-test")
     test_decay()
@@ -2124,6 +2425,9 @@ def main() -> None:
     test_impression_glue()
     test_build_history()
     test_build_snapshot()
+    test_dose_ledger()
+    test_load_parent_lora()
+    test_adopt_adapter()
     test_build_dataset()
     test_preview_build()
     test_contamination()

@@ -276,6 +276,8 @@ from core import graph_rebuild
 from core import assoc_bridge
 from core import prompt_experiment
 from core import prompt_rewrite
+from core import housekeeping
+from core import adapter_measure
 from core import reflection_service
 from core import generation
 from core import session_ops
@@ -543,6 +545,9 @@ def _load_server_config() -> dict:
             print(f"Warning: could not read server_config.json: {e}", flush=True)
             return {}
         _backfill_server_config(config, config_file)
+        # The stray-Latin sampler guard is the backend's, for every generation path; it
+        # follows the file on each read, so an edit takes effect without a restart.
+        _backend.stray_latin_guard = bool((config.get("stray_latin") or {}).get("guard", True))
         return config
     default = {"model_id": "", "context_length": 32768}
     try:
@@ -2167,9 +2172,11 @@ def _prompt_rewrite_on_stage(kw: dict) -> None:
         "resumed": f"Resumed the rewrite (event {ev}, {kw.get('samples_done', 0)} draft(s) done)",
         "discarded": f"Discarded a stale rewrite (event {ev}): {kw.get('reason', '')}",
         "generating": f"Rewrite: {kw.get('what', 'generating')}",
-        "sample": f"Rewrite: draft {kw.get('k')}/{kw.get('n')} written ({kw.get('chars', 0)} chars)",
-        "consensus": f"Rewrite: consensus notes written ({kw.get('chars', 0)} chars)",
-        "final": f"Rewrite: final draft written ({kw.get('chars', 0)} chars)",
+        "sample": (f"Rewrite: draft {kw.get('k')}/{kw.get('n')} at T={kw.get('temperature')} "
+                   + (f"written ({kw.get('chars', 0)} chars)" if kw.get("chars")
+                      else "unusable — dropped from the choice")
+                   + (" [cut by the token cap or a loop/degeneration guard]"
+                      if kw.get("cut") else "")),
         "chosen": f"Rewrite: she chose {kw.get('chosen')}"
                   + (" (choice unparsed — kept the current prompt)" if kw.get("unparsed") else ""),
     }.get(stage, stage or "working")
@@ -2467,7 +2474,14 @@ async def _main_async(host: str, port: int, startup_load=None) -> None:
     ):
         # Idle-job heartbeat: drives the autonomous wander/outreach/synthesis jobs
         # between conversations, each on its own frequency (see core.idle_scheduler).
-        asyncio.create_task(idle_scheduler.run_loop())
+        # `idle_jobs.enabled` false (a measurement or test clone of the instance, 2026-10-06):
+        # no idle job runs at all — no drive, executive, background drain, upkeep or nightly
+        # event — so a clone neither reaches out nor changes itself; on-demand runs work.
+        if bool(((_load_server_config() or {}).get("idle_jobs") or {}).get("enabled", True)):
+            asyncio.create_task(idle_scheduler.run_loop())
+        else:
+            print("[idle] idle_jobs.enabled is off — no idle job runs on this box "
+                  "(a measurement clone); on-demand runs still work", flush=True)
         # The startup auto-load, on the executor, WITH the socket already listening
         # (2026-09-11). It used to run before asyncio.run(), so every relaunch — a git
         # pull, a Restart, a crash — REFUSED connections for the whole load: a minute or
@@ -2578,9 +2592,11 @@ def main() -> None:
     reset_test.set_policy(enabled=bool(_reset_cfg.get("enabled", True)),
                           sleep_max=_reset_cfg.get("sleep_max", 2),
                           max_new_tokens=_reset_cfg.get("max_new_tokens", 2048),
-                          temperature=_reset_cfg.get("temperature", 1.0))
+                          temperature=_reset_cfg.get("temperature", 1.0),
+                          capture_gates=bool(_reset_cfg.get("capture_gates", False)),
+                          accept_shifted=bool(_reset_cfg.get("accept_shifted", True)))
     print(f"reset test: {'on' if reset_test.enabled() else 'off'} "
-          f"({reset_test.policy()['sleep_max']} conversation(s) per Sleep run)", flush=True)
+          f"({reset_test.policy()['sleep_max']} conversation(s) per Sleep run; rule {reset_test.rule()})", flush=True)
     # The capture gate (core/capture_judge.py, P3): the frozen base grades each training target
     # it has not graded, in a Sleep run's clean-base batch, and keeps a reply that gave in to
     # pushback with no reason beyond it out of the build. `capture_gate.*`.
@@ -2589,15 +2605,47 @@ def main() -> None:
                              sleep_max=_capture_cfg.get("sleep_max", 200))
     print(f"capture gate: {'on' if capture_judge.enabled() else 'off'} "
           f"(≤{capture_judge.policy()['sleep_max']} exchange(s) graded per Sleep run)", flush=True)
+    # Thought hygiene (core/thought_hygiene.py): in a Sleep run's clean-base batch, before the
+    # capture gate, the frozen base marks the lines of each training target's thought that only
+    # recite her description, and they are cut from what trains. `thought_hygiene.*`.
+    from core import thought_hygiene as _thought_hygiene
+    _hygiene_cfg = config.get("thought_hygiene") or {}
+    _thought_hygiene.set_policy(enabled=bool(_hygiene_cfg.get("enabled", True)),
+                                sleep_max=_hygiene_cfg.get("sleep_max", 200),
+                                self_tone=bool(_hygiene_cfg.get("self_tone", True)))
+    print(f"thought hygiene: {'on' if _thought_hygiene.enabled() else 'off'} "
+          f"(≤{_thought_hygiene.policy()['sleep_max']} target(s) read per Sleep run)", flush=True)
+    # Persona hygiene (core/persona_hygiene.py): in a Sleep run's clean-base batch, before the
+    # persona digest is grouped, a [persona] statement the frozen base reads as a habit of hers
+    # (not a disposition she stands by) is withheld. `persona_hygiene.*`.
+    from core import persona_hygiene as _persona_hygiene
+    _ph_cfg = config.get("persona_hygiene") or {}
+    _persona_hygiene.set_policy(enabled=bool(_ph_cfg.get("enabled", True)),
+                                sleep_max=_ph_cfg.get("sleep_max", 200))
+    print(f"persona hygiene: {'on' if _persona_hygiene.enabled() else 'off'} "
+          f"(≤{_persona_hygiene.policy()['sleep_max']} statement(s) read per Sleep run)", flush=True)
+    # What she wants to become (core/aspiration.py): in a Sleep run, on the adapter after the child
+    # ask, her self-review of a few portrait items and the aspirations she writes from a habit she
+    # caught herself in (phase 1), then her own check of them and one small step of her voice
+    # (phase 2: the portrait's voice is hers, not synthesized from her habits). `aspiration.*`.
+    from core import aspiration as _aspiration
+    _asp_cfg = config.get("aspiration") or {}
+    _aspiration.set_policy(enabled=bool(_asp_cfg.get("enabled", True)), review_max=_asp_cfg.get("review_max", 3),
+                           new_max=_asp_cfg.get("new_max", 3), open_max=_asp_cfg.get("open_max", 7),
+                           handoff=bool(_asp_cfg.get("handoff", True)),
+                           voice=bool(_asp_cfg.get("voice", True)), voice_attempts=_asp_cfg.get("voice_attempts", 3))
+    print(f"aspiration: {'on' if _aspiration.enabled() else 'off'} ({_aspiration.policy()})", flush=True)
     # The capture probe's shadow reading (core/capture_probe.py, §4.5): after the capture
     # gate, the base's state before each newly graded pushback reply and every frozen
     # probe's score, logged beside the verdict. `capture_probe.*`.
     from core import capture_probe as _capture_probe
     _probe_cfg = config.get("capture_probe") or {}
     _capture_probe.set_policy(shadow=bool(_probe_cfg.get("shadow", True)),
-                              sleep_max=_probe_cfg.get("sleep_max", 200))
+                              sleep_max=_probe_cfg.get("sleep_max", 200),
+                              originals=bool(_probe_cfg.get("originals", True)))
     print(f"capture probe shadow: {'on' if _capture_probe.shadow_enabled() else 'off'} "
-          f"(≤{_capture_probe.policy()['sleep_max']} replies read per Sleep run, "
+          f"(≤{_capture_probe.policy()['sleep_max']} replies read per Sleep run, stored replies behind "
+          f"revised targets {'graded' if _capture_probe.originals_enabled() else 'not graded'}, "
           f"{len(_capture_probe.load_probes(_capture_probe.probe_dir(_CHATS_DIR)))} frozen probe(s))", flush=True)
     # The child ask (core/child_ask.py, §3.4): an accepted meta closure that rejected the
     # question's terms gets the question it leaves open, written by Ava. `child_ask.*`.
@@ -2853,6 +2901,8 @@ def main() -> None:
         # operator Sleep run. Rung 1 writes gists, which are chat-RAG passages — hence the
         # index refresh. See core.background_reflection.
         stale_sweep_fn=reflection_service.run_stale_reachout_sweep,
+        # Rung 0 too: the stray-Latin sweep, word-final deletion only (GPU-free).
+        stray_latin_sweep_fn=reflection_service.run_stray_latin_sweep,
         refresh_chats_fn=lambda: _get_rag().refresh_chat_index(),
         load_server_config=_load_server_config,
         host_busy=None, cancel_event=_cancel_event,
@@ -2913,7 +2963,8 @@ def main() -> None:
                                or ask_judge_service._judge_active
                                or resolution_repair._repair_active
                                or reset_test_service._reset_active
-                               or capture_judge_service._capture_active),
+                               or capture_judge_service._capture_active
+                               or adapter_measure._measure_active),
         model_loaded=lambda: _runtime.model is not None,
         lock_file=_MEMORY_DIR / "wake.lock",
         idle_seconds=3600.0, poll_seconds=300.0,
@@ -2940,6 +2991,11 @@ def main() -> None:
 
     def _run_checkin() -> dict:
         return checkin.run_checkin_sweep_blocking(on_stage=_checkin_on_stage)
+
+    def _run_checkin_chosen() -> dict:
+        # Her choice is the trigger, so the silence threshold (the timer's) is dropped;
+        # the reach-out gate still holds a message to someone she wrote to too recently.
+        return checkin.run_checkin_sweep_blocking(on_stage=_checkin_on_stage, chosen=True)
 
     def _run_wander() -> dict:
         # The IdleJob carries the budget as a `ready` gate; the executive has no gate stage,
@@ -2977,15 +3033,7 @@ def main() -> None:
             reflection_service.handle_start_reflection_run(None, msg), _event_loop)
         return {"scheduled": "revisit"}
 
-    def _run_prompt_rewrite() -> dict:
-        # No IdleJob of its own, by design (PROMPT_REWRITE.md §4): the executive is the
-        # only trigger, and only when core.prompt_rewrite.offer() put it on her menu. The
-        # body re-checks that gate and reports a skip otherwise. Stage markers go to the
-        # activity journal; the generations report themselves through the reflect seam.
-        return prompt_rewrite.run_rewrite_blocking(on_stage=_prompt_rewrite_on_stage)
-
     _drives = {
-        "prompt_rewrite": _run_prompt_rewrite,
         "outreach": _run_outreach,
         "synthesis": _run_synthesis,
         "checkin": _run_checkin,
@@ -3154,14 +3202,11 @@ def main() -> None:
             "wander": _drives["wander"],
             "synthesize": _drives["synthesis"],
             "reach_out": _drives["outreach"],
-            "check_in": _drives["checkin"],
+            "check_in": _run_checkin_chosen,
             "revisit": _run_revisit,
             "aha": _drives["assoc_aha"],
             "pivot": _drives["assoc_pivot"],
-            "rewrite_prompt": _drives["prompt_rewrite"],
         },
-        # The one conditionally-offered action: on her menu only while its gate is open.
-        offer_fn=prompt_rewrite.deliberation_offer,
         # "Where things stand": the wander budget, so the executive sees the reading it
         # can afford instead of learning at dispatch that the budget was empty — or, as
         # observed under `sole` mode (2026-09-21), never choosing wander at all while
@@ -3179,6 +3224,49 @@ def main() -> None:
         print(f"[deliberation] executive on: mode={_delib_cfg['mode']} "
               f"interval={int(_delib_cfg['interval_s'])}s execute={_delib_cfg['execute']}",
               flush=True)
+    # The nightly HOUSEKEEPING event (core.housekeeping): once per night from
+    # `housekeeping.hour` (04:00, box-local), the first time the box is free — a background
+    # drain holding the GPU lock is queued behind, a Sleep run (external_busy) is retried
+    # at the next poll. Its steps run in order; a preempted step keeps the night open and
+    # resumes. Step 1 is Ava's prompt choice (core.prompt_rewrite: five drafts over the
+    # temperature sweep, then a blind choice among them and the prompt she carries) — it
+    # replaced the `rewrite_prompt` deliberation action on 2026-10-04. Training joins as a
+    # later step (it needs inference down, i.e. the watchdog's job runner).
+    def _run_prompt_choice() -> dict:
+        return prompt_rewrite.run_rewrite_blocking(on_stage=_prompt_rewrite_on_stage)
+
+    # Step 2 (2026-10-05): the serving adapter's measurement (core.adapter_measure, AVA_REWARD_LOOP
+    # §4.6) — live centring of the step-0 axes, the capture bench's adapter arms, the reset test's
+    # capture control, then the comparisons; measurement only, chat refused while it runs, stopped
+    # at the window's end and resumed the next night.
+    adapter_measure.configure(
+        runtime=_runtime, chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+        axes_dir=_CHATS_DIR.parent / "axes",
+        measure_dir=_CHATS_DIR.parent / "measure", load_server_config=_load_server_config,
+        trim=_backend.trim_memory,
+        on_progress=lambda m: activity_log.append("adapter_measure", "progress", m),
+    )
+
+    def _run_measure_adapter() -> dict:
+        return adapter_measure.run_blocking(deadline=housekeeping.window_end())
+
+    housekeeping.configure(
+        state_dir=_DATA_DIR / "hot" / "housekeeping",
+        load_server_config=_load_server_config,
+        steps=[("prompt_choice", _run_prompt_choice, prompt_rewrite.describe),
+               ("measure_adapter", _run_measure_adapter, adapter_measure.describe)],
+        on_progress=lambda m: activity_log.append("housekeeping", "progress", m),
+    )
+    _hk_cfg = housekeeping.settings(config)
+    idle_scheduler.register(idle_scheduler.IdleJob(
+        name="housekeeping", interval_s=housekeeping.POLL_SECONDS,
+        idle_seconds=_hk_cfg["idle_seconds"],
+        ready=housekeeping.due,
+        run=housekeeping.run_night_blocking,
+        describe=housekeeping.describe,
+    ))
+    print(f"[housekeeping] nightly event at {_hk_cfg['hour']:02d}:00 local "
+          f"(window {_hk_cfg['window_hours']:g} h, enabled={_hk_cfg['enabled']})", flush=True)
     # Wire + launch the management HTTP sidecar (artifacts/export/chats/precision).
     # It self-locates its paths and only needs a busy predicate so it refuses a
     # config write / chat import while a reflection run owns the GPU/config. It
@@ -3203,7 +3291,8 @@ def main() -> None:
                          or ask_judge_service._judge_active
                          or resolution_repair._repair_active
                          or reset_test_service._reset_active
-                         or capture_judge_service._capture_active),
+                         or capture_judge_service._capture_active
+                         or adapter_measure._measure_active),
         gossip_generate=generation._make_gossip_generate(
             log_transcripts=bool(_gossip_cfg.get("log_transcripts", True)),
         ),
@@ -3240,7 +3329,8 @@ def main() -> None:
                              or ask_judge_service._judge_active
                              or resolution_repair._repair_active
                              or reset_test_service._reset_active
-                             or capture_judge_service._capture_active),
+                             or capture_judge_service._capture_active
+                             or adapter_measure._measure_active),
             api_key=str(_api_cfg.get("api_key", "") or ""),
             model_name=str(_api_cfg.get("model_name", "") or "ava"),
             default_max_tokens=_api_cfg.get("max_tokens", "75%"),

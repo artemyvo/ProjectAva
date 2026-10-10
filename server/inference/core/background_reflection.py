@@ -90,6 +90,7 @@ _bg_store: Any = None   # the run store for the active wake (so request_preempt 
 _reflect_one_chat_fn: Callable = None    # reflection_service.run_chat_only_reflection
 _stale_sweep_fn: Callable = None         # reflection_service.run_stale_reachout_sweep
 _refresh_chats_fn: Callable = None       # rag.refresh_chat_index
+_stray_latin_sweep_fn: Callable = None   # reflection_service.run_stray_latin_sweep
 _load_server_config: Callable = None
 _CHATS_DIR: Any = None
 _DATA_DIR: Any = None
@@ -100,23 +101,26 @@ _cancel_event: Any = None
 
 def configure(*, reflect_one_chat_fn, chats_dir, data_dir, runs_dir,
               stale_sweep_fn=None, refresh_chats_fn=None, load_server_config=None,
-              host_busy=None, cancel_event=None) -> None:
+              host_busy=None, cancel_event=None, stray_latin_sweep_fn=None) -> None:
     """Wire the background pass with the server capabilities it needs.
 
     ``reflect_one_chat_fn(config, store, staging_dir, on_chat_reflected) -> status`` runs
     ONE chat's per-chat reflection on the executor thread (wired to
     ``reflection_service.run_chat_only_reflection``). ``stale_sweep_fn() -> [deleted]`` is
     the shared stale-reach-out policy (``reflection_service.run_stale_reachout_sweep``) —
-    absent ⇒ rung 0 is a no-op. ``refresh_chats_fn`` rebuilds the chat RAG index after the
+    absent ⇒ rung 0 is a no-op. ``stray_latin_sweep_fn() -> report`` is the shared
+    stray-Latin policy (``reflection_service.run_stray_latin_sweep``, word-final deletion
+    only here — the mid-word model repair is the Sleep run's), also rung 0. ``refresh_chats_fn`` rebuilds the chat RAG index after the
     backfill writes gists (a gist is a chat-RAG passage; without it the new recall is on
     disk but not retrievable until something else rebuilds). ``host_busy`` reports the
     non-idle-job GPU owners; ``cancel_event`` is the shared generation cancel used for
     instant preempt.
     """
     global _reflect_one_chat_fn, _CHATS_DIR, _DATA_DIR, _RUNS_DIR, _host_busy, _cancel_event
-    global _stale_sweep_fn, _refresh_chats_fn, _load_server_config
+    global _stale_sweep_fn, _refresh_chats_fn, _load_server_config, _stray_latin_sweep_fn
     _reflect_one_chat_fn = reflect_one_chat_fn
     _stale_sweep_fn = stale_sweep_fn
+    _stray_latin_sweep_fn = stray_latin_sweep_fn
     _refresh_chats_fn = refresh_chats_fn
     _load_server_config = load_server_config
     _CHATS_DIR = Path(chats_dir)
@@ -701,6 +705,22 @@ def run_background_reflection_blocking() -> dict:
         activity_log.append(
             "background_reflection", "progress",
             f"Removed {len(deleted)} unanswered reach-out chat(s): {names}")
+    # Stray-Latin sweep, word-final only (GPU-free): the glitch "болееC стабильную" leaves
+    # the transcripts and targets before the drain below re-reads them.
+    if _stray_latin_sweep_fn is not None:
+        try:
+            latin = _stray_latin_sweep_fn() or {}
+        except Exception:
+            traceback.print_exc()
+            latin = {}
+        if latin.get("sessions"):
+            from core import activity_log
+            activity_log.append(
+                "background_reflection", "progress",
+                f"Stray Latin deleted in {len(latin['sessions'])} chat(s): "
+                f"{latin.get('exchanges', 0)} exchange(s), {latin.get('targets', 0)} target(s)"
+                + (f"; {len(latin.get('left') or [])} mid-word glue(s) wait for Sleep"
+                   if latin.get("left") else ""))
 
     def _nothing_to_do(reason: str) -> dict:
         # A wake that only swept still DID something: report it rather than reporting a

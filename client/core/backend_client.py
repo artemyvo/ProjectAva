@@ -499,13 +499,16 @@ class BackendClient:
             self._send({"type": "capture_judge_report"})
             return self._recv_until({"capture_judge_report"}, timeout=300.0)
 
-    def capture_judge_run(self, *, limit: int = 0, rejudge: bool = False, persona: bool = True) -> dict:
+    def capture_judge_run(self, *, limit: int = 0, rejudge: bool = False, persona: bool = True,
+                          originals: bool = False) -> dict:
         """Grade the corpus's waiting training targets on the clean base, in the background
         (returns at once; progress via capture_judge_status). ``persona=False`` leaves the
-        gated exchanges' [persona] statements to capture_persona_apply."""
+        gated exchanges' [persona] statements to capture_persona_apply. ``originals=True``
+        grades instead the stored reply behind each revised target (the capture probe's
+        labels; no gate)."""
         with self._rpc_lock:
             self._send({"type": "capture_judge_run", "limit": int(limit), "rejudge": bool(rejudge),
-                        "persona": bool(persona)})
+                        "persona": bool(persona), "originals": bool(originals)})
             return self._recv_until({"capture_judge_started"}, timeout=300.0)
 
     def capture_judge_status(self, after: int = 0) -> dict:
@@ -725,24 +728,27 @@ class BackendClient:
             return self._recv_until({"exchange_regenerated_applied"})
 
     def set_training_ban(self, target: str, exchange_index: Optional[int],
-                         banned: bool) -> dict:
+                         banned: bool, history_only: bool = False) -> dict:
         """Ban (or un-ban) one Training review row from future training.
 
         *target* is the row's ``source_session``: a chat transcript filename (with its
         ``exchange_index``) or ``wander:<ts>`` for a wander capture (index ``None``). The
         flag lands on the chat sidecar / the wander corpus record, and the build drops the
         row from then on; the source itself survives until "Rewrite history" deletes it, so
-        the ban is reversible until that point. Returns ``training_ban_set``."""
+        the ban is reversible until that point. *history_only* (chat rows): the ban's other
+        kind — out of training, but kept in the transcript by "Rewrite history" as the context
+        of later turns. Returns ``training_ban_set``."""
         with self._rpc_lock:
             self._send({
                 "type": "set_training_ban",
                 "target": target,
                 "exchange_index": (None if exchange_index is None else int(exchange_index)),
                 "banned": bool(banned),
+                "history_only": bool(history_only),
             })
             return self._recv_until({"training_ban_set"})
 
-    def rewrite_history(self) -> dict:
+    def rewrite_history(self, sessions: Optional[list] = None) -> dict:
         """Bake every human-reviewed (locked) target into its transcript and unfreeze it.
 
         Training review "Rewrite history": for every locked exchange in hot/chats, rewrite the
@@ -753,11 +759,15 @@ class BackendClient:
         (RAG recall, snapshots, later-exchange context). In the same pass every **banned**
         exchange is DELETED from its transcript (later exchanges shift down a position, and
         the sidecar/ledger stores keyed by position move with them) and every banned wander
-        capture is dropped from the corpus. Returns ``history_rewritten {rewritten, deleted,
-        wander_deleted, chats, skipped, errors}``. May re-embed the whole chat corpus, so a
-        wide timeout."""
+        capture is dropped from the corpus. A history-only ban is kept in its transcript.
+        *sessions* limits it to those transcript filenames (no wander cleanup then). Returns
+        ``history_rewritten {rewritten, deleted, kept_history_only, wander_deleted, chats,
+        skipped, errors}``. May re-embed the whole chat corpus, so a wide timeout."""
+        msg: dict = {"type": "rewrite_history"}
+        if sessions:
+            msg["sessions"] = [str(s) for s in sessions]
         with self._rpc_lock:
-            self._send({"type": "rewrite_history"})
+            self._send(msg)
             return self._recv_until({"history_rewritten"}, timeout=600.0)
 
     def get_rag_artifacts(self) -> dict:
@@ -1395,10 +1405,10 @@ class BackendClient:
             return self._recv_until({"prompt_revert_done"})
 
     def prompt_rewrite_status(self, attempts: int = 5) -> dict:
-        """Fetch the autonomous prompt rewrite's status for the Prompt tab: the gate's
-        verdict chain (why the `rewrite_prompt` action is or is not on Ava's menu), the
-        pattern budget, and the newest *attempts* records in full — timestamp, outcome,
-        chosen candidate, her WHY and every candidate's text."""
+        """Fetch the nightly prompt choice's status for the Prompt tab: the eligibility
+        gate's verdict chain, the housekeeping night (done steps, next start), the pattern
+        budget, and the newest *attempts* records in full — timestamp, outcome, chosen
+        candidate, her WHY and every candidate's text and temperature."""
         with self._rpc_lock:
             self._send({"type": "prompt_rewrite_status", "attempts": int(attempts)})
             return self._recv_until({"prompt_rewrite_status"})

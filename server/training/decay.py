@@ -69,6 +69,64 @@ TRAIN_LORA_R_DEFAULT = 32
 # alpha == their r) keep their original alpha/r == 1.0 scaling.
 TRAIN_LORA_ALPHA = 4
 
+# Build mode (server_config.json `train_mode`): "full" fits a fresh LoRA on the frozen base
+# over the whole corpus every build; "incremental" resumes the serving adapter and trains
+# each row only by the dose it is still owed (training/dose_ledger.py,
+# INCREMENTAL_TRAINING.md). The default keeps a box's behaviour unchanged until the
+# operator switches.
+TRAIN_MODES = ("full", "incremental")
+TRAIN_MODE_DEFAULT = "full"
+
+# Incremental-build knobs (server_config.json `incremental.*`). The LR / schedule / epochs
+# defaults are the last incremental recipe before the switch to full training (701a91c^,
+# 2026-07-05): 1e-5 constant, one epoch, no warmup — set by 5d7b379 after the walk-down
+# 2e-4 -> 1e-4 -> 5e-5 -> 1e-5 at r=16 alpha=16; TRAIN_LORA_ALPHA above keeps r=32
+# LR-neutral against that point. `min_increment` (tokens) is the smallest build worth
+# running: below it the build is skipped and every owed increment carries forward.
+# `min_coverage` is the foreign-adapter guard: an incremental build refuses when the parent's
+# ledger knows less than this share of the local trainable rows (an adapter trained on
+# another box — adopt it with training.adopt_adapter instead).
+INCREMENTAL_DEFAULTS = {
+    "lr": 1e-5,
+    "lr_schedule": "constant",
+    "warmup_steps": 0,
+    "epochs": 1,
+    "min_increment": 16384,
+    "min_coverage": 0.5,
+}
+INCREMENTAL_SCHEDULES = ("constant", "triangular")
+
+
+def train_mode(config: Optional[dict]) -> str:
+    """The configured build mode (``train_mode``), falling back to the default."""
+    mode = str((config or {}).get("train_mode") or TRAIN_MODE_DEFAULT).strip().lower()
+    return mode if mode in TRAIN_MODES else TRAIN_MODE_DEFAULT
+
+
+def incremental_settings(config: Optional[dict]) -> dict:
+    """``incremental.*`` from server_config.json, each knob defaulted and type-coerced."""
+    raw = (config or {}).get("incremental") or {}
+    d = INCREMENTAL_DEFAULTS
+    out = dict(d)
+    try:
+        out["lr"] = float(raw.get("lr", d["lr"]))
+    except (TypeError, ValueError):
+        pass
+    sched = str(raw.get("lr_schedule", d["lr_schedule"])).strip().lower()
+    out["lr_schedule"] = sched if sched in INCREMENTAL_SCHEDULES else d["lr_schedule"]
+    for k in ("warmup_steps", "epochs", "min_increment"):
+        try:
+            out[k] = max(0, int(raw.get(k, d[k])))
+        except (TypeError, ValueError):
+            pass
+    out["epochs"] = max(1, out["epochs"])
+    try:
+        out["min_coverage"] = min(1.0, max(0.0, float(raw.get("min_coverage",
+                                                              d["min_coverage"]))))
+    except (TypeError, ValueError):
+        pass
+    return out
+
 
 def modifier(stage: int, decay_steps: int, curve: str = "linear") -> float:
     """RAG/rehearsal weight for *stage*, in [0, 1]. 1.0 when fresh, 0.0 when set."""

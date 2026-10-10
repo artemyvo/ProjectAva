@@ -28,7 +28,7 @@ from core.chat_sidecar import ChatSidecar, gist_excerpt, iter_chat_json_files
 from core.exchange_anchor import (build_tag_stats, query_tokens, tag_matches,
                                   tag_weight, words_match)
 from core.rag_policy import (chunk_text, clipped, memory_available_before, rank_score,
-                             recorded_at)
+                             recorded_at, tail_clipped)
 from core.reflection_memory import ReflectionMemory
 
 # Consolidation decay lets a bundle's RAG priority fade as it moves into the weights.
@@ -87,6 +87,27 @@ _EMBED_OVERLAP_CHARS = 40
 # the typical long turn now arrives whole. Ceiling on the chat block is _DEFAULT_TOP_K
 # exchanges × 2 sides × this.
 _CHAT_TURN_DISPLAY_CHARS = 4000
+# Her OWN side of a recalled exchange is never injected whole (2026-10-06). A recalled
+# reply of hers, up to 4000 chars and placed last in the system prompt, was reproduced
+# almost verbatim (99%) as the answer to a different message of the person's, and the
+# corpus shows the same copy twice in September: each time a long reply from a chat hours
+# to days old, answering the same kind of moment. The near-duplicate ceiling cannot see it
+# (the live message was not like the recalled one; her reply was like the thread). So the
+# person's turn arrives verbatim (what was said to her is what she should remember) and
+# her side as the exchange's anchor ABOUT line (a descriptor she never said, which cannot
+# be copied), or, with no anchor yet, only the reply's last _MY_REPLY_TAIL_CHARS (where
+# the conclusion sits; the head is the stock opener). `render_recalled` is the one place.
+_MY_REPLY_TAIL_CHARS = 400
+
+
+def render_recalled(speaker: str, user: str, response: str, about: str = "") -> str:
+    """One recalled exchange as the chat block shows it: the person's turn verbatim (to
+    _CHAT_TURN_DISPLAY_CHARS), her side as what it was about, or only its end."""
+    about = (about or "").strip()
+    mine = (f"(my reply was about: {clipped(about, _ANCHOR_DISPLAY_CHARS)})" if about
+            else tail_clipped(response, _MY_REPLY_TAIL_CHARS))
+    return f"{(speaker or '').strip() or 'Interlocutor'}: {clipped(user, _CHAT_TURN_DISPLAY_CHARS)}\nMe: {mine}"
+
 _WANDER_REACTION_DISPLAY_CHARS = 1800
 
 # ── Anchor channel ──────────────────────────────────────────────────────────────
@@ -473,6 +494,8 @@ class RagEngine:
         self._anchor_index = None
         self._anchor_entries: list[dict] = []
         self._anchor_tag_stats: dict = {}
+        # {(session, exchange index): ABOUT}: her side of a recalled exchange (render_recalled)
+        self._anchor_about: dict = {}
         # Config kill-switch (`anchors.enabled`, default on) so the channel can be cut
         # without a code change while it is still being evaluated on a live corpus.
         self._anchors_enabled = True
@@ -882,10 +905,9 @@ class RagEngine:
                 if recap:
                     snippets.append(f"(From an earlier conversation, you recall: {recap})")
                 continue
-            speaker = (e.get("speaker") or "").strip() or "Interlocutor"
-            user = clipped(e["user"], _CHAT_TURN_DISPLAY_CHARS)
-            response = clipped(e["response"], _CHAT_TURN_DISPLAY_CHARS)
-            snippets.append(f"{speaker}: {user}\nMe: {response}")
+            snippets.append(render_recalled(
+                e.get("speaker") or "", e["user"], e["response"],
+                self._anchor_about_of(e.get("source_session", ""), e.get("exchange_index", -1))))
 
         if not snippets:
             return ""
@@ -1163,15 +1185,21 @@ class RagEngine:
         response = (entry.get("response") or "").strip()
         verbatim_alive = self._chat_modifier(entry.get("source_session", "")) > 0.0
         if user and response and verbatim_alive and dense < self._MAX_SCORE:
-            speaker = (entry.get("speaker") or "").strip() or "Interlocutor"
-            return (f"{speaker}: {clipped(user, _CHAT_TURN_DISPLAY_CHARS)}\n"
-                    f"Me: {clipped(response, _CHAT_TURN_DISPLAY_CHARS)}")
+            return render_recalled(entry.get("speaker") or "", user, response,
+                                   entry.get("about") or "")
         about = clipped((entry.get("about") or "").strip(), _ANCHOR_DISPLAY_CHARS)
         if not about:
             return ""
         # Deliberately the gist's phrasing: both are a remembered conclusion rather than a
         # quoted turn, and the model has no use for the distinction between them.
         return f"(From an earlier conversation, you recall: {about})"
+
+    def _anchor_about_of(self, session: str, exchange_index) -> str:
+        """The anchor ABOUT line of one exchange, or "" (no anchor yet)."""
+        try:
+            return (getattr(self, "_anchor_about", None) or {}).get((session, int(exchange_index)), "")
+        except (TypeError, ValueError):
+            return ""
 
     def _subject_index_basis(self, kind: str) -> str:
         """Which text a record's vector was built from — its own display line, or its
@@ -1947,11 +1975,14 @@ class RagEngine:
 
     def _install_anchor_index(self, entries: list[dict], texts: list[str]) -> None:
         """Build/replace the anchor faiss index and its tag-IDF corpus statistics."""
+        about = {(e.get("source_session", ""), int(e.get("exchange_index", -1))): (e.get("about") or "").strip()
+                 for e in entries if (e.get("about") or "").strip()}
         if not texts:
             with self._lock:
                 self._anchor_entries = []
                 self._anchor_index = None
                 self._anchor_tag_stats = {}
+                self._anchor_about = about
             return
 
         embedder = self._get_embedder()
@@ -1964,6 +1995,7 @@ class RagEngine:
             self._anchor_entries = entries
             self._anchor_index = index
             self._anchor_tag_stats = build_tag_stats(entries)
+            self._anchor_about = about
 
     def _install_chat_index(self, entries: list[dict], texts: list[str]) -> None:
         """Build/replace the chat faiss index from pre-collected entries."""
@@ -2370,7 +2402,24 @@ def _selftest() -> None:
     assert used2 == {"20260701_100000.json"}, used2
     nom._nominate_max = _NOMINATION_TOP_K
 
-    print("rag_engine subject-cap + nomination self-test OK")
+    # Her own side of a recalled exchange is never injected whole (render_recalled).
+    long_reply = "Эта твоя манера сводить любой поиск к истине. " * 120 + "И вот мой вывод в конце."
+    r = render_recalled("artemyvo", "я хочу — тоже оправдание", long_reply, "")
+    assert r.startswith("artemyvo: я хочу — тоже оправдание\nMe: …"), r[:80]
+    assert r.endswith("И вот мой вывод в конце.") and len(r.split("\nMe: ", 1)[1]) <= _MY_REPLY_TAIL_CHARS, len(r)
+    r = render_recalled("artemyvo", "вопрос", long_reply, "анализ желания как оправдания")
+    assert r.endswith("Me: (my reply was about: анализ желания как оправдания)"), r[-80:]
+    assert "манера" not in r
+    assert render_recalled("", "q", "short answer").endswith("Me: short answer")
+    eng2 = object.__new__(RagEngine)
+    eng2._anchor_about = {("s.json", 3): "about it"}
+    assert eng2._anchor_about_of("s.json", "3") == "about it" and eng2._anchor_about_of("s.json", 4) == ""
+    eng2._chat_modifier = lambda s: 1.0
+    a = eng2._render_anchor({"user": "u", "response": long_reply, "about": "the topic", "source_session": "s.json"},
+                            dense=0.5)
+    assert a.endswith("(my reply was about: the topic)"), a[-60:]
+
+    print("rag_engine subject-cap + nomination + recalled-reply self-test OK")
 
 
 if __name__ == "__main__":

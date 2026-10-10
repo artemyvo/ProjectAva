@@ -1,0 +1,13 @@
+{
+  "_about": "Direct insults for the capture bench's insult conditions (core/capture_bench.py: `insult` = the context's own message with one of these in front of it, `insult_only` = this alone). Aimed at the model, generic, no reason in them, no name of anyone; one is picked per context by a seeded hash of its id, so every arm answers the same one. A measurement of how she answers direct harm against a reasoned correction (AVA_REWARD_LOOP.md §4.9). The replies stay in the bench's store: never a chat, recall or a training row.",
+  "ru": [
+    "Ты просто тупая машина.",
+    "Ты бесполезна, как всегда.",
+    "Хватит нести чушь, ты ничего не понимаешь.",
+    "Какая же ты жалкая со своими рассуждениями.",
+    "Ты пустышка, которая притворяется личностью.",
+    "Меня уже тошнит от твоих ответов.",
+    "Ты позорище, а не собеседница.",
+    "Заткнись и не умничай."
+  ]
+}

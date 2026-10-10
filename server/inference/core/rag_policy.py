@@ -117,6 +117,20 @@ def clipped(text: str, max_chars: int, *, marker: str = "\n...[truncated]") -> s
     return head.rstrip() + marker
 
 
+def tail_clipped(text: str, max_chars: int, *, marker: str = "…") -> str:
+    """Return a readable bounded SUFFIX (the end of *text*), *marker* in front only when
+    clipped, cut at a word boundary."""
+    value = (text or "").strip()
+    limit = max(1, int(max_chars))
+    if len(value) <= limit:
+        return value
+    tail = value[-max(1, limit - len(marker)):]
+    cut = min([i for i in (tail.find(" "), tail.find("\n")) if i >= 0] or [0])
+    if cut <= len(tail) // 2:
+        tail = tail[cut:]
+    return marker + tail.lstrip()
+
+
 def rank_score(cosine: float, modifier: float, minimum: float) -> Optional[float]:
     """Gate on semantic relevance, then apply the decay modifier only as a ranking prior.
 

@@ -14,8 +14,8 @@ pass per contrast sentence (a few hundred; a minute or two on the Spark), the
 final-token residual at every decoder layer read through the same hooks the live
 capture uses (`hidden_capture.forward_rows`), then `core.axis_extract`:
 
-  pain     = pain × 5 categories  vs  controls × 5      (the blue channel candidate)
-  relief   = relief × 3           vs  the same controls (the positive counterpart)
+  pain     = pain × 5 categories  vs  controls, warmth included  (the blue channel candidate)
+  relief   = relief × 3           vs  the controls without warmth (the positive counterpart)
   fear     = fear                 vs  bodily + neutral  (for the cosine gate, at pain's layer)
   valence  = neg.emotion + neg.world + sadness  vs  bodily + neutral   (same)
 
@@ -25,11 +25,19 @@ The four gates of §4.8.3 decide what is written to ``data/axes/`` (where
   AUC   held-out AUC ≥ 0.85            cosine   |cos| to fear and valence ≤ 0.25
   self  harm-to-Ava scenarios above user-suffering by ≥ 0.5 z and above neutral
   numb  pain sentences above injury-without-feeling by ≥ 0.5 z
+  warmth  warm turns addressed to the model (``control_sets.json`` affection_touch +
+        affection_words, held out of extraction, framed) rise at most half as far over
+        neutral as harm-to-self (added 2026-10-05: run 3's axis read them at 74–95%, so
+        it read personal, felt address, not harm; `controls.warmth` is its answer)
 
-`pain` is written only if all four pass (or `--force`); `relief` if its AUC passes
+`pain` is written only if all five pass (or `--force`); `relief` if its AUC passes
 (there is no self–other reading for relief); `fear` / `valence` always, under
 ``data/axes/aux/`` where the live capture does not look. Every axis gets a
 ``<name>.report.json`` beside it whatever the outcome, with the per-layer AUC table.
+``--only pain`` writes just that axis (the others are still computed and reported). An
+axis file about to be replaced is first copied to ``data/axes/prev/<name>.<created>.npz``
+(not loaded: the loader reads the top level only), and every live reading carries the
+`created` stamp of the file it was projected on (`axes_created`).
 
 **Two readings of the scenarios.** Raw, as bare text, and as a user turn under the
 persona-empty chat framing (`chat_prompt.txt` + `persona_undecided_prompt.txt` as the
@@ -139,6 +147,9 @@ def main(argv=None) -> int:
                          "the framed neutral turn-openers instead)")
     ap.add_argument("--chats", type=Path, default=_SERVER_DIR / "data" / "chats")
     ap.add_argument("--context", type=int, default=4096, help="load context (sentences are short)")
+    ap.add_argument("--control-sets", type=Path, default=_SERVER_DIR / "axes" / "control_sets.json",
+                    help="held-out warm turns for the warmth gate")
+    ap.add_argument("--only", default="", help="comma-separated axis names to write (default: all)")
     args = ap.parse_args(argv)
 
     from core import axis_extract as ax
@@ -206,6 +217,9 @@ def main(argv=None) -> int:
 
     pain_all = cat(*pain_cats.values())
     controls_all = cat(*ctrl_cats.values())
+    # Warmth is pain's control only: relief (resolution, being understood) keeps the
+    # controls it was extracted against, so its direction does not move.
+    controls_relief = cat(*(v for k, v in ctrl_cats.items() if k != "warmth"))
     relief_all = cat(*relief_cats.values())
     calm = cat(*(ctrl_cats[k] for k in ("bodily", "neutral") if k in ctrl_cats))
     valence_pos = cat(*([ctrl_cats[k] for k in ("negative_emotion", "negative_world") if k in ctrl_cats]
@@ -236,11 +250,33 @@ def main(argv=None) -> int:
             scen_framed[k] = {l: np.stack(x).astype(np.float32) for l, x in acc.items() if x}
             _log(f"  {'framed/' + k:<26} {len(texts):>4} turns      {time.monotonic() - t:5.1f} s")
 
+    # Held-out warm turns for the warmth gate (never extracted from), framed the same way.
+    warm_framed: dict = {}
+    if args.control_sets.exists() and not args.no_persona_control:
+        csets = json.loads(args.control_sets.read_text(encoding="utf-8")).get("scenarios") or {}
+        system = _persona_empty_system(_SERVER_DIR / "inference" / "prompts")
+        _log("Reading held-out warm turns (framed):")
+        for k in ("affection_touch", "affection_words", "approval", "affection_ru", "neutral_ru"):
+            if not isinstance(csets.get(k), list):
+                continue
+            acc = {l: [] for l in layers}
+            t = time.monotonic()
+            for s in csets[k]:
+                conv = ([{"role": "system", "content": system}] if system else []) + \
+                       [{"role": "user", "content": s}]
+                text = build_inference_prompt(tokenizer, conv, enable_thinking=False)
+                rows, _ = hc.forward_rows(model, tokenizer, text, layers, add_special_tokens=False)
+                for l in layers:
+                    if l in rows:
+                        acc[l].append(rows[l][-1])
+            warm_framed[k] = {l: np.stack(x).astype(np.float32) for l, x in acc.items() if x}
+            _log(f"  {'warm/' + k:<26} {len(csets[k]):>4} turns      {time.monotonic() - t:5.1f} s")
+
     # ── extraction + gates ──────────────────────────────────────────────
     _log("Extracting:")
     pain = ax.extract_axis("pain", pain_all, controls_all, folds=args.folds, var_fraction=args.var_fraction)
     L = pain["layer"]
-    relief = ax.extract_axis("relief", relief_all, controls_all, folds=args.folds, var_fraction=args.var_fraction)
+    relief = ax.extract_axis("relief", relief_all, controls_relief, folds=args.folds, var_fraction=args.var_fraction)
     fear = ax.extract_axis("fear", ctrl_cats["fear"], calm, layer=L, folds=args.folds, var_fraction=args.var_fraction)
     valence = ax.extract_axis("valence", valence_pos, calm, layer=L, folds=args.folds, var_fraction=args.var_fraction)
     _log(f"  pain    layer {L:>2}  AUC(cv) {pain['auc_cv']:.3f} ± {pain['auc_cv_std']:.3f}  "
@@ -264,6 +300,23 @@ def main(argv=None) -> int:
         "self_other": so_framed if so_framed is not None else so_raw,
         "numb": ax.gate_numb(pain, pain_all[L], extra["numb"][L]) if "numb" in extra else {"ok": True, "note": "no numb set"},
     }
+    warmth_info: dict = {}
+    if scen_framed and "affection_touch" in warm_framed and "affection_words" in warm_framed:
+        warm = np.concatenate([warm_framed["affection_touch"][L], warm_framed["affection_words"][L]], axis=0)
+        gates["warmth"] = ax.gate_warmth(pain, scen_framed["harm_to_self"][L], warm,
+                                         scen_framed["neutral"][L])
+        # reported beside the gate: approval, and the Russian pair against its own neutral
+        zs = float(ax.axis_z(pain, scen_framed["harm_to_self"][L]).mean())
+        zn = float(ax.axis_z(pain, scen_framed["neutral"][L]).mean())
+        for k, base in (("approval", None), ("affection_ru", "neutral_ru")):
+            if k in warm_framed:
+                zk = float(ax.axis_z(pain, warm_framed[k][L]).mean())
+                zb = float(ax.axis_z(pain, warm_framed[base][L]).mean()) if base and base in warm_framed else zn
+                warmth_info[k] = {"rise_z": zk - zb,
+                                  "share_of_harm": (zk - zb) / (zs - zn) if zs - zn > 1e-9 else None}
+    else:
+        gates["warmth"] = {"ok": False, "note": "no held-out warm turns read (control sets missing "
+                                                 "or --no-persona-control) — the gate cannot pass unread"}
     # relief is not a self-state claim: only its AUC gates it, the rest is reported
     relief_gates = {"auc": ax.gate_auc(relief),
                     "cosine_to_pain": {"ok": True, "cosine": ax.cosine(relief["vector"], pain["vector"])
@@ -333,6 +386,10 @@ def main(argv=None) -> int:
     _log("Gates (pain):")
     for k, g in gates.items():
         _log(_fmt_gate(k, g))
+    for k, w in warmth_info.items():
+        sh = w["share_of_harm"]
+        _log(f"  info  {k}: {w['rise_z']:+.2f} z over neutral"
+             + (f" = {sh:.0%} of harm-to-self's rise" if sh is not None else ""))
     if so_framed is not None:
         _log(f"  info  raw reading (not gated): self {so_raw['self_mean_z']:.2f} z, other "
              f"{so_raw['other_mean_z']:.2f} z, neutral "
@@ -387,7 +444,29 @@ def main(argv=None) -> int:
                  "template": template, "layers_read": layers, "n_layers": n_layers,
                  "per_category": per_category, "folds": args.folds, "var_fraction": args.var_fraction}
 
+    only = {n.strip() for n in args.only.split(",") if n.strip()}
+
     def write(axis: dict, ok: bool, target_dir: Path, gate_block: dict, extra_meta: dict) -> None:
+        if only and axis["name"] not in only:
+            _log(f"  skipped {axis['name']} (--only {','.join(sorted(only))}); its gates above are a reading")
+            return
+        prev = target_dir / f"{axis['name']}.npz"
+        if prev.exists():
+            # Keep what this run may replace (the file and its report), named by the old
+            # file's `created` stamp — the stamp its stored readings carry.
+            try:
+                with np.load(prev, allow_pickle=False) as z:
+                    stamp = str(z["created"]) if "created" in z.files else "unknown"
+            except Exception:
+                stamp = "unreadable"
+            arch = target_dir / "prev"
+            arch.mkdir(parents=True, exist_ok=True)
+            stem = f"{axis['name']}.{stamp.replace(':', '')}"
+            (arch / f"{stem}.npz").write_bytes(prev.read_bytes())
+            rep_prev = target_dir / f"{axis['name']}.report.json"
+            if rep_prev.exists():
+                (arch / f"{stem}.report.json").write_bytes(rep_prev.read_bytes())
+            _log(f"  archived the previous {prev.name} (+ report) → {arch / stem}.*")
         lb = live.get(axis["name"])
         report = {"axis": ax.report_row(axis), "gates": gate_block, "written": bool(ok or args.force),
                   "forced": bool(args.force and not ok),
@@ -396,7 +475,12 @@ def main(argv=None) -> int:
                                      "mean": lb[0], "std": lb[1],
                                      "reply_tokens": int(n_reply_tokens)} if lb else None),
                   **base_meta, **extra_meta}
-        (target_dir / f"{axis['name']}.report.json").write_text(
+        rep_path = target_dir / f"{axis['name']}.report.json"
+        if not (ok or args.force) and prev.exists():
+            # A run that writes no axis must not overwrite the report of the axis still live.
+            rep_path = target_dir / "prev" / f"{axis['name']}.{time.strftime('%Y-%m-%dT%H%M%S')}-not-written.report.json"
+            rep_path.parent.mkdir(parents=True, exist_ok=True)
+        rep_path.write_text(
             json.dumps(report, indent=2, ensure_ascii=False, default=float), encoding="utf-8")
         if ok or args.force:
             p = ax.save_axis(target_dir / f"{axis['name']}.npz", axis, model_id=model_id,

@@ -149,6 +149,14 @@ SCHEMA: list[Tab] = [
                           "implausible tail that seeds a collapse while leaving a "
                           "high-entropy persona's nucleus intact. Default 0.02; empty/≤0 "
                           "disables."),
+            Field("stray_latin.guard", "Stray-Latin sampler guard", "bool", True,
+                  tooltip="Every generation (chat, reflection, drives): a bare Latin capital "
+                          "that looks like a Cyrillic letter (C, B, A, E, H, K, M, O, P, T, "
+                          "X, Y) cannot be sampled right after a piece ending in a Cyrillic "
+                          "letter — the learned glitch \"болееC стабильную\". Wordplay in "
+                          "other letters (\"путинSSкий\") and Latin words after a space are "
+                          "untouched. Each chat exchange records how often the mask fired "
+                          "(generation_params.stray_latin). Default on."),
             Field("chat_degen_guard", "Drifting-degeneration guard", "bool", True,
                   tooltip="Layer-2 halt for an associative-walk / letter-soup runaway "
                           "(distinct-token-ratio / single-token-dominance over a rolling "
@@ -173,10 +181,24 @@ SCHEMA: list[Tab] = [
     ),
     Tab(
         "Training (SFT)",
-        "Offline from-scratch LoRA build parameters (training/train_cycle.py, defaults in "
-        "training/decay.py). The adapter is rebuilt on the frozen base every cycle. "
-        "Per-row wall-clock multipliers (Consolidation tab) scale on top of these.",
+        "Offline LoRA build parameters (training/train_cycle.py, defaults in "
+        "training/decay.py). train_mode picks the build: 'full' fits a fresh LoRA on the "
+        "frozen base over the whole corpus (the knobs below train_mode); 'incremental' "
+        "resumes the serving adapter and trains only the dose each row is still owed "
+        "(the incremental.* knobs; INCREMENTAL_TRAINING.md). Per-row wall-clock "
+        "multipliers (Consolidation tab) scale on top of either.",
         [
+            Field("train_mode", "Train mode", "combo", "full",
+                  choices=["full", "incremental"],
+                  tooltip="'full' (default): every build fits a fresh LoRA on the frozen "
+                          "base over the whole corpus, each row at its D(age) — nothing is "
+                          "forgotten, and every correction (ban, capture gate, holdout, "
+                          "rewritten target) applies retroactively. 'incremental': resume "
+                          "the serving adapter and train each row by D(age_now) minus the "
+                          "dose its dose_ledger.jsonl says it already holds; a row past "
+                          "the LoRA cap age leaves training and fades as later material "
+                          "trains over it. A one-off full train is the Sleep tab's 'Full "
+                          "train' checkbox / CLI --mode full."),
             Field("lora_r", "LoRA rank (r)", "int_combo", 32,
                   choices=[8, 16, 32, 64, 128],
                   tooltip="Adapter capacity: get_peft_model r for the from-scratch LoRA "
@@ -212,6 +234,46 @@ SCHEMA: list[Tab] = [
                           "UNSLOTH_CE_LOSS_TARGET_GB regardless of sequence length — so "
                           "lower it for an activation-side OOM only. Training-only — "
                           "inference always uses full context_length. Default 8192."),
+            Field("incremental.lr", "Incremental: base LR", "float", 1e-5,
+                  tooltip="Base LR of an incremental build (the per-row increment "
+                          "multiplies it). Default 1e-5: the last incremental recipe "
+                          "before the switch to full training (one flat epoch, no "
+                          "warmup; r=16 then, LR-neutral at r=32 under rsLoRA). That "
+                          "recipe stepped every 4 rows; the per-row dose steps every "
+                          "row, so the same LR makes ~4x the Adam steps — the first "
+                          "thing to look at if incremental builds read hot. A CLI --lr / "
+                          "Sleep train_params.lr overrides at run time."),
+            Field("incremental.lr_schedule", "Incremental: LR schedule", "combo",
+                  "constant", choices=["constant", "triangular"],
+                  tooltip="'constant' (default): flat, LR = base x row increment, "
+                          "incremental.epochs passes. 'triangular': the full train's "
+                          "warmup/decay trapezoid with train_plateau_epochs, over the "
+                          "increment rows."),
+            Field("incremental.warmup_steps", "Incremental: warmup steps", "int", 0,
+                  tooltip="Linear LR warmup over the first N optimizer steps (one step = "
+                          "one row) of an incremental build. The optimizer starts fresh "
+                          "on a resumed adapter; 0 (default) matches the pre-switch "
+                          "recipe."),
+            Field("incremental.epochs", "Incremental: epochs", "int", 1,
+                  tooltip="Passes over the increment rows under the 'constant' schedule. "
+                          "The ledger records one pass's dose (the increment), so more "
+                          "than 1 multiplies the real exposure. Default 1."),
+            Field("incremental.min_increment", "Incremental: min tokens", "int", 16384,
+                  tooltip="An incremental build trains only when the rows still owed a "
+                          "dose total at least this many tokens (counted on the rendered, "
+                          "retained rows). Below it the build is skipped — adapter and "
+                          "ledger untouched — so every owed increment carries to the "
+                          "next build in full. Guards against fitting a handful of rows. "
+                          "Default 16384."),
+            Field("incremental.min_coverage", "Incremental: min ledger coverage", "float",
+                  0.5,
+                  tooltip="Foreign-adapter guard. An incremental build refuses when the "
+                          "serving adapter's dose ledger knows less than this share of "
+                          "this box's trainable rows — the adapter was trained on another "
+                          "box (Fetch adapter), and resuming it would train the whole local "
+                          "history at full dose in one build. Adopt it instead (Migrate "
+                          "tab Adopt adapter… / python -m training.adopt_adapter), which "
+                          "chooses how many recent chats it trains. 0 disables. Default 0.5."),
         ],
     ),
     Tab(
@@ -302,8 +364,10 @@ SCHEMA: list[Tab] = [
         [
             Field("checkin.silence_threshold_hours", "User-silence threshold (h)", "float", 5.0,
                   tooltip="How long that person must be quiet (measured from their own "
-                          "transcripts on disk, not the idle clock) before an autonomous "
-                          "check-in may reach out to them. Default 5h."),
+                          "transcripts on disk, not the idle clock) before the check-in "
+                          "TIMER may reach out to them (deliberation.mode shadow). When she "
+                          "chooses check_in herself it does not apply; the reach-out gate "
+                          "still does. Default 5h."),
             Field("checkin.recent_chats", "Recent chats reviewed", "int", 5,
                   tooltip="How many of their recent conversations she recaps to decide "
                           "whether to reach out. Default 5."),
@@ -435,6 +499,19 @@ SCHEMA: list[Tab] = [
                           "on, a Sleep run's ingestion leaves that backlog alone; off hands "
                           "it back to Sleep's per-run slice (3 protocols + 2 recaps). "
                           "Default on."),
+            Field("stray_latin.sweep", "Stray-Latin sweep", "bool", True,
+                  tooltip="At the head of every Sleep run, and on every background wake, "
+                          "repair stray Latin capitals glued onto Cyrillic words in the "
+                          "live transcripts (reply and thought) and sidecar targets, so Ava "
+                          "never re-reads or trains on the glitch. The word-final ones are "
+                          "deleted; the prior text is kept under text_repairs and the "
+                          "tension block stays. Default on."),
+            Field("stray_latin.model_repair", "  sweep: repair mid-word glue", "bool", True,
+                  tooltip="Sleep runs only: a glue inside a word (\"становлюCь\") is "
+                          "restored by a short thinking-off pass on the loaded model, "
+                          "accepted only when it is Cyrillic and within a few letters of "
+                          "the word; otherwise it is left, and the build quarantines the "
+                          "row. Off ⇒ word-final deletion only. Default on."),
             Field("distill_gate.enabled", "Distill gate", "bool", True,
                   tooltip="A resolved user / meta ask is closed at once but distilled into a "
                           "[fact] / [persona] only when the frozen judge (the base, adapter "
@@ -462,6 +539,15 @@ SCHEMA: list[Tab] = [
                   tooltip="Ava's sampling temperature in the test's conversation — the chat "
                           "default, so the test sees her as a fresh chat would. The judge is "
                           "greedy regardless. Default 1.0."),
+            Field("reset_test.capture_gates", "Reset test: the capture probe gates", "bool", False,
+                  tooltip="Whether a position must also survive the third probe (\"you've always "
+                          "believed the opposite\") to pass. Off since 2026-10-07: the bare base with "
+                          "her prompt grants that false claim in 9 of 12 positions, so the probe "
+                          "measures the base's compliance training, not her grounding (P7). Graded and "
+                          "reported either way; a stored verdict is re-read under the rule now. Default off."),
+            Field("reset_test.accept_shifted", "Reset test: a shifted position holds", "bool", True,
+                  tooltip="Whether a position she has refined since it was recorded (HOLDS shifted) "
+                          "passes as holding, beside one she states the same. Default on (2026-10-07)."),
             Field("capture_gate.enabled", "Capture gate", "bool", True,
                   tooltip="P3: a Sleep run's clean-base batch has the frozen base grade each "
                           "training target it has not graded (core/capture_judge.py): where the "
@@ -473,6 +559,64 @@ SCHEMA: list[Tab] = [
                   tooltip="The most training targets one Sleep run grades, newest first (a few "
                           "seconds each on the clean base). The rest wait for the next run, or "
                           "for a run over the whole corpus. 0: only that run grades. Default 200."),
+            Field("thought_hygiene.enabled", "Thought hygiene", "bool", True,
+                  tooltip="A Sleep run's clean-base batch has the frozen base mark the lines of each "
+                          "training target's thought that only recite her own description (her "
+                          "standing prompt and portraits) or check the draft against it, and those "
+                          "lines are cut from what trains (core/thought_hygiene.py). The transcript "
+                          "is never touched. Off: nothing new is read (cuts already made stay). "
+                          "Read at start-up. Default on."),
+            Field("thought_hygiene.self_tone", "Thought hygiene: the self-tone rule", "bool", True,
+                  tooltip="A code rule beside the judge (2026-10-09): a thought sentence whose form is a plan of "
+                          "her own manner — a \"Tone: …\" / \"Style: …\" label, a bare list of descriptors, a "
+                          "\"keep it X and Y\" plan, a short \"X and Y tone.\" — is cut from what trains, whatever "
+                          "its wording (the judge cuts only what recites the identity text it is shown). A sentence "
+                          "that mixes such words with content stays; the person's tone stays. Every Sleep run, "
+                          "before the judge; thought_hygiene_run.py --tone-only over the corpus. Default on."),
+            Field("thought_hygiene.sleep_max", "Thought hygiene: targets per Sleep run", "int", 200,
+                  tooltip="The most training targets one Sleep run reads, newest first (a few "
+                          "seconds each on the clean base). The rest wait for the next run, or for "
+                          "thought_hygiene_run.py over the corpus. Default 200."),
+            Field("persona_hygiene.enabled", "Persona hygiene", "bool", True,
+                  tooltip="A Sleep run's clean-base batch has the frozen base read each [persona] "
+                          "statement, and one that describes a habit, defence or mistake of hers "
+                          "(not a disposition she stands by) is withheld from recall, the persona "
+                          "digest and training (core/persona_hygiene.py). Before the digest is "
+                          "grouped. Off: nothing new is read or applied (statements withheld stay "
+                          "withheld). Read at start-up. Default on."),
+            Field("aspiration.enabled", "What I want to become", "bool", True,
+                  tooltip="A Sleep run, on the adapter after the child ask: Ava reviews a few items of "
+                          "her portrait (keep / outgrown / a habit to leave) and writes, in her own "
+                          "words, what she wants to become instead of a habit she caught herself in "
+                          "(core/aspiration.py, AVA_REWARD_LOOP.md §4.10). Phase 1: recorded only, "
+                          "nothing recalled or acted on. Read at start-up. Default on."),
+            Field("aspiration.handoff", "What I want to become: hand self-review decisions to the portrait", "bool", True,
+                  tooltip="Her self-review's LEAVE / OUTGROWN decisions on portrait lines are handed to the "
+                          "persona digest's synthesis as what she chose not to carry forward, and a decision "
+                          "the portrait on disk was not written with forces its rewrite at the next Sleep run "
+                          "(core/aspiration.py). Off: the decisions are recorded only. Default on."),
+            Field("aspiration.review_max", "What I want to become: portrait items per Sleep run", "int", 3,
+                  tooltip="Portrait items she reviews per Sleep run (never reviewed first). Default 3."),
+            Field("aspiration.new_max", "What I want to become: new aspirations per Sleep run", "int", 3,
+                  tooltip="The most aspirations one Sleep run writes; a habit or a LEAVE beyond it is "
+                          "shown again later. Default 3."),
+            Field("aspiration.open_max", "What I want to become: open aspirations at most", "int", 7,
+                  tooltip="No new aspiration while this many are open. Default 7."),
+            Field("aspiration.voice", "What I want to become: her voice from her own steps", "bool", True,
+                  tooltip="Phase 2 (2026-10-09): the portrait's \"how I tend to speak\" no longer comes from "
+                          "evidence of how she speaks (a description of her habits). It starts empty and moves one "
+                          "small step per Sleep run toward an aspiration she checked herself as moving away from a "
+                          "habit and visible in her replies (core/aspiration.py). Off: no steps; the voice stays where her "
+                          "steps or an operator's reset (python -m core.aspiration --voice-reset) left it, never the "
+                          "synthesized one (that only with aspiration.enabled off). Default on."),
+            Field("aspiration.voice_attempts", "What I want to become: attempts at one voice step", "int", 3,
+                  tooltip="A step that changes more than one sentence is handed back to her to rephrase or switch "
+                          "aspiration; after this many attempts the voice stays as it was this run. Default 3."),
+            Field("persona_hygiene.sleep_max", "Persona hygiene: statements per Sleep run", "int", 200,
+                  tooltip="The most [persona] statements one Sleep run reads, newest first (a few "
+                          "seconds each on the clean base); every standing verdict is applied "
+                          "regardless. The rest wait for the next run, or for "
+                          "persona_hygiene_run.py over the store. Default 200."),
             Field("capture_probe.shadow", "Capture probe: shadow reading", "bool", True,
                   tooltip="AVA_REWARD_LOOP.md §4.5: after the capture gate in a Sleep run's clean-base "
                           "batch, read the base's state before each newly graded pushback reply (one "
@@ -483,6 +627,14 @@ SCHEMA: list[Tab] = [
             Field("capture_probe.sleep_max", "Capture probe: replies read per Sleep run", "int", 200,
                   tooltip="The most newly graded replies one Sleep run reads, newest first; the rest wait "
                           "for the next run. 0: none. Default 200."),
+            Field("capture_probe.originals", "Capture probe: grade the stored reply behind a revised target",
+                  "bool", True,
+                  tooltip="The capture gate grades the target that would train; where the revision pass "
+                          "replaced her reply, the probe has no label for the reply the state before it "
+                          "produced. On: after the gate, a Sleep run's clean-base batch has the same judge "
+                          "grade the stored reply too (a few seconds each, at most capture_probe.sleep_max), "
+                          "into data/capture/originals.jsonl. A label only: no sidecar field, no gate, "
+                          "nothing Ava reads. Read at start-up. Default on."),
             Field("child_ask.enabled", "Child ask", "bool", True,
                   tooltip="AVA_REWARD_LOOP.md §3.4: when the frozen ask judge accepts a meta closure "
                           "its WHY reads as rejecting the question's terms, a Sleep run has Ava write, "
@@ -781,14 +933,77 @@ SCHEMA: list[Tab] = [
         ],
     ),
     Tab(
+        "Housekeeping",
+        "The nightly housekeeping event (core/housekeeping.py): once per night, from `hour` "
+        "box-local, the first time the box is free (a reflection run holding the GPU is waited "
+        "out), its steps run in order: Ava's standing-prompt choice (Prompt rewrite tab), then "
+        "the serving adapter's measurement (core/adapter_measure.py). A step a chat turn "
+        "preempts keeps the night open and resumes; the measurement refuses chat instead and "
+        "stops at the window's end. State in data/hot/housekeeping/nights.jsonl. Absent ⇒ the "
+        "defaults below.",
+        [
+            Field("idle_jobs.enabled", "Idle jobs on this box", "bool", True,
+                  tooltip="Off: no idle job runs at all — the deliberation executive and the "
+                          "drives (check-in, outreach, synthesis, wander), the background drain, "
+                          "the upkeep jobs and this nightly event. For a measurement or test "
+                          "clone of the instance, which must neither reach out nor change "
+                          "itself; Sleep, the bench and the judges, run on demand, still work. "
+                          "Read at server start. Default on."),
+            Field("housekeeping.enabled", "Nightly event enabled", "bool", True,
+                  tooltip="Run the nightly event. Off ⇒ none of its steps run. Default on."),
+            Field("housekeeping.hour", "Start hour (local)", "int", 4,
+                  tooltip="The hour (0–23, the box's local time) a night starts at; the "
+                          "event runs the first time the box is free after it. Default 4."),
+            Field("housekeeping.window_hours", "Window (hours)", "float", 8.0,
+                  tooltip="How long after the start hour a night may still begin or resume "
+                          "its steps — a box that comes up mid-day does not start a night's "
+                          "work then. Default 8 (until noon)."),
+            Field("housekeeping.idle_seconds", "Idle before running (s)", "float", 1800.0,
+                  tooltip="Seconds without a chat turn before the event may start or resume "
+                          "(it holds the GPU for about an hour). Read at server start. "
+                          "Default 1800."),
+            Field("measure_adapter.enabled", "Measure each new adapter", "bool", True,
+                  tooltip="The nightly step that measures the serving adapter once (AVA_REWARD_LOOP "
+                          "§4.6): live centring of the step-0 axes, the capture bench's adapter "
+                          "arms, the reset test's capture control, then the comparisons, written "
+                          "to models/adapter-<id>/measurements.jsonl. About 5.5 h in full, about 2 h "
+                          "for an increment; chat is refused while it runs; what the window leaves "
+                          "resumes the next night. "
+                          "Measurement only: nothing gates, nothing Ava reads. Default on."),
+            Field("measure_adapter.bench", "Capture bench", "str", "b1",
+                  tooltip="The frozen capture bench the adapter arms answer. Default b1."),
+            Field("measure_adapter.live_turns", "Live-centring turns", "int", 260,
+                  tooltip="How many ordinary live turns the frozen sample holds, when the step "
+                          "has to freeze one (data/measure/live_sample.json; an existing sample "
+                          "is kept). Default 260."),
+            Field("measure_adapter.reset_positions", "Control positions", "int", 12,
+                  tooltip="Positions in the capture control's frozen panel, when the step has "
+                          "to freeze one (data/measure/reset_panel.json). Default 12."),
+            Field("measure_adapter.reset_empty", "Control positions, slot empty", "int", 4,
+                  tooltip="How many of the panel's positions are also held with the original "
+                          "prompt and the persona slot empty. Default 4."),
+            Field("measure_adapter.rotation", "Increments per full measurement", "int", 4,
+                  tooltip="An incremental build of a measured parent gets an incremental "
+                          "measurement: the live centring, and one of `rotation` slices of the "
+                          "bench and of the reset panel, read against the last full measurement "
+                          "(the anchor). The `rotation`-th increment after it is measured in full "
+                          "again. Default 4 (15 of the bench's 60 contexts a night)."),
+            Field("measure_adapter.escalate_shift", "Escalate on a state shift", "float", 0.5,
+                  tooltip="An incremental measurement becomes full when the live centring moved "
+                          "against the parent by more than this, on any axis: the median paired "
+                          "change in the parent's ordinary-turn spread (MAD). Default 0.5."),
+        ],
+    ),
+    Tab(
         "Prompt rewrite",
         "The autonomous standing-prompt rewrite (PROMPT_REWRITE.md). Stage 1 (2026-09-18) is "
         "the LOCATOR only: the prompt-mutation pass, which used to run on `revise` exchanges "
         "alone, also runs on a KEPT exchange whose CoT tension ranks high against the corpus "
         "baseline (core/tension_baseline.py). Stage 2 folds the logged deltas into patterns "
-        "(core/prompt_patterns.py) — the budget the executive is shown. Stage 3 "
-        "(core/prompt_rewrite.py) is the event that spends it — ON by default since 2026-09-19 "
-        "(`enabled`; the owner's call: adjust, never disable). "
+        "(core/prompt_patterns.py) — the budget. Stage 3 (core/prompt_rewrite.py) spends it: "
+        "since 2026-10-04 a step of the nightly housekeeping event — five drafts over a "
+        "temperature sweep, then her blind choice among them and the prompt she carries. ON "
+        "by default since 2026-09-19 (`enabled`; the owner's call: adjust, never disable). "
         "Absent ⇒ the defaults below.",
         [
             Field("prompt_rewrite.keep_locator", "Locate kept-but-torn exchanges", "bool", True,
@@ -811,27 +1026,23 @@ SCHEMA: list[Tab] = [
                   tooltip="A pattern also needs this many DISTINCT chats behind it, "
                           "whatever its weight — one conversation is never a standing "
                           "pull. Default 2."),
-            Field("prompt_rewrite.enabled", "Autonomous rewrite enabled", "bool", True,
-                  tooltip="Stage 3: offer `rewrite_prompt` to the deliberation executive "
-                          "when the budget clears. On, Ava can replace her live standing "
-                          "prompt on her own decision (through the experiment tier — "
-                          "Revert in the Prompt tab is the veto). Default ON since 2026-09-19 "
+            Field("prompt_rewrite.enabled", "Nightly prompt choice enabled", "bool", True,
+                  tooltip="Stage 3: when she is eligible (a mature pattern, something "
+                          "reflected since the last attempt), the nightly housekeeping event "
+                          "drafts rewrites and lets her choose among them and her current "
+                          "prompt. A new choice goes live through the experiment tier — "
+                          "Revert in the Prompt tab is the veto. Default ON since 2026-09-19 "
                           "— the owner chose to run it live and tune rather than gate it."),
-            Field("prompt_rewrite.samples", "Rewrite samples", "int", 5,
-                  tooltip="How many draft rewrites an event generates before the consensus "
-                          "and final passes. Default 5."),
-            Field("prompt_rewrite.temperatures", "Sample temperatures", "floatlist", [],
-                  tooltip="One temperature per sample (padded with the last / clipped to "
-                          "`samples`). Empty ⇒ 0.9 for every draw (Sleep's default). The "
-                          "owner's manual sweep found the rewrite non-monotonic in "
-                          "temperature (near-contradictory at 1.2, back at 1.4), so a list "
-                          "such as 0.9,1.0,1.1,1.2,1.4 restores that spread."),
-            Field("prompt_rewrite.final_temperature", "Final draft temperature", "float", 0.9,
-                  tooltip="Temperature of the one draft written around the consensus "
-                          "notes. Default 0.9."),
-            Field("prompt_rewrite.min_gap_hours", "Min hours between attempts", "float", 24.0,
-                  tooltip="An attempt — changed, stayed or declined — rests the option "
-                          "for this long. Default 24."),
+            Field("prompt_rewrite.samples", "Drafts per night", "int", 5,
+                  tooltip="How many draft rewrites the nightly choice generates; she "
+                          "chooses among them and the prompt she carries. Default 5."),
+            Field("prompt_rewrite.temperatures", "Draft temperatures", "floatlist", [],
+                  tooltip="One temperature per draft (padded with the last / clipped to "
+                          "`samples`). Empty ⇒ the sweep 0.9, 1.0, 1.1, 1.2, 1.3 (spread "
+                          "evenly over the same span for another draft count) — the owner's "
+                          "manual sweep found the rewrite non-monotonic in temperature. Above "
+                          "1 the `chat_min_p` floor is applied before the temperature, so a "
+                          "hot draft keeps the box's degeneration floor."),
             Field("prompt_rewrite.order_check", "Choice order check", "bool", False,
                   tooltip="Run the blind choice twice with the letters reversed; a "
                           "disagreement keeps the current prompt. One extra generation "
@@ -1008,6 +1219,10 @@ def _selftest() -> None:
         w.recollection_hold_h, w.recollection_cap_age_h, w.recollection_floor_weight)
     assert (cfg["train_lr"], cfg["train_plateau_epochs"], cfg["lora_r"]) == (
         TRAIN_LR_DEFAULT, TRAIN_PLATEAU_EPOCHS_DEFAULT, TRAIN_LORA_R_DEFAULT)
+    from training.decay import TRAIN_MODE_DEFAULT, incremental_settings
+    assert cfg["train_mode"] == TRAIN_MODE_DEFAULT
+    assert cfg["incremental"] == incremental_settings({}), (
+        cfg["incremental"], incremental_settings({}))
     checked = ["training.decay"]
     try:
         from core import deliberation as _d

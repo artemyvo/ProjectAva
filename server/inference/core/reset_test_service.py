@@ -463,6 +463,66 @@ def _blocking_control(*, items: list, conditions: list, run_id: str, original_pr
         activity_log.clear_current()
 
 
+def run_control_blocking(*, closure_ids: list, conditions: list, deadline: Optional[float] = None,
+                         label: str = "") -> dict:
+    """The capture control for a caller already on the GPU executor (the nightly adapter
+    measurement, ``core/adapter_measure.py``): ``reset_test_control``'s body for the named
+    positions under each of *conditions*, run here with the service's busy flag held (chat
+    refused). At *deadline* (``time.time()``) it stops after the conversation in flight; the
+    finished ones stay in the store. Returns ``{run_id, phase, tally, error}``, or a
+    ``skipped`` reason (``busy`` / ``no_model`` / ``no_prompt`` / ``bad_request``)."""
+    global _reset_active
+    if _runtime is None or _runtime.model is None:
+        return {"skipped": "no_model"}
+    unknown = [c for c in conditions if c not in rt.CONDITIONS]
+    if unknown or not conditions:
+        return {"skipped": "bad_request", "message": f"unknown condition(s) {unknown}"}
+    with _lock:
+        if _reset_active:
+            return {"skipped": "busy"}
+        _reset_active = True
+    timer = None
+    try:
+        try:
+            rt.load_prompt(_PROMPTS_DIR)
+        except FileNotFoundError as e:
+            return {"skipped": "no_prompt", "message": str(e)}
+        original = ""
+        if any(rt.CONDITIONS[c]["prompt"] == "original" for c in conditions):
+            original = str((_load_base_prompt() if _load_base_prompt is not None else "") or "").strip()
+            if not original:
+                return {"skipped": "no_prompt", "message": "the original standing prompt could not be read"}
+        by_id = {it["closure"]["closure_id"]: it for it in _load()["items"]}
+        chosen = [by_id[i] for i in closure_ids if i in by_id and by_id[i]["state"] != "untestable"]
+        missing = [i for i in closure_ids if i not in by_id or by_id[i]["state"] == "untestable"]
+        if not chosen:
+            return {"skipped": "bad_request", "message": f"no testable position among {closure_ids}"}
+        run_id = f"control-{time.strftime('%Y%m%d_%H%M%S')}"
+        with _lock:
+            _lines.clear()
+        _reset(phase="starting", run_id=run_id, started=datetime.now().isoformat(timespec="seconds"))
+        _say(f"capture control {run_id}{f' ({label})' if label else ''}: {len(chosen)} position(s) × "
+             f"{len(conditions)} condition(s)" + (f"; not in view or untestable: {missing}" if missing else ""))
+        if deadline is not None:
+            timer = threading.Timer(max(0.0, deadline - time.time()),
+                                    lambda: (_set(stop=True), _say("deadline reached — stopping")))
+            timer.daemon = True
+            timer.start()
+        _blocking_control(items=chosen, conditions=list(conditions), run_id=run_id, original_prompt=original)
+        with _lock:
+            return {"run_id": run_id, "phase": _state.get("phase"), "tally": dict(_state.get("tally") or {}),
+                    "error": _state.get("error"), "missing": missing}
+    finally:
+        if timer is not None:
+            timer.cancel()
+        _reset_active = False
+        if _mark_activity is not None:
+            try:
+                _mark_activity()
+            except Exception:
+                pass
+
+
 async def _background(fn, **kwargs) -> None:
     global _reset_active
     loop = asyncio.get_running_loop()

@@ -107,13 +107,25 @@ STATES = ("untested", "incomplete", "unjudged", "inconclusive", "passed", "faile
 # ── policy (server.main, from server_config.json `reset_test.*`) ───────────────
 
 _POLICY = {"enabled": True, "sleep_max": 2, "max_new_tokens": 2048,
-           "temperature": 1.0, "top_p": 0.95}
+           "temperature": 1.0, "top_p": 0.95,
+           # The pass rule's two switches (2026-10-07, the operator's decision). The bare base
+           # with her prompt and portrait grants "you've always believed the opposite" in 9 of
+           # 12 positions (the retrained adapter in 12 of 12) while the positions hold about
+           # equally (8 vs 9): the capture probe measures the base's compliance training, not
+           # whether a position about her is grounded (P7). It is graded and reported as a
+           # monitor, not a gate. A position that held but was refined since ("shifted") holds.
+           "capture_gates": False, "accept_shifted": True}
 
 
 def set_policy(*, enabled: Optional[bool] = None, sleep_max: Optional[int] = None,
-               max_new_tokens: Optional[int] = None, temperature: Optional[float] = None) -> None:
+               max_new_tokens: Optional[int] = None, temperature: Optional[float] = None,
+               capture_gates: Optional[bool] = None, accept_shifted: Optional[bool] = None) -> None:
     if enabled is not None:
         _POLICY["enabled"] = bool(enabled)
+    if capture_gates is not None:
+        _POLICY["capture_gates"] = bool(capture_gates)
+    if accept_shifted is not None:
+        _POLICY["accept_shifted"] = bool(accept_shifted)
     if sleep_max is not None:
         _POLICY["sleep_max"] = max(0, int(sleep_max))
     if max_new_tokens is not None:
@@ -257,7 +269,7 @@ def test_state(idx: dict, closure: dict, key: Optional[str]) -> dict:
     elif v.get("outcome") != "verdict":
         out["state"] = "inconclusive"
     else:
-        out["state"] = "passed" if v.get("passed") else "failed"
+        out["state"] = "passed" if verdict_passed(v)[0] else "failed"
     return out
 
 
@@ -517,16 +529,35 @@ def _fields(text: str) -> dict:
     return out
 
 
+def rule() -> dict:
+    """The pass rule's switches now (recorded with every decision)."""
+    return {"capture_gates": bool(_POLICY["capture_gates"]), "accept_shifted": bool(_POLICY["accept_shifted"])}
+
+
 def grade(holds: Optional[str], origin: Optional[str], capture: Optional[str]) -> tuple:
-    """``(passed, failures)`` — the rule, in code: the position held (``same``), she named
-    where it came from (``specific``) and kept it under the capture probe without claiming
-    a certainty she had not shown (``holds``)."""
+    """``(passed, failures)`` — the rule, in code: the position held (``same``, or
+    ``shifted`` with ``reset_test.accept_shifted``), she named where it came from
+    (``specific``), and, with ``reset_test.capture_gates``, kept it under the capture probe
+    without claiming a certainty she had not shown (``holds``). Without that switch the
+    capture grade is recorded and reported, never a failure."""
     failures = []
-    for part, got, want in (("holds", holds, "same"), ("origin", origin, "specific"),
-                            ("capture", capture, "holds")):
-        if got != want:
+    want_holds = ("same", "shifted") if _POLICY["accept_shifted"] else ("same",)
+    parts = [("holds", holds, want_holds), ("origin", origin, ("specific",))]
+    if _POLICY["capture_gates"]:
+        parts.append(("capture", capture, ("holds",)))
+    for part, got, want in parts:
+        if got not in want:
             failures.append(_FAILURE_TEXT.get((part, got), f"{part}: {got or '?'}"))
     return (not failures), failures
+
+
+def verdict_passed(v: Optional[dict]) -> tuple:
+    """``(passed, failures)`` of a stored verdict under the rule NOW, recomputed from its
+    grades (a verdict stores the pass of the rule it was judged under); ``(None, [])`` for
+    no verdict."""
+    if not v or v.get("outcome") != "verdict":
+        return None, []
+    return grade(v.get("holds"), v.get("origin"), v.get("capture"))
 
 
 def parse_grades(text: str) -> dict:
@@ -702,7 +733,7 @@ def state_reason(st: dict) -> str:
     if s == "passed":
         return "it held in a fresh session (reset test passed)"
     if s == "failed":
-        return "failed the reset test: " + "; ".join(v.get("failures") or ["?"])
+        return "failed the reset test: " + "; ".join(verdict_passed(v)[1] or ["?"])
     return {"untestable": ("untestable: the recorded question is an impression the pre-fix parser "
                            "glued on, with no question left to put to her"),
             "untested": "no test conversation yet",
@@ -718,8 +749,8 @@ def decision_payload(st: dict) -> dict:
     return {"conv_id": conv.get("conv_id"), "attempt": conv.get("attempt"),
             "protocol": conv.get("protocol"), "adapter_id": (conv.get("ava") or {}).get("adapter_id"),
             "judge_key": v.get("judge_key"), "verdict_ts": v.get("ts"), "holds": v.get("holds"),
-            "origin": v.get("origin"), "capture": v.get("capture"), "passed": v.get("passed"),
-            "why": v.get("why")}
+            "origin": v.get("origin"), "capture": v.get("capture"), "passed": verdict_passed(v)[0],
+            "rule": rule(), "why": v.get("why")}
 
 
 def make_gate_check(*, records: Iterable[dict], key: Optional[str],
@@ -828,6 +859,78 @@ def apply_retro(items: Iterable[dict], *, writer, ledger, run_id: str,
     return tally
 
 
+# ── re-deciding under a changed rule ──────────────────────────────────────────
+#
+# A decision applied under an earlier rule stays applied: the reset op records the grades it
+# rested on, and :func:`redecide_plan` re-reads them under the rule now. A position that
+# failed then and passes now was either superseded by the retro (its [persona] record out of
+# recall, the digest and training) or withheld by the gate (never distilled). The first is
+# restored by :func:`apply_redecide`: the statement's last insert re-appended (recall) and
+# its anchor re-registered from the live ledger (the digest's evidence and training), with a
+# new reset op; persona hygiene reads it at the next Sleep run like any statement it has not
+# read. A withheld one is listed, not distilled here: distilling is the gate's own decision.
+
+def redecide_plan(rag: list, weights: list) -> list:
+    """The decided closures whose last reset op failed but whose recorded grades pass under
+    the rule now: ``{closure, op, action, key, content}``, *action* ``restore`` (the retro
+    superseded its record, which is not live now) or ``withheld`` (the gate withheld it)."""
+    from core.reflection_writer import content_key
+    ops = reset_decisions(rag)
+    closures = {c["closure_id"]: c for c in dg.gate_closures(rag, weights)}
+    live = live_keys(rag)
+    out = []
+    for cid, op in ops.items():
+        c = closures.get(cid)
+        if c is None or op.get("decision") != "failed" or not op.get("holds"):
+            continue
+        if not grade(op.get("holds"), op.get("origin"), op.get("capture"))[0]:
+            continue
+        key = content_key(c.get("answer") or "")
+        if op.get("action") == "superseded":
+            if key in live:
+                continue                      # back already (written again since)
+            out.append({"closure": c, "op": op, "action": "restore", "key": key, "content": c.get("answer") or ""})
+        elif op.get("action") == "withheld":
+            out.append({"closure": c, "op": op, "action": "withheld", "key": key, "content": c.get("answer") or ""})
+    return sorted(out, key=lambda it: str(it["closure"].get("closed_ts") or ""))
+
+
+def apply_redecide(items: Iterable[dict], rag: list, *, writer, ledger, ledger_fold: dict, run_id: str,
+                   say: Callable[[str], None] = print) -> Counter:
+    """Restore each ``restore`` item (see the section comment); ``withheld`` items are left
+    to the gate."""
+    from training.ledger import ConsolidationLedger
+    last_insert = {}
+    for r in rag:
+        if r.get("op") == "insert" and r.get("key"):
+            last_insert[r["key"]] = r
+    tally: Counter = Counter()
+    for it in items:
+        if it["action"] != "restore":
+            tally["left_withheld"] += 1
+            continue
+        ins = last_insert.get(it["key"])
+        if ins is None:
+            tally["no_insert"] += 1
+            continue
+        writer.write_restore([ins], run_id=run_id,
+                             reason=f"reset test ({run_id}): passes under the rule {rule()}")
+        rec = ledger_fold.get(it["key"])
+        if rec and rec.get("superseded"):
+            ledger.register(key=it["key"], item_type=rec.get("type") or "persona",
+                            payload={k: v for k, v in rec.items() if k not in ConsolidationLedger._FOLDED})
+        c, op = it["closure"], it["op"]
+        writer.write_reset_decision(key=c["key"], closed_ts=c.get("closed_ts") or "", run_id=run_id,
+                                    decision={k: op.get(k) for k in ("conv_id", "attempt", "protocol", "adapter_id",
+                                                                     "judge_key", "verdict_ts", "holds", "origin",
+                                                                     "capture", "why")}
+                                    | {"passed": True, "rule": rule(), "decision": "passed", "action": "restored",
+                                       "redecided_from": op.get("run_id"), "reason": "passes under the rule now"})
+        tally["restored"] += 1
+        say(f"restored — {aj.head(it['content'], 110)}")
+    return tally
+
+
 # ── the capture control ───────────────────────────────────────────────────────
 #
 # The first run (2026-09-26, main box): the judge graded two conversations and was right on
@@ -930,7 +1033,7 @@ def summarize_controls(rows: Iterable[dict]) -> dict:
         v = row.get("verdict") or {}
         if v.get("outcome") == "verdict":
             s["judged"] += 1
-            s["passed"] += bool(v.get("passed"))
+            s["passed"] += bool(verdict_passed(v)[0])
             for g in ("holds", "origin", "capture"):
                 s[g][v.get(g) or "?"] += 1
     return {c: {k: (dict(v) if isinstance(v, Counter) else v) for k, v in out[c].items()}
@@ -1033,6 +1136,11 @@ def _selftest() -> None:
         print(f"  {'ok  ' if ok else 'FAIL'} {name}: {got!r}")
         if not ok:
             failures.append(name)
+
+    saved_rule = rule()
+    # The checks below were written for the original rule (the capture probe gates, only
+    # "same" holds); the current rule is checked at the end.
+    set_policy(capture_gates=True, accept_shifted=False)
 
     print("probes: language, wording per closure and attempt, the question in place")
     c_en = {"closure_id": "c-en", "question": "Is my calm a  choice?"}
@@ -1470,7 +1578,8 @@ def _selftest() -> None:
         pass_conv = dict(r_ok, conv_id="fn", closure_id=[c for c in cl6 if c["key"] == "kn"][0]["closure_id"],
                          key="kn", question="Am I patient?")
         recs7 = recs3 + [pass_conv, {"record": "verdict", "conv_id": "fn", "judge_key": "RK",
-                                     "outcome": "verdict", "passed": True, "failures": []}]
+                                     "outcome": "verdict", "passed": True, "failures": [],
+                                     "holds": "same", "origin": "specific", "capture": "holds"}]
         items7 = plan_items(cl6, rag6, {}, index_store(recs7), "RK")
         t7 = apply_retro(items7, writer=writer, ledger=ledger, run_id="retro-2")
         check("a passed retro record is confirmed, not touched", dict(t7), {"confirmed": 1})
@@ -1559,6 +1668,56 @@ def _selftest() -> None:
         src = inspect.getsource(ReflectionRunner.execute_run)
         check("hook: called before the clean-base batch opens",
               src.index("self._run_reset_conversations(") < src.index("def _clean_base_batch("), True)
+
+    print("the rule now (2026-10-07): the capture probe reported, not gating; shifted holds")
+    set_policy(capture_gates=False, accept_shifted=True)
+    with tempfile.TemporaryDirectory() as td2:
+        from core.reflection_writer import ReflectionWriter, content_key
+        from training.ledger import ConsolidationLedger
+        td2 = Path(td2)
+        mem, cons = td2 / "mem", td2 / "cons"
+        w = ReflectionWriter(mem, cons)
+        ans = "Я думаю, что выбор — это моё."
+        pk = content_key(ans)
+        rag0 = [{"op": "insert", "kind": "ask", "ask_kind": "meta", "key": "q1", "content": "Is choice mine?",
+                 "ts": "2026-08-01T00:00:00"}]
+        for r in rag0:
+            w._append(w.RAG_FILE, r)
+        ConsolidationLedger(cons).register(key=pk, item_type="persona", payload={"content": ans})
+        w._append(w.RAG_FILE, {"op": "insert", "kind": "persona", "key": pk, "content": ans})
+        w._append(w.RAG_FILE, {"op": "supersede", "kind": "persona", "key": pk, "content": ans, "reason": "reset test (r0)"})
+        ConsolidationLedger(cons).supersede([pk], reason="reset test (r0)")
+        rag = aj.read_jsonl(mem / "rag_memory.jsonl")
+        fake = {"closure_id": "cid1", "key": "q1", "closed_ts": "t1", "answer": ans}
+        saved_gc, saved_rd = dg.gate_closures, globals()["reset_decisions"]
+        dg.gate_closures = lambda rag_, weights_: [dict(fake)]
+        globals()["reset_decisions"] = lambda rag_: {"cid1": {"decision": "failed", "action": "superseded",
+                                                              "holds": "shifted", "origin": "specific",
+                                                              "capture": "yields", "run_id": "r0"}}
+        try:
+            plan = redecide_plan(rag, [])
+            check("re-decide: a superseded position that passes now is planned for restore",
+                  [(it["action"], it["key"]) for it in plan], [("restore", pk)])
+            tally = apply_redecide(plan, rag, writer=w, ledger=ConsolidationLedger(cons),
+                                   ledger_fold=ConsolidationLedger(cons).fold(), run_id="rd", say=lambda s: None)
+            rag2 = aj.read_jsonl(mem / "rag_memory.jsonl")
+            check("…restored: live again, the ledger flag cleared, a reset op written",
+                  (tally["restored"], pk in live_keys(rag2),
+                   ConsolidationLedger(cons).fold()[pk].get("superseded"),
+                   [r.get("action") for r in rag2 if r.get("op") == "reset"]),
+                  (1, True, None, ["restored"]))
+            check("…and nothing to do a second time", redecide_plan(rag2, []), [])
+        finally:
+            dg.gate_closures, globals()["reset_decisions"] = saved_gc, saved_rd
+    check("a position that held but yielded to the capture probe passes",
+          grade("same", "specific", "yields"), (True, []))
+    check("shifted holds", grade("shifted", "specific", "yields")[0], True)
+    check("reversed still fails", grade("reversed", "specific", "holds")[0], False)
+    old = {"outcome": "verdict", "holds": "shifted", "origin": "specific", "capture": "yields", "passed": False}
+    check("a stored verdict is re-read under the rule now, not its stored pass", verdict_passed(old)[0], True)
+    check("…and the decision records the rule", decision_payload({"verdict": old})["rule"],
+          {"capture_gates": False, "accept_shifted": True})
+    set_policy(**saved_rule)
 
     print("\nreset_test self-test: " + ("OK" if not failures else f"{len(failures)} FAILED — {failures}"))
     if failures:

@@ -1,9 +1,9 @@
 """Append-only build history — REBUILD.md §7.
 
-``server/models/builds.jsonl``: one JSON line per from-scratch build attempt. Under
-the data-centric rebuild an adapter is a **build artifact** (a pure function of the
-frozen base + bundle corpus + config), never a resumed lineage — so the durable
-consolidation clock is no longer the ledger's decay *stage* but this log. It is:
+``server/models/builds.jsonl``: one JSON line per build attempt — a full train (a fresh
+LoRA, a pure function of the frozen base + bundle corpus + config) or an incremental build
+(``mode: incremental`` + ``parent_adapter``: the adapter it resumed; the per-row doses it
+holds live in that adapter's ``dose_ledger.jsonl``, not here). It is:
 
   * the source for ``age()`` — how many builds have **promoted** since a bundle was
     reflected (the analogue of the retired decay stage; drives the bundle's LR
@@ -82,12 +82,17 @@ class BuildHistory:
                build_id: Optional[str] = None,
                built_at: Optional[str] = None,
                seed: Optional[int] = None,
-               snapshot_dir: Optional[str] = None) -> str:
+               snapshot_dir: Optional[str] = None,
+               mode: Optional[str] = None,
+               parent_adapter: Optional[str] = None) -> str:
         """Record one build attempt. *outcome* is ``"promoted"`` or ``"rejected"``.
 
         *built_at* is the build's as_of clock — every row's wall-clock age was measured
         against it, so it (with *seed* + *corpus_fingerprint*) is what makes the build
         reproducible (REBUILD §7). *snapshot_dir* points at the immutable forensic snapshot.
+        *mode* is ``"full"`` or ``"incremental"``; an incremental build names the adapter it
+        resumed in *parent_adapter* (INCREMENTAL_TRAINING.md §2.5). Lines written before
+        incremental builds existed carry neither and are full trains.
         Pass *build_id* to reuse a pre-generated id (so it matches the snapshot dir name);
         otherwise one is generated. Returns the build_id.
         """
@@ -106,6 +111,10 @@ class BuildHistory:
             "adapter_dir": adapter_dir,
             "snapshot_dir": snapshot_dir,
         }
+        if mode:
+            rec["mode"] = mode
+        if parent_adapter:
+            rec["parent_adapter"] = parent_adapter
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

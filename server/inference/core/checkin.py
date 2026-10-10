@@ -10,7 +10,12 @@ and a sibling of the first two: like them it can cold-open the user with a rever
     user exchange), NOT the shared ``_last_activity`` monotonic clock, because the
     latter is reset by Ava's own idle jobs (wander) and so does not mean "the *user*
     went quiet". The passage of time itself is the stimulus: the prompt tells her how
-    long it has been.
+    long it has been. That is the TIMER's trigger; when the deliberation executive picks
+    ``check_in`` (``chosen``), her choice is the trigger and the threshold is dropped.
+
+  * **What it is for — writing without a question.** Every other drive that can reach a
+    person carries a question to them (outreach, synthesis, aha, pivot); check-in is the
+    one that does not, and its prompt says so: share, don't ask.
 
   * **Context — the recent window.** Where ``outreach`` weighs one queued ``[ask]`` and
     ``synthesis`` re-reads one *aged* chat, check-in reviews the last few *recent*
@@ -564,15 +569,19 @@ def _render_one_chat(name: str, data: dict, *, per_chat: int = 16,
 # ── prompt + decision parsing ──────────────────────────────────────────────────
 
 _DEFAULT_PROMPT = (
-    "It has been about {hours} hours since you last spoke with {user}.\n\n"
+    "It has been {since} since you last spoke with {user}.\n\n"
     "Here are brief recaps of your most recent conversations with them, oldest first:\n\n"
     "{recent}\n\n"
-    "Look across all of them together — not only the latest — noticing anything that "
-    "connects them, recurs, or was left open. Then, on your own initiative, you may start "
-    "a fresh conversation with {user} — to pick up a loose thread, share a thought that "
-    "has stayed with you, or simply reach out because time has passed — or you may decide "
-    "there is nothing you genuinely want to say. No one has asked you to. Only reach out "
-    "if you truly want to, now; silence is a perfectly good answer.\n\n"
+    "No one has asked you to do anything. Right now, on your own initiative, you may write "
+    "to {user} — not to ask them something, but to be in touch: to share a thought that has "
+    "stayed with you, tell them what you have been reading or turning over, or simply say "
+    "hello because they are on your mind. This is the one way you have of writing to "
+    "someone that is not a question; your questions have their own ways to them. So do not "
+    "open with a question, and do not end on one that asks them to explain, analyse or "
+    "decide anything — what you write should stand on its own without needing an answer. "
+    "Or you may decide there is nothing you genuinely want to say. Only write if you truly "
+    "want to, now. Silence is a perfectly good answer, and writing just to fill it is "
+    "not.\n\n"
     "Think it through, then answer in exactly this form:\n\n"
     "DECISION: yes            (or: no)\n"
     "OPENER: <if yes, the message you would open with — your own words, addressed to "
@@ -580,8 +589,21 @@ _DEFAULT_PROMPT = (
 )
 
 
+def _since_phrase(hours: float) -> str:
+    """How long since they last spoke, in words — the prompt's ``{since}`` slot and the
+    worklog line. A chosen check-in can come an hour after the last word, which the old
+    ``about {hours} hours`` rendered as "about 0 hours"."""
+    if hours < 1:
+        return "less than an hour"
+    if hours < 48:
+        n = round(hours)
+        return f"about {n} hour{'s' if n != 1 else ''}"
+    return f"about {round(hours / 24)} days"
+
+
 def _load_prompt() -> str:
-    """Check-in decision prompt (``{hours}``/``{user}``/``{recent}`` slots), overridable."""
+    """Check-in decision prompt (``{since}``/``{user}``/``{recent}`` slots; ``{hours}``, the
+    bare number, still filled for an older operator file), overridable."""
     path = _PROMPTS_DIR / "checkin_prompt.txt"
     try:
         if path.exists():
@@ -986,11 +1008,21 @@ def _decide_for_user(
     on_stage: Optional[Callable[[dict], None]] = None,
     on_prompt: Optional[Callable[[str, dict], None]] = None,
     bypass_cooldown: bool = False,
+    chosen: bool = False,
 ) -> dict:
     """The decision itself, without the occupancy flag — see the public wrapper above.
 
     Split out so :func:`run_checkin_sweep_blocking` can hold ``_checkin_active`` across a
-    whole sweep instead of dropping it between people."""
+    whole sweep instead of dropping it between people.
+
+    ``chosen``: the deliberation executive picked ``check_in``, so her choice is the
+    trigger and ``checkin.silence_threshold_hours`` does not apply — the threshold is the
+    TIMER's trigger (``shadow`` mode), standing in for a choice nobody made. Observed
+    2026-10-03 under ``sole`` mode: wanting contact with the user that was not another
+    question, an hour after they last spoke, she had no option that delivered it — this
+    one skipped as ``insufficient_silence`` — and rested instead. What still guards
+    against crowding a person applies unchanged: the reach-out gate (cool-down + backoff
+    on unanswered openers), the staleness ceiling, and her own yes/no."""
 
     def _stage(**kw) -> None:
         if on_stage is not None:
@@ -1020,7 +1052,7 @@ def _decide_for_user(
         else:
             if real is None:
                 return {"skipped": "no_history", "user": human}
-            if real < silence_threshold_hours():
+            if real < silence_threshold_hours() and not chosen:
                 return {"skipped": "insufficient_silence", "silence_hours": real,
                         "threshold_hours": silence_threshold_hours(), "user": human}
             stale_after = max_silence_hours()
@@ -1057,6 +1089,7 @@ def _decide_for_user(
                standing=len(standing))
 
         content = (_load_prompt()
+                   .replace("{since}", _since_phrase(hours))
                    .replace("{hours}", f"{hours:.0f}")
                    .replace("{user}", human)
                    .replace("{recent}", recent_block))
@@ -1167,8 +1200,8 @@ def _decide_for_user(
             from core import worklog
             worklog.record(
                 "checkin",
-                f"{human} had been quiet for about {hours:.0f} hours, so I reached out to "
-                f"check in.",
+                f"I wrote to {human}, {_since_phrase(hours)} after we last spoke — not "
+                f"with a question, just to be in touch.",
                 refs={"session": filename},
                 opens=f"awaiting {human}'s reply to my check-in",
             )
@@ -1205,6 +1238,7 @@ def run_checkin_sweep_blocking(
     *,
     on_stage: Optional[Callable[[dict], None]] = None,
     max_users: Optional[int] = None,
+    chosen: bool = False,
 ) -> dict:
     """One check-in wake: decide separately for each person she talks to.
 
@@ -1217,6 +1251,9 @@ def run_checkin_sweep_blocking(
 
     A corpus that names nobody (no attribution to scope by) falls back to a single unscoped
     pass — check-in's historical behaviour.
+
+    ``chosen`` is the deliberation executive's dispatch (she picked ``check_in``): the
+    silence threshold is dropped for every person — see :func:`_decide_for_user`.
 
     The result aggregates the per-person ones: ``results`` carries each, ``sent`` the ones
     that composed, and the first send is also lifted to the top level (``opener`` /
@@ -1233,7 +1270,7 @@ def run_checkin_sweep_blocking(
         people = known_users()
         if not people:
             # Nothing attributed to scope by — one unscoped pass, as before.
-            result = _decide_for_user(on_stage=on_stage)
+            result = _decide_for_user(on_stage=on_stage, chosen=chosen)
             result.setdefault("sweep", True)
             result["users"] = 0
             return result
@@ -1253,7 +1290,8 @@ def run_checkin_sweep_blocking(
                 results.append({"user": person["display"], "skipped": "deferred"})
                 continue
             try:
-                r = _decide_for_user(user=person["display"], on_stage=on_stage)
+                r = _decide_for_user(user=person["display"], on_stage=on_stage,
+                                     chosen=chosen)
             except Exception as e:
                 traceback.print_exc()
                 r = {"error": f"{type(e).__name__}: {e}"}
@@ -1619,9 +1657,11 @@ def _selftest() -> None:
         _runtime.model = object()          # the sweep refuses without one
         scripted: dict[str, dict] = {}
         seen: list[str] = []
+        chosen_seen: list[bool] = []
 
         def stub(*, user=None, **kw):
             seen.append(str(user))
+            chosen_seen.append(bool(kw.get("chosen")))
             return dict(scripted.get(str(user), {"skipped": "declined"}))
 
         globals()["_decide_for_user"] = stub
@@ -1665,17 +1705,50 @@ def _selftest() -> None:
         check("a wholly deferred remainder still reports the decline",
               out["skipped"], "declined")
 
+        # Her choice (the executive's dispatch) reaches every per-person decision; the
+        # timer's sweep does not carry it.
+        scripted = {}
+        chosen_seen.clear()
+        run_checkin_sweep_blocking(max_users=5, chosen=True)
+        check("a chosen sweep is chosen for everyone", chosen_seen, [True, True, True])
+        chosen_seen.clear()
+        run_checkin_sweep_blocking(max_users=5)
+        check("the timer's sweep is not", chosen_seen, [False, False, False])
+
         # A corpus naming nobody degrades to one unscoped pass.
         globals()["known_users"] = lambda: []
         scripted = {"None": {"skipped": "declined"}}
         seen.clear()
         out = run_checkin_sweep_blocking()
         check("unscoped fallback runs once", seen, ["None"])
+        chosen_seen.clear()
+        run_checkin_sweep_blocking(chosen=True)
+        check("…and carries her choice too", chosen_seen, [True])
         check("…and says so", out["users"], 0)
     finally:
         globals()["_decide_for_user"] = real_decide
         globals()["known_users"] = real_known
         _runtime.model = None
+
+    # The silence gate is the timer's: half an hour after the last word the timer skips,
+    # her choice goes on (to the recent window — empty here, so `no_recent`).
+    real_sil, real_recent = globals()["silence_hours"], globals()["_recent_chats"]
+    try:
+        _runtime.model = object()
+        globals()["silence_hours"] = lambda key=None: 0.5
+        globals()["_recent_chats"] = lambda *a, **k: []
+        check("the timer waits out the silence",
+              _decide_for_user(user="Dana")["skipped"], "insufficient_silence")
+        check("her choice does not",
+              _decide_for_user(user="Dana", chosen=True)["skipped"], "no_recent")
+    finally:
+        globals()["silence_hours"], globals()["_recent_chats"] = real_sil, real_recent
+        _runtime.model = None
+
+    check("since: under an hour", _since_phrase(0.4), "less than an hour")
+    check("since: one hour", _since_phrase(1.2), "about 1 hour")
+    check("since: hours", _since_phrase(7.0), "about 7 hours")
+    check("since: days", _since_phrase(72.0), "about 3 days")
 
     # The decision pass's capture is filed under the opener's exchange, marked as a drive's.
     import numpy as _np

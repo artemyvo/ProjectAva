@@ -63,6 +63,10 @@ MIN_SEGMENT_TOKENS = 20
 #: ~half the corpus at the 0.8 mark, while a mean asks the thought to be torn on the
 #: whole, which is the signal wanted.
 METRICS = {"peak_entropy": +1, "mean_entropy": +1, "contested_frac": +1, "p10_margin": -1}
+#: The values quoted above were read off the UNCAPPED head (blocks without
+#: ``logit_softcap``). A block with it is a different sensor reading — gemma-4's capped
+#: distribution is flatter — so it is bucketed under its own model key (`sensor_model`)
+#: and never pooled with uncapped rows, even down the fallback chain.
 SEGMENT = "cot"
 
 _CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
@@ -91,6 +95,20 @@ def exchange_lang(ex: dict) -> str:
     """Language of the REPLY side (CoT + answer): what the tokenization statistics are a
     property of. The user's turn may be in the other language."""
     return detect_lang((ex.get("assistant_cot") or "") + " " + (ex.get("assistant_response") or ""))
+
+
+def sensor_model(model_id: str, block: Optional[dict]) -> str:
+    """The model key a block's stats are bucketed under: the model id, suffixed with
+    the final logit softcap the signals were computed under when one was
+    (``core.tension.summarize``). Uncapped and capped readings of one model are two
+    sensors; folding the cap into the model component keeps them apart along the
+    whole bucket chain, which only ever widens adapter and language."""
+    cap = (block or {}).get("logit_softcap") if isinstance(block, dict) else None
+    try:
+        cap = float(cap) if cap else None
+    except (TypeError, ValueError):
+        cap = None
+    return f"{model_id}@softcap{cap:g}" if cap else model_id
 
 
 def exchange_stats(ex: dict) -> Optional[dict]:
@@ -158,7 +176,7 @@ def _scan_transcript(path: Path) -> Optional[dict]:
         mid = ((ex.get("tension") or {}).get("model_id") or session.get("model_id") or "")
         rows.append({
             "index": i,
-            "model_id": str(mid),
+            "model_id": sensor_model(str(mid), ex.get("tension")),
             "adapter": adapter_name(session),
             "lang": exchange_lang(ex),
             **st,
@@ -305,7 +323,8 @@ class Baseline:
         if st is None:
             return None
         mid = ((ex.get("tension") or {}).get("model_id") or session.get("model_id") or "")
-        return self.rank_stats(st, model_id=str(mid), adapter=adapter_name(session),
+        return self.rank_stats(st, model_id=sensor_model(str(mid), ex.get("tension")),
+                               adapter=adapter_name(session),
                                lang=exchange_lang(ex))
 
     def table(self) -> list[dict]:
@@ -416,6 +435,11 @@ def _selftest() -> None:
     assert bl.rank_exchange({**ex, "tension": {"cot": {"peak_entropy": 39.0, "n_tokens": 5}}}, session) is None
     assert bl.rank_exchange({"assistant_cot": "x"}, session) is None
     assert bl.rank_exchange(ex, {**session, "interlocutor": "ai"}) is None, "AI transcripts are never ranked"
+    # A softcapped reading is another sensor: it never ranks against the uncapped rows,
+    # not even down the fallback chain to the model-wide bucket.
+    capped = {**ex, "tension": {**ex["tension"], "logit_softcap": 30.0}}
+    assert sensor_model("m", capped["tension"]) == "m@softcap30" and sensor_model("m", ex["tension"]) == "m"
+    assert bl.rank_exchange(capped, session) is None, "capped must not pool with uncapped"
 
     # Corpus scan through the cache: a user chat is sampled, an AI one is not, a sidecar is
     # not a transcript, and the second collect re-parses nothing (the cache carries rows).

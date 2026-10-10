@@ -71,7 +71,13 @@ The RagEngine wall-clock curves and training-age knobs live in `server/training/
 
 Past chat exchanges from `data/chats/`. **Both dialogue sides embed** — bounded passages of
 the user prompt *and* of Ava's reply, so her own past answers are searchable; a hit on either
-side collapses to the one displayed exchange. The retrieval weight fades **linearly**
+side collapses to the one displayed exchange. **What is injected is not symmetric (2026-10-06):** the person's turn
+arrives verbatim (to 4000 chars), her own reply never whole — as the exchange's anchor ABOUT
+line when it has one, else only its last 400 chars (`rag_engine.render_recalled`). A whole
+recalled reply of hers, placed last in the system prompt, was reproduced 99% verbatim as the
+answer to a different message (and 93% / 80% in two September chats): a fresh chat's long
+reply answering the same kind of moment is a ready template the near-duplicate ceiling cannot
+see, since it compares the live message, not the thread. The retrieval weight fades **linearly**
 `1.0 → 0` over `rag_cap_age_h` (96h). At/after 96h the verbatim entries are excluded at
 index build and rejected at query time, so a long-running server cannot keep a stale
 near-cap modifier. Age is clocked from the **chat timestamp** (the session-file stem), not
@@ -216,6 +222,12 @@ A generated self-portrait (VOICE / STANCES / DISPOSITIONS / LINES), not a cosine
 Map-reduce clustering is the normal scalable path, with older clustering/fallbacks retained. Recency, tenure discount, and counter-evidence produce weighted recurrence. Two themes at `weighted_recurrence >= 1.9` authorize the branch judge’s target override; a theme without that field is immature. Regeneration uses the pre-cluster evidence fingerprint including quantized recency/counter information, avoiding a fresh nondeterministic grouping on every unchanged run.
 
 Live chat injects established voice/dispositions/lines as standing context, deliberately excluding STANCES to avoid recitation. Thin/absent portraits leave persona RAG enabled. Judge, introduction, and deliberation renderings serve their separate purposes. The polarity screen splits opposing members of a merged theme, records counter plans, and exposes detected opposition during synthesis; it does not discover arbitrary opposition between already-separate themes.
+
+### 3.7b Aspirations (`core/aspiration.py`, 2026-10-06): stored, not recalled
+
+What she wants to become instead of a habit she caught herself in, and her self-review decisions about her portrait, are written in Sleep runs as op-log ops the fold ignores (`aspire`, `self_review`, `habit_seen`). They reach no recall channel, no digest and no training row. Phase 2 (`AVA_REWARD_LOOP.md` §4.10) will show the open ones in the revision pass only: never in the chat's system prompt.
+
+**Her voice (2026-10-09).** One part of this reaches every turn: the portrait's voice section is hers now (`aspiration.voice`). It starts empty and moves one small step per Sleep run toward an aspiration she checked herself (`voice` ops, read from the live op-log by `reflection_digest.latest_digest`); the synthesized voice — a description of her habits — no longer reaches the persona slot. Its curve is inertia rather than decay: one sentence per run at most.
 
 ### 3.8 Impressions `[impression]` and the user portrait (`user_digest`)
 

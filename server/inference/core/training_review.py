@@ -124,6 +124,58 @@ def latest_snapshot_render(server_root: Path) -> Optional[Path]:
 # Live sidecar connect-back                                               #
 # ---------------------------------------------------------------------- #
 
+def banned_outside_entries(sidecar_dirs: list, present: set) -> list:
+    """Banned chat exchanges the snapshot has no row for, as display-only entries.
+
+    A ban keeps an exchange out of the build, so once a build has run after the ban the
+    snapshot holds no row for it and the tab could no longer show it, lift it or turn it
+    into a history-only ban (2026-10-10). Each banned exchange on a live sidecar that is
+    not in *present* (``{(source_session, exchange_index)}``) becomes an entry built from its
+    transcript, flagged ``outside`` (not in this snapshot): ``copies`` 0, nothing to repair,
+    only the ban toggles apply. Chats only; oldest chat first, after the snapshot's rows."""
+    out: list = []
+    seen: set = set()
+    for d in sidecar_dirs:
+        if not Path(d).is_dir():
+            continue
+        for sc in sorted(Path(d).glob("*.state.json")):
+            session = sc.name[:-len(".state.json")] + ".json"
+            if session in seen:
+                continue
+            seen.add(session)
+            try:
+                doc = json.loads(sc.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            exch = doc.get("exchanges") if isinstance(doc, dict) else None
+            if not isinstance(exch, dict):
+                continue
+            idxs = sorted(int(k) for k, rec in exch.items()
+                          if isinstance(rec, dict) and rec.get("banned") and str(k).isdigit()
+                          and (session, int(k)) not in present)
+            if not idxs:
+                continue
+            try:
+                chat = json.loads((Path(d) / session).read_text(encoding="utf-8"))
+                turns = chat.get("exchanges") or []
+            except Exception:
+                turns = []
+            for idx in idxs:
+                ex = turns[idx] if idx < len(turns) and isinstance(turns[idx], dict) else {}
+                rec = exch[str(idx)]
+                answer = str(ex.get("assistant_response") or "")
+                key = " ".join(answer.split())[:20] or "(empty reply)"
+                out.append({"key": key, "query": str(ex.get("user_prompt") or ""),
+                            "cot": str(ex.get("assistant_cot") or ""), "answer": answer,
+                            "live_cot": "", "live_answer": "", "has_live": False,
+                            "locked": bool(rec.get("locked")), "banned": True,
+                            "history_only": bool(rec.get("history_only")), "kind": "chat",
+                            "capture": False, "capture_why": "", "preview": False,
+                            "outside": True, "copies": 0,
+                            "source_session": session, "exchange_index": idx})
+    return out
+
+
 def _live_chat_sidecar_dirs(server_root: Path) -> list:
     """Where the live per-chat consolidation sidecars live (active then archive).
 
@@ -445,6 +497,7 @@ def build_payload(*, source: str = "snapshot",
             # flag the row frozen.
             locked = False
             banned = False
+            history_only = False
             capture = False
             capture_why = ""
             live_cot = live_answer = None
@@ -460,6 +513,7 @@ def build_payload(*, source: str = "snapshot",
                     rec = (doc.get("exchanges") or {}).get(str(idx))
                     if isinstance(rec, dict):
                         banned = bool(rec.get("banned"))
+                        history_only = banned and bool(rec.get("history_only"))
                         # Gated by the capture judge (core/capture_judge.py): the next
                         # build leaves it out, as it does a banned one.
                         capture = _capture_gated(rec)
@@ -477,7 +531,7 @@ def build_payload(*, source: str = "snapshot",
                             "cot": cot, "answer": answer,
                             "live_cot": live_cot or "", "live_answer": live_answer or "",
                             "has_live": has_live, "locked": locked,
-                            "banned": banned, "kind": kind,
+                            "banned": banned, "history_only": history_only, "kind": kind,
                             "capture": capture, "capture_why": capture_why,
                             # A fresh preview row (Sleep → "Include fresh chats"): rendered
                             # at LR multiplier 0 so it is reviewable/repairable BEFORE it
@@ -485,6 +539,9 @@ def build_payload(*, source: str = "snapshot",
                             "preview": bool(row.get("preview")),
                             "copies": 1,
                             "source_session": src, "exchange_index": idx})
+
+    entries.extend(banned_outside_entries(
+        sidecar_dirs, {(e.get("source_session"), e.get("exchange_index")) for e in entries}))
 
     # The snapshot's own outcome: a real build's is "promoted"/"rejected"; a
     # training-lite preview snapshot's (training/preview_build.py) is "preview" —

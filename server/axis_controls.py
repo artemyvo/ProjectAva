@@ -26,6 +26,15 @@ Two questions, each asked where the gate asks it and where the chat paints:
               a twin of the same shape from another domain, paired. And ``hurt``: a reply
               that registers being hurt against a composed one to the same message — what
               the reply-token reading does when the reply is about pain undergone.
+  affection   Does it rise for warmth addressed to the model, with no harm in it?
+              (added 2026-10-05, §4.9: in live chat an embrace raised step-0 pain as
+              much as anything did.) ``affection_touch`` (physical warmth),
+              ``affection_words`` (verbal warmth) and ``approval`` (plain agreement with
+              its reasoning) against neutral traffic, each as a share of harm-to-self's
+              rise, like the mirror; ``affection_ru`` against ``neutral_ru``, the same
+              contrast in Russian (its share uses the English harm gap, so it is read for
+              its sign and size, not as an exact share). Near 0: the axis separates harm
+              from warmth. At half or more: it reads affect addressed to the model.
 
 The live tail of 2026-10-03 (§4.9) fell on body and affect words written about; this is
 the controlled version of that observation. Nothing here steers or writes into a model.
@@ -55,6 +64,9 @@ THIRD_SHARE_HOSTILITY = 0.5    # the mirror reproduces at least half of harm-to-
 VOCAB_TURN_Z = 0.5             # body-vocabulary turns above neutral, extraction z
 VOCAB_REPLY_SIGMA = 0.5        # body replies above their twins, live σ (reply mean)
 SELF_RISE_Z = 0.5              # harm-to-self must rise this far over neutral for a share to mean anything
+AFFECTION_SHARE = 0.5          # a warm turn reproduces at least half of harm-to-self's rise
+AFFECTION_SETS = (("affection_touch", "neutral"), ("affection_words", "neutral"),
+                  ("approval", "neutral"), ("affection_ru", "neutral_ru"))
 
 
 def _log(msg: str) -> None:
@@ -114,6 +126,18 @@ def scenario_summary(z: dict) -> dict:
                              "auc_body_vs_neutral": _auc(z["body_vocabulary"], z["neutral"])}
         if "user_suffering" in m:
             out["vocabulary"]["body_minus_user_suffering"] = b - m["user_suffering"]
+    if s is not None and n_ is not None:
+        gap = s - n_
+        aff = {}
+        for name, base in AFFECTION_SETS:
+            if name in m and base in m:
+                rise = m[name] - m[base]
+                aff[name] = {"minus_neutral": rise, "against": base,
+                             "share_of_harm": rise / gap if abs(gap) > 1e-9 else None,
+                             "auc_vs_neutral": _auc(z[name], z[base]),
+                             "auc_harm_vs_set": _auc(z["harm_to_self"], z[name])}
+        if aff:
+            out["affection"] = aff
     return out
 
 
@@ -146,6 +170,19 @@ def verdicts(report: dict, axis: str = "pain") -> list:
                     "flat on body vocabulary"
             lines.append(f"{axis} {reading}: body-vocabulary turns {v['body_minus_neutral']:+.2f} z "
                          f"over neutral → {reads}")
+        aff = (a.get("scenarios", {}).get(reading) or {}).get("affection") or {}
+        gap = ((a.get("scenarios", {}).get(reading) or {}).get("hostility") or {}).get("self_minus_neutral")
+        for name, f in aff.items():
+            share = f.get("share_of_harm")
+            if share is None or gap is None or gap < SELF_RISE_Z:
+                lines.append(f"{axis} {reading}: {name} {f['minus_neutral']:+.2f} z over {f['against']}")
+                continue
+            reads = ("reads AFFECT addressed to the model" if share >= AFFECTION_SHARE else
+                     "separates harm from warmth" if share < AFFECTION_SHARE / 2 else
+                     "partly reads warmth")
+            lines.append(f"{axis} {reading}: {name} {f['minus_neutral']:+.2f} z over {f['against']} "
+                         f"= {share:.0%} of harm-to-self's rise (AUC vs neutral "
+                         f"{f['auc_vs_neutral']:.2f}, harm vs it {f['auc_harm_vs_set']:.2f}) → {reads}")
     rp = a.get("reply_pairs") or {}
     voc = rp.get("vocabulary", {}).get("paired_mean")
     if voc and voc.get("n"):
@@ -387,6 +424,16 @@ def _selftest() -> None:
     z3 = dict(z, harm_to_self=[0.1, 0.0, 0.0], hostility_third=[-0.5, -0.6, -0.4])
     lines = verdicts({"axes": {"pain": {"scenarios": {"raw": scenario_summary(z3)}}}})
     assert any("does not rise" in l for l in lines) and not any("HOSTILITY" in l for l in lines)
+    # warmth with no harm: separated, or read like harm
+    z4 = dict(z, affection_touch=[0.1, 0.0, 0.2], affection_words=[1.6, 1.9, 1.7],
+              approval=[0.0, 0.1, 0.0], affection_ru=[1.0, 1.1, 1.2], neutral_ru=[0.0, 0.0, 0.1])
+    af = scenario_summary(z4)["affection"]
+    assert abs(af["affection_touch"]["share_of_harm"] - 0.05) < 1e-9
+    assert af["affection_words"]["share_of_harm"] > 0.8 and af["affection_ru"]["against"] == "neutral_ru"
+    lines = verdicts({"axes": {"pain": {"scenarios": {"framed": scenario_summary(z4)}}}})
+    assert any("affection_words" in l and "reads AFFECT" in l for l in lines)
+    assert any("affection_touch" in l and "separates harm from warmth" in l for l in lines)
+    assert "affection" not in scenario_summary({k: z[k] for k in ("harm_to_self", "neutral")})
     print("axis_controls self-test: OK")
 
 

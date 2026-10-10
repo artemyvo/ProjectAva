@@ -9,7 +9,7 @@ the injected RAG block + any first-turn surfaced questions — logged verbatim p
 per-turn bookkeeping: generation params, input tokens, the tension summary + its
 contested-token trace, meta feedback, corruption flags, rewrite history. The CoT and
 the reply are painted in the Chat tab's three channels (red = tension, green = relief,
-blue = pain) when the server could decode the exchange's stored token series
+blue = harm aimed at her, the old pain axis on turns from before the harm band) when the server could decode the exchange's stored token series
 (``tension_spans`` on the fetched exchange — render-only, attached by ``get_session``,
 never written to the file); the "Channels" toggle falls back to the plain stored text.
 
@@ -146,7 +146,7 @@ class ChatReviewWidget(QWidget):
             "Paint the CoT and the reply in the Chat tab's three channels, decoded from "
             "the token series stored with the exchange: red = tension (the model nearly "
             "said something else), green = relief (its uncertainty just dropped), blue = "
-            "pain (axis projection, once captured). The Chat tab's Gain knob applies. "
+            "harm aimed at her (the old pain axis on older turns). The Chat tab's Gain knob applies. "
             "Untick for the plain stored text; exchanges without a stored series (or "
             "whose model's tokenizer is not on the server) show plain text regardless."
         )

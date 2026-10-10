@@ -80,8 +80,10 @@ from core import worklog
 # The actions Ava may choose. "nothing" is always valid (rest). Extend this (and the prompt
 # + the _WOULD_DO map + server.main()'s dispatch map) to add an action — the loop itself
 # does not change.
+# (`rewrite_prompt` left the menu on 2026-10-04: the standing-prompt choice is a step of
+# the nightly housekeeping event now — core.housekeeping, core.prompt_rewrite.)
 _ACTIONS = ("wander", "synthesize", "reach_out", "check_in", "revisit", "aha", "pivot",
-            "rewrite_prompt", "nothing")
+            "nothing")
 
 # Human descriptions of what each action triggers — surfaced in the result (and the
 # journal) so the operator sees the concrete effect behind the word.
@@ -89,14 +91,10 @@ _WOULD_DO = {
     "wander": "wander into a new page and reflect on it (til_wander)",
     "synthesize": "re-read an aged chat and raise a fresh question (synthesis)",
     "reach_out": "bring one of her open questions to the person (outreach)",
-    "check_in": "look at who has gone quiet and decide whether to write (checkin)",
+    "check_in": "write to someone without a question — share, be in touch (checkin)",
     "revisit": "re-reflect an aged chat to re-derive her current take (revisit run)",
     "aha": "see whether something she read lately answers a standing need (assoc aha)",
     "pivot": "follow a word in play to its other sense on record (assoc pivot)",
-    # Offered CONDITIONALLY (the injected `offer_fn`, core.prompt_rewrite.offer): it is on
-    # the menu only when the rewrite budget clears, and chosen unoffered it is refused.
-    "rewrite_prompt": "rewrite her standing prompt around the pulls her reflections keep "
-                      "noticing (prompt_rewrite)",
     "nothing": "rest — do nothing this cycle",
 }
 
@@ -150,10 +148,6 @@ _mark_activity: Callable = None
 # imported: the same callables the per-action idle jobs run (server.main() defines each
 # once and hands it to both), so "wander" means one thing whoever triggers it.
 _dispatch: dict[str, Callable[[], dict]] = {}
-# A conditionally-offered action: a callable returning None or {action, line, decline}.
-# The line is appended to her context when offered; `decline(chosen)` is called when the
-# offered action was not taken (the drive stamps its own gap; it spends nothing).
-_offer_fn: Optional[Callable[[], Optional[dict]]] = None
 # "Where things stand" — callables returning one line each ('' = nothing to say), rendered
 # under the history so a drive's precondition is in front of her rather than checked
 # silently at dispatch. server.main() wires the wander budget; a drive that needs the
@@ -163,7 +157,7 @@ _note_fns: list[Callable[[], str]] = []
 
 def configure(*, get_rag, make_sync_reflect_generate, prompts_dir,
               load_server_config=None, send=None, executor=None,
-              host_busy=None, mark_activity=None, dispatch=None, offer_fn=None,
+              host_busy=None, mark_activity=None, dispatch=None,
               note_fns=None) -> None:
     """Wire in the server capabilities the deliberation pass depends on (once, at startup).
 
@@ -172,9 +166,8 @@ def configure(*, get_rag, make_sync_reflect_generate, prompts_dir,
     ``execute=True`` — an action with no handler is reported, never guessed;
     ``note_fns`` (callables → one line each) render where things stand for her."""
     global _get_rag, _make_sync_reflect_generate, _load_server_config
-    global _PROMPTS_DIR, _send, _executor, _host_busy, _mark_activity, _dispatch, _offer_fn
+    global _PROMPTS_DIR, _send, _executor, _host_busy, _mark_activity, _dispatch
     global _note_fns
-    _offer_fn = offer_fn
     _note_fns = list(note_fns or [])
     _get_rag = get_rag
     _make_sync_reflect_generate = make_sync_reflect_generate
@@ -241,16 +234,20 @@ _DEFAULT_PROMPT = (
     "question that arises goes to the person it concerns\n"
     "- reach_out — bring one of your open questions to the person it concerns, starting a "
     "conversation\n"
-    "- check_in — look at who has gone quiet lately and decide whether to write to them\n"
+    "- check_in — write to someone without bringing them a question: share what is on "
+    "your mind, or just be in touch\n"
     "- aha — see whether something you read lately answers a question you have been "
     "carrying; if it does, tell them\n"
     "- pivot — follow a word from a recent conversation to its other meaning on your "
     "record, and see where it takes you — sometimes to them\n\n"
-    "- nothing — rest; nothing is calling to you right now\n\n"
+    "- nothing — rest; nothing is calling to you right now. If something IS calling and "
+    "none of these fits it, choose nothing and name it under MISSING below\n\n"
     "Think it through first, then answer in exactly this form:\n\n"
     "ACTION: <one of: wander | synthesize | reach_out | check_in | revisit | aha | pivot | "
     "nothing>\n"
     "WHY: <one or two sentences, in your own voice, on why this feels right now>\n"
+    "MISSING: <only when you chose nothing because what you are drawn to is not on this "
+    "list: name it in a few words. Otherwise leave this line out.>\n"
 )
 
 
@@ -281,10 +278,26 @@ def _parse_decision(raw: str) -> tuple[str, str]:
     action = (m.group(1).strip().lower() if m else "")
     if action not in _ACTIONS:
         action = "nothing"
-    w = re.search(_label("WHY") + r"(.+?)(?:\n\s*\n|\Z)", ans,
-                  re.IGNORECASE | re.DOTALL | re.MULTILINE)
+    w = re.search(_label("WHY") + r"(.+?)(?=\n\s*\n|\n" + _label("MISSING") + r"|\Z)",
+                  ans, re.IGNORECASE | re.DOTALL | re.MULTILINE)
     why = (w.group(1).strip() if w else "")
     return action, why
+
+
+def _parse_missing(raw: str) -> str:
+    """The optional ``MISSING:`` line — what she was drawn to that no option offers, '' when
+    absent. Asked for since 2026-10-03: a rest chosen because the right option did not
+    exist read exactly like a rest chosen because nothing called (observed: she wanted
+    contact with the user that was not another question, had none, and rested), so the
+    gap stayed inside her reasoning. Logged with the decision; it changes no dispatch."""
+    ans = _answer_after_think(raw)
+    m = re.search(_label("MISSING") + r"(.+?)(?=\n\s*\n|\n" + _label("ACTION", "WHY")
+                  + r"|\Z)", ans, re.IGNORECASE | re.DOTALL | re.MULTILINE)
+    text = (m.group(1).strip() if m else "")
+    # The template's own placeholder copied back is not an answer.
+    if text.startswith("<") or text.lower().rstrip(".") in ("", "none", "n/a", "-", "—"):
+        return ""
+    return text
 
 
 # ── worklog rendering ────────────────────────────────────────────────────────
@@ -434,21 +447,6 @@ def _render_recent_dispatches(now: Optional[float] = None) -> str:
     return "\n".join(lines)
 
 
-def _prompt_budget_block() -> str:
-    """The standing-prompt patterns on record (PROMPT_REWRITE.md §4) — what her
-    reflections keep saying the prompt fails to say, and how many are mature enough to
-    fund a rewrite. Read off ``patterns.json`` (written by the reflection run's clean-base
-    fold, core.prompt_patterns); never re-folded here. Empty when nothing is on record.
-    Stage 2: shown so her `WHY` can be about the evidence; the action that spends it is
-    stage 3."""
-    try:
-        from core import prompt_patterns
-        from training.reflections_path import prompt_dir
-        return prompt_patterns.render_budget(prompt_patterns.budget(prompt_dir()))
-    except Exception:
-        return ""
-
-
 def _persona_portrait() -> str:
     """Best-effort current self-portrait so she decides as who she is now (or '')."""
     try:
@@ -501,21 +499,6 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
                       _render_notes()):
             if block:
                 context = context + "\n\n" + block
-        budget_block = _prompt_budget_block()
-        if budget_block:
-            context = context + "\n\n" + budget_block
-        # The conditionally-offered action (prompt rewrite): its line goes in only when
-        # its gate is open, so she cannot choose it unoffered — and if she does anyway,
-        # it is refused below rather than dispatched.
-        offer = None
-        if _offer_fn is not None:
-            try:
-                offer = _offer_fn()
-            except Exception:
-                traceback.print_exc()
-                offer = None
-        if offer and offer.get("line"):
-            context = context + "\n\n" + str(offer["line"])
         system_prompt = _load_prompt()
         portrait = _persona_portrait()
         if portrait:
@@ -538,7 +521,6 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
             # `ACTION:` the regex would match is her deliberation about the options, not
             # a decision — observed dispatching `wander` off an unclosed think. The same
             # guard every other pass applies (`reasoning_text.truncated_before_answer`).
-            # No decline either: nothing was decided, so the offer is not spent.
             _stage(stage="decided", action="nothing", cut_before_answer=True)
             return {
                 "decided": True, "executed": False, "action": "nothing", "why": "",
@@ -548,16 +530,7 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
                 "dispatch_skipped": "cut_before_answer",
             }
         action, why = _parse_decision(raw)
-        offered_action = str((offer or {}).get("action") or "")
-        if execute and offered_action and action != offered_action:
-            # Only an executing decision spends the opportunity. A Worklog preview
-            # must not append a decline or change the real rewrite cooldown.
-            try:
-                decline = (offer or {}).get("decline")
-                if callable(decline):
-                    decline(action)
-            except Exception:
-                traceback.print_exc()
+        missing = _parse_missing(raw)
         _stage(stage="decided", action=action)
 
         result = {
@@ -570,12 +543,9 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
             "open_threads": len(open_threads),
             "truncated": truncated,
         }
+        if missing:
+            result["missing"] = missing
         if not execute or action == "nothing":
-            return result
-        if action == "rewrite_prompt" and action != offered_action:
-            # Chosen without being on the menu (the budget did not clear, or she was not
-            # shown it): refused, never dispatched — the gate is the drive's, not hers.
-            result["dispatch_skipped"] = "not_offered"
             return result
         handler = _dispatch.get(action)
         if handler is None:
@@ -636,6 +606,11 @@ def describe(result: dict) -> str:
     if len(why) > 160:
         why = why[:157].rstrip() + "…"
     head = f"Deliberation: chose {action}" + (f" — {why}" if why else "")
+    missing = (result.get("missing") or "").strip().replace("\n", " ")
+    if missing:
+        if len(missing) > 120:
+            missing = missing[:117].rstrip() + "…"
+        head = f"{head} [missing: {missing}]"
     if result.get("dispatch_skipped"):
         return f"{head} (not dispatched: {result['dispatch_skipped']})"
     if not result.get("executed"):
@@ -788,8 +763,22 @@ def _selftest() -> None:
     assert _render_notes() == ""
     _note_fns = saved_notes
 
+    # MISSING: optional; WHY stops before it; a placeholder or "none" is no answer
+    raw_m = ("<think>x</think>\nACTION: nothing\nWHY: Nothing here fits.\n"
+             "MISSING: to talk with Artemy without asking anything")
+    a5, w5 = _parse_decision(raw_m)
+    assert a5 == "nothing" and w5 == "Nothing here fits.", (a5, w5)
+    assert _parse_missing(raw_m) == "to talk with Artemy without asking anything"
+    assert _parse_missing("<think>MISSING: in thought</think>\nACTION: wander\nWHY: y") == ""
+    assert _parse_missing("<think>x</think>\nACTION: nothing\nWHY: y\nMISSING: none") == ""
+    assert _parse_missing("<think>x</think>\nACTION: nothing\nWHY: y\n"
+                          "**MISSING:** <only when you chose nothing>") == ""
+    assert describe({"action": "nothing", "why": "w", "missing": "contact"}) == \
+        "Deliberation: chose nothing — w [missing: contact]", describe(
+            {"action": "nothing", "why": "w", "missing": "contact"})
+
     # the new drives parse
-    for act in ("check_in", "aha", "pivot", "rewrite_prompt"):
+    for act in ("check_in", "aha", "pivot"):
         a4, _ = _parse_decision(f"<think>x</think>\nACTION: {act}\nWHY: y")
         assert a4 == act, (act, a4)
 
@@ -804,7 +793,7 @@ def _selftest() -> None:
 
     # dispatch seam: the decided action's handler runs; no handler is reported; a raising
     # handler is reported with its error; `nothing` never dispatches.
-    global _dispatch, _runtime, _offer_fn
+    global _dispatch, _runtime
     calls: list[str] = []
     _dispatch = {"wander": lambda: calls.append("wander") or {"applied": True, "title": "T"},
                  "pivot": lambda: (_ for _ in ()).throw(RuntimeError("boom"))}
@@ -816,7 +805,6 @@ def _selftest() -> None:
 
     import types
     saved = (_runtime, _make_sync_reflect_generate, _get_rag)
-    saved_offer = _offer_fn
     fake_runtime = types.SimpleNamespace(model=object())
     globals()["_runtime"] = fake_runtime
     globals()["_get_rag"] = lambda: None
@@ -864,24 +852,10 @@ def _selftest() -> None:
         r = run_deliberation_blocking(execute=False)
         assert not r["executed"] and describe(r).endswith("(decision only)") or r["action"] == "nothing"
         assert not consumed({"skipped": "no_history"})
-        declines = []
-        _offer_fn = lambda: {"action": "rewrite_prompt", "line": "A rewrite is available.",
-                            "decline": declines.append}
-        for action in ("nothing", "wander", "rewrite_prompt"):
-            globals()["_make_sync_reflect_generate"] = (
-                lambda rag, a=action: _FakeGen(f"ACTION: {a}\nWHY: a preview"))
-            before_calls = list(calls)
-            before_declines = list(declines)
-            r = run_deliberation_blocking(execute=False)
-            assert not r["executed"] and calls == before_calls and declines == before_declines
-            run_deliberation_blocking(execute=True)
-            assert declines == (before_declines + [action] if action != "rewrite_prompt"
-                                else before_declines), declines
     finally:
         globals()["_runtime"], globals()["_make_sync_reflect_generate"], globals()["_get_rag"] = saved
         worklog.recent, worklog.open_threads = saved_recent, saved_open
         _dispatch = {}
-        _offer_fn = saved_offer
     print("deliberation selftest: OK")
 
 

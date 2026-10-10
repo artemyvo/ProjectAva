@@ -133,6 +133,35 @@ def detect_degeneration(gen_ids: list, window: int = _DEGEN_WINDOW,
 _NO_COPY_NGRAM = 8
 
 
+def stray_latin_guard_processor(base_cls: Any, cyr_end: Any, latin_ids: Any, stats: dict):
+    """The stray-Latin sampler guard (``core/stray_latin.py``) as a logits processor of
+    *base_cls*: on a row whose last token is a piece ending in a lowercase Cyrillic letter
+    (*cyr_end*, a bool tensor over the vocabulary), the bare homoglyph capitals
+    (*latin_ids*) get -inf. *stats* counts the armed steps, the steps where a masked letter
+    was the top-1, and the probability mass removed. First in the processor list, so the
+    ban is final for every processor and warper after it; the tension hook reads `lm_head`
+    before any processor, so stored margins still show the tendency."""
+    import torch
+
+    class _StrayLatinGuard(base_cls):
+        def __call__(self, input_ids, scores):
+            table = cyr_end.to(input_ids.device)
+            last = input_ids[:, -1].clamp(max=table.shape[0] - 1)
+            hit = table[last]
+            if not bool(hit.any()):
+                return scores
+            rows = hit.nonzero().flatten().to(scores.device)
+            ids = latin_ids.to(scores.device)
+            sub = scores[rows]
+            stats["steps"] += int(rows.numel())
+            stats["top1"] += int(torch.isin(sub.argmax(-1), ids).sum())
+            stats["mass"] += float(torch.softmax(sub.float(), dim=-1)[:, ids].sum())
+            scores[rows.unsqueeze(1), ids.unsqueeze(0)] = float("-inf")
+            return scores
+
+    return _StrayLatinGuard()
+
+
 def build_no_copy_table(ids: list, ngram: int = _NO_COPY_NGRAM) -> dict:
     """Map each (ngram-1)-token span of *ids* to the set of ids that follow it.
 
@@ -352,6 +381,51 @@ class UnslothBackend(InferenceBackend):
     # it live, and last_tokens_per_sec is the finalized whole-generation average.
     _gen_token_times: list = []
     last_tokens_per_sec: Optional[float] = None
+    # The stray-Latin sampler guard (core/stray_latin.py): masks a bare Latin-capital
+    # homoglyph token (`C`, `B`, …) right after a piece ending in a Cyrillic letter, the
+    # learned glitch "болееC стабильную". Set from `stray_latin.guard` by the server.
+    # `last_stray_latin` = {steps, top1, mass} of the last generation: steps the mask was
+    # armed, steps where a masked letter was the top-1, the probability mass it removed —
+    # so the learned tendency stays measurable while it is no longer sampled.
+    stray_latin_guard: bool = True
+    last_stray_latin: Optional[dict] = None
+    _stray_latin_cache: Optional[tuple] = None
+
+    def _stray_latin_tables(self, tokenizer: Any, model: Any) -> Optional[tuple]:
+        """``(cyr_end, latin_ids)`` for the stray-Latin guard, cached per tokenizer:
+        a bool tensor over the vocabulary (pieces whose last character is a lowercase
+        Cyrillic letter) and the ids of the bare single-letter homoglyph tokens (no
+        leading space marker). None when either set is empty (a tokenizer with no such
+        pieces has nothing to guard)."""
+        import torch
+        from core.stray_latin import HOMOGLYPHS
+        key = id(tokenizer)
+        if self._stray_latin_cache is not None and self._stray_latin_cache[0] == key:
+            return self._stray_latin_cache[1]
+        tables = None
+        try:
+            n = len(tokenizer)
+            try:
+                n = max(n, int(model.get_output_embeddings().weight.shape[0]))
+            except Exception:
+                pass
+            pieces = tokenizer.convert_ids_to_tokens(list(range(len(tokenizer))))
+            cyr = torch.zeros(n, dtype=torch.bool)
+            for i, piece in enumerate(pieces):
+                if piece and ("а" <= piece[-1] <= "я" or piece[-1] == "ё"):
+                    cyr[i] = True
+            latin = []
+            unk = getattr(tokenizer, "unk_token_id", None)
+            for letter in HOMOGLYPHS:
+                tid = tokenizer.convert_tokens_to_ids(letter)
+                if isinstance(tid, int) and tid != unk and tid < n:
+                    latin.append(tid)
+            if bool(cyr.any()) and latin:
+                tables = (cyr, torch.tensor(latin, dtype=torch.long))
+        except Exception:
+            tables = None
+        self._stray_latin_cache = (key, tables)
+        return tables
 
     @staticmethod
     def _apply_dynamo_settings() -> None:
@@ -1040,6 +1114,7 @@ class UnslothBackend(InferenceBackend):
         degen_distinct: float = _DEGEN_DISTINCT,
         degen_top_freq: float = _DEGEN_TOP_FREQ,
         no_copy_text: Optional[str] = None,
+        min_p_raw: Optional[float] = None,
     ) -> Generator[str, None, None]:
         # Re-assert the Dynamo config: unsloth's load-time patches reset it, so a value
         # set only in load() reverts (limit falls back to 8, disable clears) and
@@ -1254,7 +1329,16 @@ class UnslothBackend(InferenceBackend):
                 except Exception:
                     no_copy_ids = []
             processors: list = []
+            self.last_stray_latin = None
             if (LogitsProcessor is not None and LogitsProcessorList is not None):
+                latin_tables = (self._stray_latin_tables(text_tokenizer, model)
+                                if self.stray_latin_guard else None)
+                if latin_tables is not None:
+                    cyr_end, latin_ids = latin_tables
+                    latin_stats = {"steps": 0, "top1": 0, "mass": 0.0}
+                    self.last_stray_latin = latin_stats
+                    processors.append(stray_latin_guard_processor(
+                        LogitsProcessor, cyr_end, latin_ids, latin_stats))
                 if min_think_tokens and min_think_tokens > 0:
                     close_ids = self._resolve_think_close_ids(model, tokenizer)
                     if close_ids:
@@ -1425,12 +1509,40 @@ class UnslothBackend(InferenceBackend):
                               f"{copy_prefix}-token spans of the previous reply "
                               f"protected (ngram={_NO_COPY_NGRAM})")
 
+                if min_p_raw and min_p_raw > 0 and not greedy:
+                    # The min_p floor on the UNSCALED distribution. transformers applies
+                    # its own MinPLogitsWarper after TemperatureLogitsWarper, so above
+                    # T=1 the floor loosens with the temperature: a token survives when
+                    # p/p_max ≥ min_p^T — at T=1.3 and min_p 0.02 that is 0.0062, a tail
+                    # three times deeper than the floor was set for, which is the tail
+                    # that seeds a degeneration excursion. A custom processor runs before
+                    # the sampling warpers (`_get_logits_processor` merges these first),
+                    # so this cut happens at T=1 and the temperature then reshapes only
+                    # what survived it. Below T=1 the native warper is the tighter of the
+                    # two and this one is a no-op; the effective floor is never looser
+                    # than `min_p` at any temperature. Last in the list, so a token
+                    # another processor forced or banned is already final here.
+                    raw_floor = float(min_p_raw)
+
+                    class _RawMinP(LogitsProcessor):
+                        def __call__(self, input_ids, scores):
+                            probs = torch.softmax(scores.float(), dim=-1)
+                            keep = probs >= raw_floor * probs.max(dim=-1, keepdim=True).values
+                            return scores.masked_fill(~keep, float("-inf"))
+
+                    processors.append(_RawMinP())
+                    if debug:
+                        debug(f"min_p {raw_floor} applied before temperature {temperature}")
+
             if processors:
                 gen_kwargs["logits_processor"] = LogitsProcessorList(processors)
 
             # Cognitive-tension capture (optional): hook the LM head to read raw
             # per-token logits, reduced to (entropy, margin) on-device. Reduction
             # to per-segment stats happens server-side after the stream completes.
+            # A model with a final logit softcap (gemma-4) caps the head's output in
+            # its forward, after this hook: the reduction applies the same cap, so the
+            # signals describe the distribution the sampler drew from.
             self.last_token_signals = None
             self.last_think_open_prob = None
             self.last_hidden_capture = None
@@ -1444,6 +1556,7 @@ class UnslothBackend(InferenceBackend):
             # decode step the next), so one timestamp per hook call is a per-token clock.
             self._gen_token_times = []
             self.last_tokens_per_sec = None
+            softcap = None
             lm_head = self._find_lm_head(model)
             if lm_head is not None:
                 # Tension capture is optional; the timing hook is always on (one Python
@@ -1455,6 +1568,7 @@ class UnslothBackend(InferenceBackend):
                     from core import tension as _tension
                     gen_kwargs["return_dict_in_generate"] = True
                     open_id = self._resolve_think_open_id(model, tokenizer)
+                    softcap = self._final_logit_softcap(model)
 
                 def _lm_hook(module, _inp, out):
                     self._gen_token_times.append(time.monotonic())
@@ -1462,7 +1576,7 @@ class UnslothBackend(InferenceBackend):
                         return
                     logits = out[0] if isinstance(out, tuple) else out
                     last = logits[0, -1, :] if logits.dim() == 3 else logits[0, :]
-                    e, m, t2, op = _tension.step_signals_tensor(last, open_id)
+                    e, m, t2, op = _tension.step_signals_tensor(last, open_id, softcap)
                     tension_sig.append((e, m, t2))
                     if op is not None:
                         open_probs.append(op)
@@ -1558,7 +1672,7 @@ class UnslothBackend(InferenceBackend):
                 self.last_tokens_per_sec = self._compute_tokens_per_sec()
                 if capture_tension:
                     self.last_token_signals = self._reduce_tension(
-                        exc_holder.get("out"), tension_sig, n_prompt
+                        exc_holder.get("out"), tension_sig, n_prompt, softcap
                     )
                     self.last_think_open_prob = self._first_open_prob(
                         exc_holder.get("out"), open_probs, n_prompt
@@ -1668,6 +1782,31 @@ class UnslothBackend(InferenceBackend):
         self._lm_head_cache = (id(model), head)
         return head
 
+    @staticmethod
+    def _final_logit_softcap(model: Any) -> Optional[float]:
+        """The model's final logit softcap, or None (gemma-4: 30.0).
+
+        The tension hook sits on ``lm_head``, but such a model caps the head's output in
+        its forward — both transformers' and unsloth's compiled one — and samples from
+        the capped distribution, so the capture applies the same cap
+        (`tension.step_signals_tensor`). Read from the text config of a multimodal
+        checkpoint; a PeftModel forwards ``config`` to its base."""
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return None
+        try:
+            text_cfg = cfg.get_text_config()
+        except Exception:
+            text_cfg = None
+        for c in (text_cfg, cfg):
+            v = getattr(c, "final_logit_softcapping", None) if c is not None else None
+            try:
+                if v is not None and float(v) > 0:
+                    return float(v)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _first_open_prob(self, out: Any, open_probs: list, n_prompt: int) -> Optional[float]:
         """Probability the *first generated step* put on the think-open token.
 
@@ -1730,12 +1869,15 @@ class UnslothBackend(InferenceBackend):
             print(f"[hidden] capture reduce failed: {e}")
             return None
 
-    def _reduce_tension(self, out: Any, signals: list, n_prompt: int) -> Optional[dict]:
+    def _reduce_tension(self, out: Any, signals: list, n_prompt: int,
+                        softcap: Optional[float] = None) -> Optional[dict]:
         """Dedup the per-token signals against the generated tokens and bulk-sync.
 
         The LM head may fire k times per generated token (k=2 on gemma-4); when the
         capture count is an exact multiple of the token count we keep one per token,
         otherwise we skip (graceful None) rather than emit a misaligned trace.
+        `softcap` is the final logit softcap the signals were computed under, carried
+        into the stored block as ``logit_softcap``.
         """
         import torch
         if out is None or not signals:
@@ -1754,10 +1896,13 @@ class UnslothBackend(InferenceBackend):
         entropies = torch.stack([e for e, _, _ in chosen]).cpu().tolist()
         margins = torch.stack([m for _, m, _ in chosen]).cpu().tolist()
         top2_ids = torch.stack([t for _, _, t in chosen]).cpu().tolist()
-        return {
+        reduced = {
             "entropies": entropies, "margins": margins,
             "token_ids": gen_ids, "top2_ids": top2_ids,
         }
+        if softcap:
+            reduced["logit_softcap"] = softcap
+        return reduced
 
 
 if __name__ == "__main__":

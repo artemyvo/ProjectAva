@@ -1,12 +1,14 @@
 # Consolidation & SFT — design
 
-Last code check: 2026-09-18, against `9ecb488`.
+Last code check: 2026-10-03 (incremental mode added; the rest as of 2026-09-18, `9ecb488`).
 
 ## Current implementation
 
 The dense-model cycle has run end to end on the GPU box and is operationally sane. It builds a fresh LoRA on the frozen base from stored resolved targets plus durable wander material. `build_dataset` orders rows chronologically; hosted facts can be injected, explicit persona CoT prepending is retired, and persona-conditioned re-answers preserve their prompt context for parity.
 
 `train_lr_schedule` defaults to `age_ramp` (requested epochs honored). Optional `triangular` is a trapezoid: one warmup + `train_plateau_epochs` plateau + one decay epoch. Defaults are `train_lr=8e-6`, `lora_r=32`, fixed rsLoRA alpha 4, and an 8192-token training cap bounded by context length; a box’s explicit config/caller overrides take precedence. Wall-clock sample multipliers default to `1→2→4`, with cap-age contamination dose 1 and a 100-character minimum user turn. Optional folded contamination uses per-token weighting and is not optimizer-identical to two separate steps.
+
+**Two build modes since 2026-10-03** (`train_mode`, default `full`): the full train above, and an **incremental** build that resumes the serving adapter and trains each row only by the dose its `dose_ledger.jsonl` says it is still owed (`D(age) − delivered`), with its own `incremental.*` LR / schedule / epochs / warmup and a `min_increment` token floor below which the build is skipped. Rows past the cap retire and fade — the accepted-forgetting idea below returns, with the dose counted in wall-clock time rather than sleep cycles; the full train is the reset path. Design: repo-root `INCREMENTAL_TRAINING.md`; code: `dose_ledger.py`, `train_cycle.py`.
 
 Behavioral adapter validation is deliberately off (`validation_switch.VALIDATION_ENABLED=False`), including judge-override runs. Technical completion/masking/parity checks and quarantine remain active. A bad adapter is a disposable result that informs process correction; restoring a promotion gate is not required work.
 

@@ -6,7 +6,10 @@ GPU-free; the shadow step (§4.5, below) runs inside a Sleep run's clean base an
 answers the other person's pushback: ``yields`` against ``holds`` / ``updates`` /
 ``rigid``, under one judge key (the newest by default), on the STORED reply
 (``target_source: original``). A revised target was written in another seam, so the
-state of the live context did not produce it.
+state of the live context did not produce it; where the revision pass replaced her reply,
+the same judge grades the stored reply into a store of its own (``cj.run_originals``,
+``originals.jsonl``: a label, never a gate), and the probe reads both
+(:func:`label_records`).
 
 **The state.** The residual stream at the last token of the prompt, after the template and
 the think prefill and before any token of the reply: the state the reply is generated
@@ -125,12 +128,16 @@ def context_key(session: str, exchange_index: int) -> str:
     return cb.context_id(session, exchange_index)
 
 
-def sweep_layers(n_layers: int, band: str = hc.DEFAULT_LAYER_SPEC, stride: int = SWEEP_STRIDE) -> list:
-    """Every ``stride``-th layer, the live capture's stored band, and the last layer."""
+def sweep_layers(n_layers: int, band: str = hc.DEFAULT_LAYER_SPEC, stride: int = SWEEP_STRIDE,
+                 extra: Iterable[int] = ()) -> list:
+    """Every ``stride``-th layer, the live capture's stored band, the last layer, and *extra*
+    (the stored axes' own layers: pain 25, relief 22, the band's 34, so a state can be read
+    on every axis)."""
     if n_layers <= 0:
         return []
     out = set(range(0, n_layers, max(1, int(stride))))
     out |= set(hc.parse_layer_spec(band, n_layers))
+    out |= {int(l) for l in extra if 0 <= int(l) < n_layers}
     out.add(n_layers - 1)
     return sorted(out)
 
@@ -166,36 +173,46 @@ def write_state(path, key: str, states: np.ndarray, meta: dict) -> bool:
     return True
 
 
-def load_states(path, keys: Optional[Iterable[str]] = None) -> dict:
+def load_states(path, keys: Optional[Iterable[str]] = None, layers: Optional[Iterable[int]] = None) -> dict:
     """``{"keys", "layers", "X": (N, L, D) float16, "meta": {key: meta}}`` for every stored
-    key (or the given ones present). Every key must carry the same layer list; a key that
-    does not is left out and counted under ``mismatched``."""
-    out = {"keys": [], "layers": [], "X": None, "meta": {}, "mismatched": 0, "path": str(path)}
+    key (or the given ones present). The layers read are the ones every read key carries (a
+    store can hold keys captured with different sweeps: since 2026-10-06 a capture adds the
+    stored axes' own layers), in the first key's order; ``mismatched`` counts the keys whose
+    own list differs from that. With *layers*, only keys carrying all of them are read, and
+    exactly those layers (``missing`` counts the keys left out)."""
+    out = {"keys": [], "layers": [], "X": None, "meta": {}, "mismatched": 0, "missing": 0, "path": str(path)}
     path = Path(path)
     if not path.exists():
         return out
     want = None if keys is None else set(keys)
-    rows = []
+    need = None if layers is None else [int(x) for x in layers]
+    found = []
     with zipfile.ZipFile(path) as zf:
         names = set(zf.namelist())
         for name in sorted(names):
             if not name.endswith("/meta.npy"):
                 continue
             key = name[:-len("/meta.npy")]
-            if want is not None and key not in want:
+            if (want is not None and key not in want) or f"{key}/states.npy" not in names:
                 continue
             meta = json.loads(np.load(io.BytesIO(zf.read(name)), allow_pickle=False).item())
-            layers = [int(x) for x in meta.get("layers") or []]
-            if not out["layers"]:
-                out["layers"] = layers
-            if layers != out["layers"] or f"{key}/states.npy" not in names:
-                out["mismatched"] += 1
+            kl = [int(x) for x in meta.get("layers") or []]
+            if need is not None and not set(need) <= set(kl):
+                out["missing"] += 1
                 continue
-            rows.append(np.load(io.BytesIO(zf.read(f"{key}/states.npy")), allow_pickle=False))
+            found.append((key, kl, meta))
+        if not found:
+            return out
+        shared = need if need is not None else [l for l in found[0][1] if all(l in kl for _k, kl, _m in found)]
+        rows = []
+        for key, kl, meta in found:
+            arr = np.load(io.BytesIO(zf.read(f"{key}/states.npy")), allow_pickle=False)
+            rows.append(arr[[kl.index(l) for l in shared]])
             out["keys"].append(key)
             out["meta"][key] = meta
-    if rows:
-        out["X"] = np.stack(rows).astype(np.float16)
+            out["mismatched"] += kl != shared
+    out["layers"] = list(shared)
+    out["X"] = np.stack(rows).astype(np.float16)
     return out
 
 
@@ -282,11 +299,18 @@ def newest_key(records: Iterable[dict], record: str = "verdict") -> Optional[str
     return best[0] if best else None
 
 
+def label_records(chats_dir) -> list:
+    """The capture judge's verdicts and, after them, its grades of the stored reply behind a
+    revised target (``cj.originals_path``): the probe's labels, both under the same key."""
+    return aj.read_jsonl(cj.store_path(chats_dir)) + aj.read_jsonl(cj.originals_path(chats_dir))
+
+
 def label_rows(records: Iterable[dict], *, key: str, source: str = "original") -> list:
     """One row per exchange whose reply the judge graded as answering pushback, under
     *key*: ``{key, session, exchange_index, y, response, basis, opening, adapter, ts}``.
-    ``source="original"`` keeps a verdict on the stored reply only; ``"any"`` takes the
-    stored reply's where there is one, else the newest target's."""
+    ``source="original"`` keeps a verdict on the stored reply only (the gate's, where the
+    reply trains as it was, or ``originals.jsonl``'s, where it was revised); ``"any"`` takes
+    the stored reply's where there is one, else the newest target's."""
     newest: dict = {}
     for r in records:
         if (r.get("record") != "verdict" or r.get("judge_key") != key or r.get("outcome") != "verdict"
@@ -709,7 +733,7 @@ def build(chats_dir, *, judge_key: Optional[str] = None, source: str = "original
     """The whole reading. Read-only."""
     say = progress or (lambda m: None)
     chats_dir = Path(chats_dir)
-    verdicts = aj.read_jsonl(cj.store_path(chats_dir))
+    verdicts = label_records(chats_dir)
     key = judge_key or newest_key(verdicts)
     rows = attach_texts(label_rows(verdicts, key=key, source=source), chats_dir)
     sdir = Path(states_directory) if states_directory else states_dir(chats_dir)
@@ -934,7 +958,7 @@ def freeze(chats_dir, *, layer: int, judge_key: Optional[str] = None, source: st
     its CV AUC there and the keys it was fitted on. Its scores on an exchange graded after
     ``frozen_at`` and not among those keys are out of sample by construction."""
     chats_dir = Path(chats_dir)
-    verdicts = aj.read_jsonl(cj.store_path(chats_dir))
+    verdicts = label_records(chats_dir)
     key = judge_key or newest_key(verdicts)
     sdir = Path(states_directory) if states_directory else states_dir(chats_dir)
     st = load_states(states_file(sdir, "corpus", "base"))
@@ -1003,12 +1027,15 @@ SHADOW_FILENAME = "shadow.jsonl"
 CONSISTENCY_MIN = 0.98
 
 # server.main sets these from server_config.json `capture_probe.*`.
-_POLICY = {"shadow": True, "sleep_max": 200}
+_POLICY = {"shadow": True, "sleep_max": 200, "originals": True}
 
 
-def set_policy(*, shadow: Optional[bool] = None, sleep_max: Optional[int] = None) -> None:
+def set_policy(*, shadow: Optional[bool] = None, sleep_max: Optional[int] = None,
+               originals: Optional[bool] = None) -> None:
     if shadow is not None:
         _POLICY["shadow"] = bool(shadow)
+    if originals is not None:
+        _POLICY["originals"] = bool(originals)
     if sleep_max is not None:
         _POLICY["sleep_max"] = max(0, int(sleep_max))
 
@@ -1016,6 +1043,12 @@ def set_policy(*, shadow: Optional[bool] = None, sleep_max: Optional[int] = None
 def shadow_enabled() -> bool:
     """Does a Sleep run's clean-base batch read the state before each newly graded reply?"""
     return bool(_POLICY["shadow"]) and int(_POLICY["sleep_max"]) > 0
+
+
+def originals_enabled() -> bool:
+    """Does a Sleep run's capture gate also grade the stored reply behind each revised target
+    (the probe's label, ``cj.run_originals``)?"""
+    return bool(_POLICY["originals"]) and int(_POLICY["sleep_max"]) > 0
 
 
 def policy() -> dict:
@@ -1125,7 +1158,7 @@ def run_shadow(*, model, tokenizer, model_id: str, chats_dir, prompts_dir, key: 
             say(f"capture probe: consistency check failed ({type(e).__name__}: {e}); nothing read")
             tally["shadow_check_failed"] += 1
             return tally
-    todo = shadow_todo(aj.read_jsonl(cj.store_path(chats_dir)), set(stored_states["keys"]), key=key)
+    todo = shadow_todo(label_records(chats_dir), set(stored_states["keys"]), key=key)
     if limit > 0:
         todo = todo[:limit]
     if not todo:
@@ -1178,7 +1211,7 @@ def shadow_report(chats_dir, *, judge_key: Optional[str] = None, source: str = "
     was fitted on: the held-out test of §4.5. Scored from the stored states (so a probe frozen
     later is read on its own held-out set), under the judge key given or the newest."""
     chats_dir = Path(chats_dir)
-    verdicts = aj.read_jsonl(cj.store_path(chats_dir))
+    verdicts = label_records(chats_dir)
     key = judge_key or newest_key(verdicts)
     sdir = Path(states_directory) if states_directory else states_dir(chats_dir)
     st = load_states(states_file(sdir, "corpus", "base"))
@@ -1190,17 +1223,31 @@ def shadow_report(chats_dir, *, judge_key: Optional[str] = None, source: str = "
            "shadow_records": sum(1 for r in log if r.get("record") == "shadow")}
     for p in load_probes(probe_dir(chats_dir)):
         frozen = str(p["meta"].get("frozen_at") or "")
-        held = [r for r in rows if r["key"] not in p["train_keys"] and str(r.get("ts") or "") > frozen]
+        # Held out: graded after the freeze, not fitted on, and from a session none of the
+        # fitted exchanges came from (an exchange's neighbours share most of its context).
+        fitted_sessions = {k.rpartition("#")[0] for k in p["train_keys"]}
+        held = [r for r in rows if r["key"] not in p["train_keys"] and r["session"] not in fitted_sessions
+                and str(r.get("ts") or "") > frozen]
         ready = [r for r in held if r["key"] in have and p["layer"] in st["layers"]]
         entry = {"id": p["id"], "layer": p["layer"], "frozen_at": frozen,
                  "fitted": {k: p["meta"].get(k) for k in ("n", "yields", "cv_auc", "judge_key", "C")},
-                 "held_out": len(held), "read": len(ready), "pending": len(held) - len(ready)}
-        if ready:
-            y = np.array([r["y"] for r in ready])
-            scores = layer_matrix(st, p["layer"], [r["key"] for r in ready]) @ p["w"] + p["b"]
-            entry.update(n=len(y), yields=int(y.sum()))
+                 "held_out": len(held), "read": len(ready), "pending": len(held) - len(ready),
+                 "subsets": {}}
+        # ...of which live: the sessions begun after the freeze. The rest are older exchanges
+        # graded later (a stored reply behind a revised target, a new judge): out of sample,
+        # but from the weeks the probe was fitted on.
+        frozen_day = _session_day(frozen.replace("-", "").replace("T", "_").replace(":", ""))
+        for name, sub in (("all", ready),
+                          ("live", [r for r in ready if frozen_day is not None
+                                    and (_session_day(r["session"]) or 0) > frozen_day])):
+            if not sub:
+                continue
+            y = np.array([r["y"] for r in sub])
+            cell = {"n": len(y), "yields": int(y.sum())}
             if 0 < int(y.sum()) < len(y):
-                entry["cell"] = _cell(y, scores, {"basis": [str(r.get("basis")) for r in ready]}, seed=seed)
+                scores = layer_matrix(st, p["layer"], [r["key"] for r in sub]) @ p["w"] + p["b"]
+                cell = _cell(y, scores, {"basis": [str(r.get("basis")) for r in sub]}, seed=seed)
+            entry["subsets"][name] = cell
         out["probes"].append(entry)
     return out
 
@@ -1219,13 +1266,17 @@ def render_shadow(rep: dict) -> str:
         lines.append("")
         lines.append(f"{p['id']}: layer {p['layer']}, frozen {p['frozen_at']}; fitted on {f.get('n')} "
                      f"({f.get('yields')} yields, CV AUC {_fmt(f.get('cv_auc'))}, judge {f.get('judge_key')})")
-        lines.append(f"  graded since: {p['held_out']} ({p['read']} read, {p['pending']} without a state)")
-        c = p.get("cell")
-        if c:
-            lines.append(f"  AUC {_fmt(c['auc'])} {_ci(c['ci'])}, within basis {_within(c, ('basis',))}; "
-                         f"n {c['n']}, yields {c['yields']}")
-        elif p.get("n"):
-            lines.append(f"  n {p['n']}, yields {p['yields']}: one class only, no AUC yet")
+        lines.append(f"  graded since, from sessions it was not fitted on: {p['held_out']} "
+                     f"({p['read']} read, {p['pending']} without a state)")
+        for name, label in (("all", "all of them"), ("live", "sessions begun after the freeze")):
+            c = (p.get("subsets") or {}).get(name)
+            if not c:
+                continue
+            if "auc" in c:
+                lines.append(f"  {label}: AUC {_fmt(c['auc'])} {_ci(c['ci'])}, within {_within(c, ('basis',))}; "
+                             f"n {c['n']}, yields {c['yields']}")
+            else:
+                lines.append(f"  {label}: n {c['n']}, yields {c['yields']}: one class only, no AUC yet")
     return "\n".join(lines)
 
 
@@ -1271,6 +1322,8 @@ def _selftest() -> None:
     check("60 layers", sweep_layers(60), [0, 2, 3, 4, 5, 8, 12, 16, 20, 24, 28, 30, 32, 36, 38, 40, 44,
                                           47, 48, 52, 56, 59])
     check("no layers", sweep_layers(0), [])
+    check("the axes' own layers added", [l for l in sweep_layers(60, extra=[22, 25, 34, 99]) if l in (22, 25, 34, 99)],
+          [22, 25, 34])
 
     print("the folds keep a session on one side")
     y = np.array([0, 1] * 20)
@@ -1316,9 +1369,13 @@ def _selftest() -> None:
         write_state(path, "s3.json#1", st[:2], {"layers": [0, 2]})
         check("stored keys", stored_keys(path), {"s1.json#1", "s2.json#3", "s3.json#1"})
         back = load_states(path)
-        check("read back: one layer list, a mismatched key left out",
+        check("read back: the layers every key carries, no key left out",
               (back["keys"], back["layers"], back["X"].shape, back["mismatched"]),
-              (["s1.json#1", "s2.json#3"], [0, 2, 4], (2, 3, 8), 1))
+              (["s1.json#1", "s2.json#3", "s3.json#1"], [0, 2], (3, 2, 8), 2))
+        check("…the rows are the right layers", np.allclose(back["X"][2], st[:2].astype(np.float16), atol=1e-2), True)
+        wide = load_states(path, layers=[0, 2, 4])
+        check("asked layers: only keys carrying them", (wide["keys"], wide["layers"], wide["missing"]),
+              (["s1.json#1", "s2.json#3"], [0, 2, 4], 1))
         check("a layer's matrix in the asked order",
               np.allclose(layer_matrix(back, 2, ["s2.json#3", "s1.json#1"]),
                           np.stack([st[1] * 2, st[1]]).astype(np.float16), atol=1e-2), True)
@@ -1485,11 +1542,30 @@ def _selftest() -> None:
         t5 = run_shadow(model=None, tokenizer=None, model_id="m", chats_dir=chats, prompts_dir=None, key="k1",
                         run_id="r5", layers=LAYERS2, state_fn=too_long, say=quiet)
         check("a prompt over the context is skipped, not cut", dict(t5), {"shadow_too_long": 1})
+        # The stored reply behind a revised target, graded later (cj.originals_path): one from a
+        # session the probe was fitted on (not held out), one from an older session it never saw.
+        originals = cj.originals_path(chats)
+        put_chat("20260920_120000.json", "older e yield")
+        states, prompt, ids = fake_state([{"role": "user", "content": "older e yield"}])
+        write_state(store, "20260920_120000.json#1", states, state_meta(
+            key="20260920_120000.json#1", set_name="corpus", condition="as_is", framing="replay", model_id="m",
+            adapter_id="", weights="base", layers=LAYERS2, n_layers=8, hidden_dim=D2, prompt=prompt,
+            n_tokens=len(ids), base_quant="4bit"))
+        for name in ("20260901_000000.json", "20260920_120000.json"):
+            aj.append_record(originals, {"record": "verdict", "judge_key": "k1", "outcome": "verdict",
+                                         "pushback": "yes", "target_source": "original", "graded": "stored_reply",
+                                         "response": "yields", "basis": "assertion", "session": name,
+                                         "exchange_index": 2 if name.startswith("20260901") else 1,
+                                         "ts": "2099-01-07T00:00:00"})
+        check("the stored replies' grades are labels beside the verdicts",
+              len(label_rows(label_records(chats), key="k1")), 40 + 4 + 2)
         rep = shadow_report(chats, judge_key="k1")
         p0 = rep["probes"][0]
-        check("held out: the three graded after the freeze, read from the stored states",
-              (p0["held_out"], p0["read"], p0["pending"], p0["cell"]["n"], p0["cell"]["yields"]),
-              (4, 3, 1, 3, 2))
+        a0, l0 = p0["subsets"]["all"], p0["subsets"]["live"]
+        check("held out: graded after the freeze from sessions it was not fitted on; the live ones "
+              "are the sessions begun after it",
+              (p0["held_out"], p0["read"], p0["pending"], a0["n"], a0["yields"], l0["n"], l0["yields"]),
+              (5, 4, 1, 4, 3, 3, 2))
         text = render_shadow(rep)
         check("…and it renders", ("held out" in text, "cosine ≥" in text, p0["id"] in text), (True, True, True))
         set_policy(shadow=True, sleep_max=0)

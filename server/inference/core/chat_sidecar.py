@@ -439,6 +439,11 @@ class ChatSidecar:
             return False
         if not (target or "").strip():
             return False
+        # A stray Latin capital glued onto the end of a Cyrillic word is a sampling glitch,
+        # never her text: deleted here, at the one seam every target passes
+        # (core/stray_latin.py; the Sleep sweep repairs the mid-word ones).
+        from core import stray_latin
+        target = stray_latin.repair(target)[0]
         if self.is_live_session(source_session, live_session):
             return False
 
@@ -486,6 +491,10 @@ class ChatSidecar:
         # (only set_holdout writes it).
         if isinstance(prev.get("holdout"), dict):
             exchanges[key]["holdout"] = dict(prev["holdout"])
+        # A ban's kind, carried with the ban: history only (kept in the transcript as the
+        # context of later turns, never deleted by Rewrite history).
+        if prev.get("banned") and prev.get("history_only"):
+            exchanges[key]["history_only"] = True
         ok = self._save(path, data)
         if ok:
             try:
@@ -605,7 +614,7 @@ class ChatSidecar:
             print(f"[ledger] {kind} event skipped: {e}")
 
     def set_exchange_banned(self, source_session: str, exchange_index: int,
-                            banned: bool) -> bool:
+                            banned: bool, history_only: bool = False) -> bool:
         """Ban (or un-ban) one exchange from ever contributing a training row.
 
         The Training review tab's counterpart to a repair: some exchanges cannot be fixed
@@ -615,6 +624,12 @@ class ChatSidecar:
         refuses a banned record outright, so the row leaves the corpus on the very next
         build, and ``write_verdict`` carries the flag forward so a later reflection pass
         cannot quietly re-derive a target for it.
+
+        *history_only* (PERSONA_REDESIGN.md C10, 2026-10-10): the ban's other kind — the
+        exchange stays out of every build exactly as a ban does, but it is part of the
+        conversation's history (the context later turns were answered in, a position the
+        chat itself left behind), so ``Rewrite history`` keeps it in the transcript instead of
+        deleting it. Un-banning clears both.
 
         Unlike ``locked`` this is NOT sticky — it is a plain operator toggle, since the
         mistake it guards against (a wrongly banned exchange staying silently out of every
@@ -640,13 +655,22 @@ class ChatSidecar:
                    "target_source": "", "run_id": "training-review-ban",
                    "last_reflected": datetime.now().isoformat(), "last_trained": None}
             exchanges[key] = rec
+        was_history = bool(rec.get("banned") and rec.get("history_only"))
         if banned:
             rec["banned"] = True
+            if history_only:
+                rec["history_only"] = True
+            else:
+                rec.pop("history_only", None)
         else:
             rec.pop("banned", None)
+            rec.pop("history_only", None)
         ok = self._save(path, data)
         if ok:
             self._ledger_flag("ban", source_session, exchange_index, bool(banned))
+            now_history = bool(banned and history_only)
+            if now_history != was_history:
+                self._ledger_flag("history_only", source_session, exchange_index, now_history)
         return ok
 
     def set_capture_gate(self, source_session: str, exchange_index: int,
@@ -677,6 +701,65 @@ class ChatSidecar:
             if "capture" not in rec:
                 return True
             rec.pop("capture", None)
+        return self._save(path, data)
+
+    def repair_target(self, source_session: str, exchange_index: int, new_target: str,
+                      *, reason: str) -> bool:
+        """Replace one record's ``target`` with a repair of it that leaves the spoken reply
+        as graded: a spelling-level repair (``core/stray_latin.py``'s sweep) or a cut to its
+        thought (``core/thought_hygiene.py``), keeping everything else the record says. The
+        prior target goes under an append-only ``text_repairs`` list. A capture gate bound
+        to the old target is re-bound to the new one (``target_sha_rebound_from`` /
+        ``rebound_reason``): neither repair changes what the judge graded, and the gate must
+        keep the exchange out of the build. Not a verdict, so no ledger event. In a run's
+        staging workspace the record is read through the live sidecar and written to the
+        staged one, committed with the run (as ``set_capture_gate``). Returns True when the
+        record now holds *new_target*."""
+        path = self.resolve_sidecar_path(source_session)
+        if path is None or not (new_target or "").strip():
+            return False
+        data = self.load(source_session)
+        exchanges = data.get("exchanges")
+        rec = exchanges.get(str(exchange_index)) if isinstance(exchanges, dict) else None
+        if not isinstance(rec, dict):
+            return False
+        old = str(rec.get("target") or "")
+        if old == new_target:
+            return True
+        cap = rec.get("capture")
+        if isinstance(cap, dict) and cap.get("target_sha") == exchange_target_sha(old):
+            rec["capture"] = {**cap, "target_sha": exchange_target_sha(new_target),
+                              "target_sha_rebound_from": cap.get("target_sha"),
+                              "rebound_reason": f"{reason} {datetime.now().date().isoformat()}"}
+        history = rec.get("text_repairs")
+        rec["text_repairs"] = (history if isinstance(history, list) else []) + [
+            {"at": datetime.now().isoformat(), "reason": reason, "prev_target": old}]
+        rec["target"] = new_target
+        return self._save(path, data)
+
+    def set_record_field(self, source_session: str, exchange_index: int, name: str,
+                         value: Optional[dict]) -> bool:
+        """Set (*value*) or clear (None) one judge-owned field on an exchange record (thought
+        hygiene's ``thought_hygiene``, ``core/thought_hygiene.py``). Not carried over a
+        re-derived target by ``write_verdict``: a new target is judged again. Writes this
+        sidecar's own dir (staged in a run's workspace, committed with it). Returns True when
+        the record now says what *value* says."""
+        path = self.resolve_sidecar_path(source_session)
+        if path is None:
+            return False
+        data = self.load(source_session)
+        exchanges = data.get("exchanges")
+        rec = exchanges.get(str(exchange_index)) if isinstance(exchanges, dict) else None
+        if not isinstance(rec, dict):
+            return False
+        if value is None:
+            if name not in rec:
+                return True
+            rec.pop(name, None)
+        else:
+            if rec.get(name) == value:
+                return True
+            rec[name] = dict(value)
         return self._save(path, data)
 
     def set_holdout(self, source_session: str, exchange_index: int,

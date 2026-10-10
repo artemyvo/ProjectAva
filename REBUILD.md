@@ -6,6 +6,8 @@ Status: **built and exercised on the GPU box**. Last code check: 2026-09-18, aga
 
 Sections 1–6 and 8–11 retain the original implementation brief and its design reasoning; proposed data layouts, numeric examples, migration steps, and acceptance criteria there are historical where they differ from the current contract above. Section 7 records the current evidence/validation policy. For precise maintained behavior use `documentation/AVA_DESIGN.md`, `AVA_MEMORY.md`, and `AVA_STATUS.md`; do not execute the old migration/wipe plan as routine operation.
 
+Since 2026-10-03 this is `train_mode: full`, one of two build modes; the other resumes the serving adapter and trains only the dose each row is still owed (`INCREMENTAL_TRAINING.md`). Under it the full train is the reset path: it erases the incremental lineage's forgetting and is the only retroactive correction.
+
 The July collapse motivated this design, but its best current explanation is reflection RAG pollution. From-scratch reconstruction has independent correction/portability benefits; the historical failure does not prove resumed training intrinsically unsafe.
 
 ## 1. Core principle

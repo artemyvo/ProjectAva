@@ -172,6 +172,10 @@ class Axis:
     # projecting generation tokens; "extraction" = the templated control sentences, a
     # different format whose absolute level does not transfer (run 1: +5 z offset).
     baseline: str = "extraction"
+    # The file's `created` stamp: which extraction a projection was read on. Stored beside
+    # every projection (`axes_created`), so readings of two extractions under one name
+    # (pain before and after 2026-10-05) are never pooled by accident.
+    created: str = ""
 
 
 _AXES_CACHE: dict = {"key": None, "axes": []}
@@ -205,6 +209,7 @@ def load_axes(axes_dir: Path, model_id: str) -> list[Axis]:
                     if np.isfinite(lm) and np.isfinite(ls) and ls > 0:
                         mean, std, baseline = lm, ls, "live"
                 mid = str(z["model_id"]) if "model_id" in z.files else ""
+                created = str(z["created"]) if "created" in z.files else ""
         except Exception as e:
             print(f"[hidden] axis {p.name} unreadable: {e}")
             continue
@@ -214,7 +219,7 @@ def load_axes(axes_dir: Path, model_id: str) -> list[Axis]:
             continue
         if not np.isfinite(std) or std <= 0:
             std = 1.0
-        axes.append(Axis(p.stem, layer, vec, mean, std, mid, str(p), baseline))
+        axes.append(Axis(p.stem, layer, vec, mean, std, mid, str(p), baseline, created))
     _AXES_CACHE["key"] = key
     _AXES_CACHE["axes"] = axes
     return list(axes)
@@ -379,16 +384,19 @@ def reduce_capture(
     residuals = {layer: mats[layer][positions] for layer in sorted(mats)
                  if layer in set(int(x) for x in store_layers)}
     proj: dict[str, list[float]] = {}
+    created: dict[str, str] = {}
     for ax in axes:
         mat = mats.get(int(ax.layer))
         if mat is None or mat.shape[1] != ax.vector.shape[0]:
             continue
         z = (mat.astype(np.float32) @ ax.vector - ax.mean) / (ax.std or 1.0)
         proj[ax.name] = [float(v) for v in z]
+        created[ax.name] = getattr(ax, "created", "") or ""
     return {
         "positions": positions,
         "residuals": residuals,
         "axes": proj,
+        "axes_created": created,
         "n_tokens": n,
         "layers": sorted(residuals),
         "hidden_dim": int(next(iter(mats.values())).shape[1]),
@@ -638,6 +646,7 @@ def write_sidecar(transcript: Path, exchange_id: str, capture: Optional[dict], *
         "position_rule": "0 + after-newline + last",
         "residual": "output of decoder layer L (0-based), last position, fp16",
         "axes": sorted((capture.get("axes") or {}).keys()),
+        "axes_created": dict(capture.get("axes_created") or {}),
         "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if extra_meta:

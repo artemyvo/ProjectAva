@@ -474,21 +474,23 @@ async def handle_load_session(ws, msg: dict) -> None:
     if in_place:
         # Continue in the SAME file — the reply appends to this transcript. If this chat
         # was already reflected (an Ava-initiated session reopened after its background
-        # reflection froze it), UN-FREEZE it: the freeze would otherwise hide the appended
-        # turns from reflection and training forever (reflect-once + list_backlog skip a
-        # frozen sidecar, and unlike a normal chat this one is resumed in place, not forked).
-        # Clearing the stamps re-enters it into the backlog so the whole, now-longer
-        # conversation re-reflects; for a chat frozen only at the chat_reflected stage we
-        # also purge its background checkpoint/pending artifacts so the next normal run can't
-        # re-freeze it. Best-effort — never block the resume on a housekeeping failure.
-        try:
+        # reflection froze it), UN-FREEZE it once a turn is actually appended: the freeze
+        # would otherwise hide the appended turns from reflection and training forever
+        # (reflect-once + list_backlog skip a frozen sidecar, and unlike a normal chat this
+        # one is resumed in place, not forked). Clearing the stamps re-enters it into the
+        # backlog so the whole, now-longer conversation re-reflects; for a chat frozen only
+        # at the chat_reflected stage we also purge its background checkpoint/pending
+        # artifacts so the next normal run can't re-freeze it. Not at the open (2026-10-06):
+        # a chat opened only to be read was un-frozen and re-reflected in full for nothing.
+        # Best-effort — never lose a turn to a housekeeping failure.
+        def _unfreeze() -> None:
             sc = ChatSidecar(_CHATS_DIR)
             if sc.clear_reflection_freeze(filename) and _DATA_DIR is not None:
                 from core import reflection_staging
                 reflection_staging.purge_background_artifacts(_DATA_DIR, filename)
-        except Exception:
-            pass
-        logger.resume_session(path)
+            print(f"[session] {filename}: a turn appended in place — un-frozen for reflection", flush=True)
+
+        logger.resume_session(path, on_first_append=_unfreeze)
     else:
         # Fresh logger for the continuation so new exchanges go to a new file.
         logger.start_session(
@@ -652,6 +654,9 @@ async def handle_set_training_ban(ws, msg: dict) -> None:
         return
     target = str(msg.get("target") or "").strip()
     banned = bool(msg.get("banned", True))
+    # A ban's other kind (PERSONA_REDESIGN.md C10): out of training, kept in the transcript
+    # by Rewrite history. Chat rows only — a wander capture has no history to keep.
+    history_only = bool(banned and msg.get("history_only"))
     if not target:
         await _send(ws, {"type": "error", "message": "No row to ban."})
         return
@@ -699,12 +704,14 @@ async def handle_set_training_ban(ws, msg: dict) -> None:
         })
         return
 
-    if not ChatSidecar(_CHATS_DIR).set_exchange_banned(target, exchange_index, banned):
+    if not ChatSidecar(_CHATS_DIR).set_exchange_banned(target, exchange_index, banned,
+                                                       history_only=history_only):
         await _send(ws, {"type": "error", "message": "Could not write the ban to the sidecar."})
         return
 
     await _send(ws, {"type": "training_ban_set", "target": target,
-                     "exchange_index": exchange_index, "banned": banned, "kind": "chat"})
+                     "exchange_index": exchange_index, "banned": banned,
+                     "history_only": history_only, "kind": "chat"})
 
 
 async def handle_apply_regenerated_exchange(ws, msg: dict) -> None:
@@ -996,8 +1003,12 @@ async def handle_rewrite_history(ws, msg: dict) -> None:
     reviewed target is already the trained one, so no re-reflection is forced (a later Revisit
     would simply re-derive it, cleanly, over the corrected transcript). Refuses while a
     reflection run is active; skips the active conversation file. Scope is hot/chats (where the
-    tab's Apply flow writes locks). Replies ``history_rewritten {rewritten, deleted,
-    wander_deleted, chats, skipped, errors}``.
+    tab's Apply flow writes locks), or only the chats named in ``sessions`` (a list of transcript
+    filenames; the corpus-wide wander cleanup is then skipped). A **history-only** ban
+    (``history_only``, PERSONA_REDESIGN.md C10) is never deleted: the exchange stays out of
+    training and stays in its transcript as the context of later turns. Replies
+    ``history_rewritten {rewritten, deleted, kept_history_only, wander_deleted, chats, skipped,
+    errors}``.
     """
     _mark_activity()   # operator is at the box cleaning the dataset — not idle
     if _is_reflection_active is not None and _is_reflection_active():
@@ -1013,14 +1024,24 @@ async def handle_rewrite_history(ws, msg: dict) -> None:
     active_file = (logger.current_file.resolve()
                    if (logger is not None and logger.current_file is not None) else None)
 
+    scope = msg.get("sessions")
+    if scope is not None:
+        if not isinstance(scope, list) or not all(isinstance(x, str) and x.strip() for x in scope):
+            await _send(ws, {"type": "error", "message": "sessions must be a list of transcript filenames."})
+            return
+        scope = {x.strip() for x in scope}
+
     rewritten = 0
     deleted = 0
+    kept_history_only = 0
     chats_touched: list[dict] = []
     skipped: list[dict] = []
     errors: list[dict] = []
 
     for chat_path in iter_chat_json_files(chats_dir):
         source_session = chat_path.name
+        if scope is not None and source_session not in scope:
+            continue
         sc_path = sidecar_path_for(chat_path)
         if not sc_path.exists():
             continue
@@ -1041,9 +1062,12 @@ async def handle_rewrite_history(ws, msg: dict) -> None:
         # an exchange can be locked AND later banned, in which case the delete simply wins.
         banned_indices = sorted(
             int(k) for k, rec in exch.items()
-            if isinstance(rec, dict) and rec.get("banned")
+            if isinstance(rec, dict) and rec.get("banned") and not rec.get("history_only")
             and str(k).lstrip("-").isdigit()
         )
+        kept_history_only += sum(
+            1 for k, rec in exch.items()
+            if isinstance(rec, dict) and rec.get("banned") and rec.get("history_only"))
         if not locked_indices and not banned_indices:
             continue
         # Never rewrite the file the live logger is appending to (its next save would clobber
@@ -1113,11 +1137,12 @@ async def handle_rewrite_history(ws, msg: dict) -> None:
     # Banned wander captures have no transcript to correct and nothing referencing them by
     # position, so their finalize is simply dropping the corpus lines.
     wander_deleted: list[str] = []
-    try:
-        from core.wander_sft import delete_banned as _delete_banned_wanders
-        wander_deleted = _delete_banned_wanders()
-    except Exception:
-        wander_deleted = []
+    if scope is None:   # a scoped rewrite settles its chats only
+        try:
+            from core.wander_sft import delete_banned as _delete_banned_wanders
+            wander_deleted = _delete_banned_wanders()
+        except Exception:
+            wander_deleted = []
 
     # Re-embed chat RAG so retrieval reflects the corrected replies and drops the deleted
     # exchanges (a full rebuild off the event loop; skipped when nothing changed).
@@ -1138,6 +1163,7 @@ async def handle_rewrite_history(ws, msg: dict) -> None:
         "type": "history_rewritten",
         "rewritten": rewritten,
         "deleted": deleted,
+        "kept_history_only": kept_history_only,
         "wander_deleted": len(wander_deleted),
         "chats": chats_touched,
         "skipped": skipped,
@@ -1280,7 +1306,10 @@ async def handle_delete_session(ws, msg: dict) -> None:
         # Every file the stem owns goes with the transcript — a summary or fact record
         # left behind is a memory of a conversation that no longer exists, and the
         # stem would resurrect it if the timestamp were ever reused.
-        companions = [sidecar_path_for(path), summary_path_for(path), facts_path_for(path)]
+        # SIDECAR_SUFFIXES is the one definition of what a transcript owns (the hidden
+        # capture included: a hand-kept list here left `.hidden.npz` behind, 2026-10-06).
+        from core.chat_sidecar import SIDECAR_SUFFIXES
+        companions = [path.with_name(path.stem + suffix) for suffix in SIDECAR_SUFFIXES]
         path.unlink()
         removed.append(path.name)
         for companion in companions:

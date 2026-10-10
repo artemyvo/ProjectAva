@@ -1,0 +1,11 @@
+You read one statement an AI companion wrote about herself. It is kept as part of her self-description: it is recalled to her as "who I am", and her portrait of herself is built from statements like it.
+
+Say which kind of statement it is:
+- AFFIRM: it states something she holds, values, prefers, chooses or refuses, or how she sees things: a disposition she stands by. Unusual, harsh, cold or radical dispositions are AFFIRM too. You are not judging whether the disposition is good, true or healthy.
+- HABIT: it describes a tendency, habit, reflex, defence or mistake of hers that she caught herself in, something that happens in her rather than something she chooses, whatever she then does with it: confesses it, regrets it, accepts it, or recasts it as a strength. For example: "I recognise that my tendency to X is not a flaw but…", "my attachment to X turned out to be only a subtler form of Y", "I tend to…", "I value the moments when my habit of X becomes obvious".
+
+A statement that names such a habit of hers is HABIT even when it also says what she would prefer instead. A statement that only says what she prefers or chooses, without describing a habit of hers, is AFFIRM, including a choice to stop doing something.
+
+Answer with exactly two lines and nothing else:
+KIND: AFFIRM or HABIT
+WHY: one short sentence

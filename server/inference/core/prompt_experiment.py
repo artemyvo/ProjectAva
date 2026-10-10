@@ -236,6 +236,30 @@ def parse_experiment_prompt(text: str) -> str:
     return ""
 
 
+_PARA_MIN_CHARS = 40
+
+
+def repeated_paragraphs(text: str) -> list:
+    """The paragraphs of *text* that occur more than once (blank-line separated, compared
+    with whitespace and case folded; only paragraphs of :data:`_PARA_MIN_CHARS` or more).
+
+    A standing prompt written by her own generation can loop: the experiment activated on
+    2026-10-04 held four paragraphs twice, word for word, inside one ``<new_prompt>`` block,
+    and doubled the description she reads on every turn. A draft that repeats itself is
+    a degenerate generation, refused (the experiment) or dropped (the nightly choice),
+    never silently de-duplicated: the loop is reported, not hidden."""
+    seen: dict = {}
+    out = []
+    for para in re.split(r"\n\s*\n", text or ""):
+        key = " ".join(para.split()).lower()
+        if len(key) < _PARA_MIN_CHARS:
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 2:
+            out.append(para.strip())
+    return out
+
+
 # ── experiment generation (runs on the GPU executor thread) ─────────────────────
 
 def run_prompt_experiment_blocking(
@@ -292,6 +316,13 @@ def run_prompt_experiment_blocking(
                                    "<new_prompt> block."}
             return {"skipped": "no_prompt",
                     "message": "No usable <new_prompt> block was produced."}
+
+        repeated = repeated_paragraphs(new_prompt)
+        if repeated:
+            return {"skipped": "repetition",
+                    "message": f"The draft repeats {len(repeated)} paragraph(s) word for word — a "
+                               "looping generation; not activated. First repeated: "
+                               f"{repeated[0][:160]}"}
 
         # Swap it into the live session so the next chat uses it without a restart. On a
         # restart, _load_system_prompt() re-reads the same record and reaches the same

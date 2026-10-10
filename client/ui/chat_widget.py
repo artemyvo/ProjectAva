@@ -755,8 +755,8 @@ class ChatWidget(QWidget):
         self.spn_gain.setToolTip(
             "How far a full-strength signal lifts its colour channel above the grey "
             "body text: red = tension (the model nearly said something else), green = "
-            "relief (its uncertainty just dropped), blue = pain (axis projection, once "
-            "captured). 128 = full range, 0 = plain grey. Applies to newly rendered replies."
+            "relief (its uncertainty just dropped), blue = harm aimed at her (the harm × "
+            "target band; the old pain axis on older turns). 128 = full range, 0 = plain grey. Applies to newly rendered replies."
         )
         self.spn_gain.valueChanged.connect(self._on_gain_changed)
         params_layout.addWidget(self.spn_gain)
@@ -1823,8 +1823,10 @@ class ChatWidget(QWidget):
     #     red   = tension  (1 − top1-top2 margin: the model nearly said something else)
     #     green = relief   (causal z-score of the entropy drop, server-side
     #                       `tension.relief_series` — a proxy until a relief axis exists)
-    #     blue  = pain     (pain-axis projection, z-scored; absent until an axis is
-    #                       captured — a missing channel is zero, never an error)
+    #     blue  = harm     (harm aimed at her: the harm × target band's readout, z-scored,
+    #                       since 2026-10-07; the old pain axis on turns from before the
+    #                       band — the server says which in `blue_axis`; a missing channel
+    #                       is zero, never an error)
     # colour = (grey + gain·s_r, grey + gain·s_g, grey + gain·s_b), each s in [0,1].
     # Because a channel only ever adds, no mix can wash out: tension then relief on one
     # token is yellow, tension under pain magenta, all three white — all legible on
@@ -2018,9 +2020,10 @@ class ChatWidget(QWidget):
         step0 = spans.get("step0") or {}
         if step0:
             cursor.insertText("  step 0 ", neutral)
+            blue_key = "harm" if step0.get("harm") is not None else "pain"
             for key, unit, colour in (("tension", "", self._channel_qcolor(1.0, 0.0, 0.0)),
                                       ("relief", "σ", self._channel_qcolor(0.0, 1.0, 0.0)),
-                                      ("pain", "σ", self._channel_qcolor(0.0, 0.0, 1.0))):
+                                      (blue_key, "σ", self._channel_qcolor(0.0, 0.0, 1.0))):
                 if step0.get(key) is None:
                     continue
                 fmt = QTextCharFormat()

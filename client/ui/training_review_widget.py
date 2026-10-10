@@ -571,17 +571,20 @@ class BanWorker(QThread):
     done = pyqtSignal(dict)      # server's training_ban_set payload
     failed = pyqtSignal(str)
 
-    def __init__(self, client, target: str, exchange_index, banned: bool):
+    def __init__(self, client, target: str, exchange_index, banned: bool,
+                 history_only: bool = False):
         super().__init__()
         self._client = client
         self._target = target
         self._exchange_index = exchange_index
         self._banned = banned
+        self._history_only = history_only
 
     def run(self) -> None:
         try:
             result = self._client.set_training_ban(
-                self._target, self._exchange_index, self._banned)
+                self._target, self._exchange_index, self._banned,
+                history_only=self._history_only)
             if result.get("type") == "error":
                 self.failed.emit(result.get("message", "Ban failed."))
                 return
@@ -596,13 +599,14 @@ class RewriteHistoryWorker(QThread):
     done = pyqtSignal(dict)      # server's history_rewritten payload
     failed = pyqtSignal(str)
 
-    def __init__(self, client):
+    def __init__(self, client, sessions: Optional[list] = None):
         super().__init__()
         self._client = client
+        self._sessions = sessions
 
     def run(self) -> None:
         try:
-            result = self._client.rewrite_history()
+            result = self._client.rewrite_history(sessions=self._sessions)
             if result.get("type") == "error":
                 self.failed.emit(result.get("message", "Rewrite history failed."))
                 return
@@ -875,6 +879,7 @@ class TrainingReviewWidget(QWidget):
         # train" is the fact an operator scanning the list needs.
         self._frost_icon = self._make_frost_icon()
         self._ban_icon = self._make_ban_icon()
+        self._history_icon = self._make_history_icon()
         self._blank_icon = self._make_blank_icon()
         self._build_ui()
 
@@ -911,6 +916,20 @@ class TrainingReviewWidget(QWidget):
         return QIcon(pm)
 
     @staticmethod
+    def _make_history_icon(size: int = 16) -> QIcon:
+        """A small 📜 for a history-only ban: out of training, kept in the transcript."""
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        f = p.font()
+        f.setPointSize(int(size * 0.72))
+        p.setFont(f)
+        p.setPen(QColor(200, 170, 90))
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "📜")
+        p.end()
+        return QIcon(pm)
+
+    @staticmethod
     def _make_blank_icon(size: int = 16) -> QIcon:
         pm = QPixmap(size, size)
         pm.fill(Qt.GlobalColor.transparent)
@@ -937,10 +956,15 @@ class TrainingReviewWidget(QWidget):
         # the next build leaves the exchange out (core/capture_judge.py).
         if e.get("capture"):
             suffix += "  ⛔capture"
+        # A banned exchange the snapshot has no row for: listed so its ban stays reversible.
+        if e.get("outside"):
+            suffix += "  (not in this build)"
         prefix = "wander " if e.get("kind") == "wander" else ""
         return f"{row + 1:>4}. {prefix}{e['key']}{suffix}"
 
     def _row_icon(self, e: dict) -> QIcon:
+        if e.get("banned") and e.get("history_only"):
+            return self._history_icon
         if e.get("banned"):
             return self._ban_icon
         return self._frost_icon if e.get("locked") else self._blank_icon
@@ -1273,6 +1297,12 @@ class TrainingReviewWidget(QWidget):
         self.btn_ban = QPushButton("Ban from training")
         self.btn_ban.clicked.connect(self._on_toggle_ban)
         edit_bar.addWidget(self.btn_ban)
+        # The ban's other kind (PERSONA_REDESIGN.md C10): out of training, but part of the
+        # conversation — "Rewrite history" keeps it in the transcript as the context of the
+        # later turns instead of deleting it.
+        self.btn_history = QPushButton("History only")
+        self.btn_history.clicked.connect(self._on_toggle_history)
+        edit_bar.addWidget(self.btn_history)
         self.btn_apply_edits = QPushButton("Apply")
         self.btn_apply_edits.setToolTip(
             "Write the edited CoT + answer to the chat sidecar as this exchange's trainable "
@@ -1852,7 +1882,7 @@ class TrainingReviewWidget(QWidget):
         self.btn_replace_all.setEnabled(True)
         self.btn_replace_all.setText("Stop" if running else "Replace all…")
         for w in (self.btn_refresh, self.btn_rewrite, self.btn_replace, self.btn_regenerate,
-                  self.btn_apply_edits, self.btn_cancel_edits, self.btn_ban,
+                  self.btn_apply_edits, self.btn_cancel_edits, self.btn_ban, self.btn_history,
                   self.btn_strip_persona):
             w.setEnabled(False)
         if not running:
@@ -2112,6 +2142,17 @@ class TrainingReviewWidget(QWidget):
         can = self._can_ban(e)
         self.btn_ban.setEnabled(can and not self._ban_in_flight)
         banned = bool(e is not None and e.get("banned"))
+        history = bool(banned and e.get("history_only"))
+        chat_row = can and e is not None and e.get("kind") != "wander"
+        self.btn_history.setEnabled(chat_row and not self._ban_in_flight)
+        self.btn_history.setText("Make full ban" if history else "History only")
+        self.btn_history.setToolTip(
+            "Keep the ban, but let “Rewrite history” delete this exchange from its transcript."
+            if history else
+            "Bar this exchange from every future build, but keep it in its transcript as the "
+            "context of the later turns: “Rewrite history” never deletes it (📜). For a "
+            "position the conversation itself left behind, whose later turns only make sense "
+            "after it." if chat_row else "History only applies to chat exchanges.")
         self.btn_ban.setText("Un-ban" if banned else "Ban from training")
         if not can:
             self.btn_ban.setToolTip(
@@ -2159,14 +2200,44 @@ class TrainingReviewWidget(QWidget):
         self._ban_worker.failed.connect(self._on_ban_failed)
         self._ban_worker.start()
 
+    def _on_toggle_history(self) -> None:
+        """Make the selected chat row a history-only ban, or turn one back into a full ban."""
+        row = self.lst_entries.currentRow()
+        if not (0 <= row < len(self._entries)):
+            return
+        e = self._entries[row]
+        if not self._can_ban(e) or e.get("kind") == "wander":
+            self._sync_ban_control(e)
+            return
+        client = self._chat_widget._client
+        if client is None or not client.is_connected():
+            self._lbl_edit.setText("Not connected — connect from the Chat tab to ban a row.")
+            return
+        if self._ban_in_flight:
+            return
+        history = not bool(e.get("banned") and e.get("history_only"))
+        self._ban_pending_row = row
+        self._ban_in_flight = True
+        self.btn_ban.setEnabled(False)
+        self.btn_history.setEnabled(False)
+        self._lbl_edit.setText("Keeping this exchange as history only…" if history
+                               else "Making this a full ban…")
+        self._ban_worker = BanWorker(client, e["source_session"], e.get("exchange_index"),
+                                     True, history_only=history)
+        self._ban_worker.done.connect(self._on_ban_done)
+        self._ban_worker.failed.connect(self._on_ban_failed)
+        self._ban_worker.start()
+
     def _on_ban_done(self, result: dict) -> None:
         self._ban_in_flight = False
         row = self._ban_pending_row
         self._ban_pending_row = None
         banned = bool(result.get("banned"))
+        history = bool(banned and result.get("history_only"))
         if isinstance(row, int) and 0 <= row < len(self._entries):
             e = self._entries[row]
             e["banned"] = banned
+            e["history_only"] = history
             item = self.lst_entries.item(row)
             if item is not None:
                 item.setIcon(self._row_icon(e))
@@ -2176,6 +2247,9 @@ class TrainingReviewWidget(QWidget):
             self._apply_hiding()
         self._sync_edit_controls(self._current_entry())
         self._lbl_edit.setText(
+            "History only 📜 — out of the corpus from the next build, kept in its transcript "
+            "as the context of the later turns (“Rewrite history” never deletes it)."
+            if history else
             "Banned 🚫 — this row is out of the corpus from the next build. “Rewrite "
             "history” deletes the source for good."
             if banned else
@@ -2353,8 +2427,11 @@ class TrainingReviewWidget(QWidget):
     def _has_provenance(self, e: dict) -> bool:
         """A row can be regenerated only if it carries chat provenance (source_session +
         integer exchange_index). Wander rows and old snapshots (pre-provenance) can't be
-        traced to a source exchange, so their controls stay disabled."""
-        return bool(e.get("source_session")) and isinstance(e.get("exchange_index"), int)
+        traced to a source exchange, so their controls stay disabled. Nor can a banned row the
+        snapshot has no row for (``outside``): it is listed so the ban can be lifted or made
+        history-only, and repairing a target that does not train would be inventing one."""
+        return (bool(e.get("source_session")) and isinstance(e.get("exchange_index"), int)
+                and not e.get("outside"))
 
     def _set_regen_controls_enabled(self, enabled: bool) -> None:
         self.chk_corrupt_cot.setEnabled(enabled)
@@ -2380,7 +2457,10 @@ class TrainingReviewWidget(QWidget):
             chk.setChecked(False)
             chk.blockSignals(False)
         self._set_regen_controls_enabled(has_prov)
-        if not has_prov:
+        if e.get("outside"):
+            self._lbl_regen.setText("(banned, not in this build — only the ban can be changed "
+                                    "here; it shows the transcript's reply)")
+        elif not has_prov:
             self._lbl_regen.setText("(no source exchange — re-fetch snapshot to enable regeneration)")
         elif e.get("has_live"):
             self._lbl_regen.setText("❄ frozen (human-validated) — showing the live sidecar "
@@ -2623,7 +2703,8 @@ class TrainingReviewWidget(QWidget):
         if self._rewrite_worker is not None and self._rewrite_worker.isRunning():
             return
         frozen = sum(1 for e in self._entries if e.get("locked"))
-        banned = sum(1 for e in self._entries if e.get("banned"))
+        banned = sum(1 for e in self._entries if e.get("banned") and not e.get("history_only"))
+        history = sum(1 for e in self._entries if e.get("banned") and e.get("history_only"))
         # The server settles ALL locked/banned rows on the box, which may exceed what this
         # (possibly filtered / stale) snapshot shows — say so honestly.
         counts = []
@@ -2631,7 +2712,12 @@ class TrainingReviewWidget(QWidget):
             counts.append(f"{frozen} frozen ❄ {'exchange' if frozen == 1 else 'exchanges'}")
         if banned:
             counts.append(f"{banned} banned 🚫 {'row' if banned == 1 else 'rows'}")
-        shown = f"This snapshot shows {' and '.join(counts)}. " if counts else ""
+        if history:
+            counts.append(f"{history} history-only 📜 {'row' if history == 1 else 'rows'} (kept)")
+        shown = f"This snapshot shows {', '.join(counts)}. " if counts else ""
+        cur = self._current_entry()
+        cur_chat = (str(cur.get("source_session") or "")
+                    if cur is not None and cur.get("kind") != "wander" else "")
         confirm = QMessageBox(self)
         confirm.setIcon(QMessageBox.Icon.Warning)
         confirm.setWindowTitle("Rewrite history?")
@@ -2643,20 +2729,29 @@ class TrainingReviewWidget(QWidget):
             "tension data, and unfreezes it.\n\n"
             "For every banned (🚫) row it goes further and DELETES the source: a banned "
             "exchange is removed from its transcript (the later exchanges shift down one "
-            "position), and a banned wander capture is dropped from the wander corpus.\n\n"
+            "position), and a banned wander capture is dropped from the wander corpus. A "
+            "history-only (📜) row is never deleted: it stays in its transcript, out of "
+            "training.\n\n"
             "This edits the original transcripts (ground truth) and cannot be automatically "
             "undone. Prior content is kept in each exchange's rewrite_history, and a deleted "
             "exchange under the session's deleted_exchanges, for manual recovery. Rebuild + "
             "re-fetch a snapshot afterwards to see it here.")
+        chk_scope = None
+        if cur_chat:
+            chk_scope = QCheckBox(f"Only the selected row's chat ({cur_chat}); "
+                                  "wander captures untouched")
+            chk_scope.setChecked(True)
+            confirm.setCheckBox(chk_scope)
         confirm.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
         confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
         if confirm.exec() != QMessageBox.StandardButton.Yes:
             return
+        sessions = [cur_chat] if (chk_scope is not None and chk_scope.isChecked()) else None
         self.btn_rewrite.setEnabled(False)
         self._lbl_status.setText(
             "Rewriting history (baking reviewed targets in, deleting banned rows)…")
-        self._rewrite_worker = RewriteHistoryWorker(client)
+        self._rewrite_worker = RewriteHistoryWorker(client, sessions=sessions)
         self._rewrite_worker.done.connect(self._on_rewrite_done)
         self._rewrite_worker.failed.connect(self._on_rewrite_failed)
         self._rewrite_worker.start()
@@ -2669,7 +2764,13 @@ class TrainingReviewWidget(QWidget):
         chats = result.get("chats") or []
         skipped = result.get("skipped") or []
         errors = result.get("errors") or []
+        kept = int(result.get("kept_history_only", 0))
         if not (n or deleted or wander_deleted):
+            if kept:
+                self._lbl_status.setText(
+                    f"Rewrite history: nothing to rewrite or delete; {kept} history-only 📜 "
+                    f"exchange{'s' if kept != 1 else ''} kept in their transcripts.")
+                return
             self._lbl_status.setText(
                 "Rewrite history: nothing to do — no human-reviewed (locked) or banned rows found.")
             return
@@ -2684,6 +2785,9 @@ class TrainingReviewWidget(QWidget):
         if wander_deleted:
             parts.append(f"Dropped {wander_deleted} banned wander "
                          f"capture{'s' if wander_deleted != 1 else ''} from the corpus.")
+        if kept:
+            parts.append(f"Kept {kept} history-only 📜 exchange{'s' if kept != 1 else ''} "
+                         "in their transcripts.")
         if skipped:
             parts.append(f"{len(skipped)} skipped")
         if errors:

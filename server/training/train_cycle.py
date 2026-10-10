@@ -1,11 +1,25 @@
-"""One from-scratch build: assemble corpus → train a fresh LoRA → probe → record → clean.
+"""One build: assemble corpus → train a LoRA → probe → record → clean.
 
-REBUILD (see repo-root ``REBUILD.md``). The adapter is a **build artifact** — a pure
-function of (frozen base, bundle corpus, config), recompiled from scratch every build and
-never resumed. Repetition is replaced by an age-keyed LR ramp. Run offline (not while the
-inference server holds the GPU), e.g. as a Sleep-phase job:
+Two modes (``server_config.json`` ``train_mode``, CLI ``--mode``):
 
-    cd server && .venv/bin/python -m training.train_cycle            # full build
+* **full** — REBUILD (repo-root ``REBUILD.md``). The adapter is a **build artifact** — a
+  pure function of (frozen base, bundle corpus, config), fitted fresh over the whole
+  corpus. Nothing is forgotten, and every correction applies retroactively: the reset
+  and emergency path once incremental builds are the norm. The steps below describe it.
+* **incremental** — repo-root ``INCREMENTAL_TRAINING.md``. Resume the serving adapter and
+  train each row only by the dose it is still owed: its wall-clock ``D(age)`` minus what
+  the adapter's ``dose_ledger.jsonl`` says it already holds (``training/dose_ledger.py``).
+  A row past the LoRA cap age owes nothing more and fades as later material trains over
+  it. Below ``incremental.min_increment`` tokens the build is skipped and the owed doses
+  carry forward. Its own LR / schedule / epochs / warmup (``incremental.*``). A lineage
+  mismatch (model, rank, alpha, rsLoRA, LoRA keys) refuses the build: run a full train.
+
+Every build, full or incremental, writes the adapter's ``dose_ledger.jsonl`` +
+``lineage.json`` from the rows it trained. Run offline (not while the inference server
+holds the GPU), e.g. as a Sleep-phase job:
+
+    cd server && .venv/bin/python -m training.train_cycle            # build in train_mode
+    cd server && .venv/bin/python -m training.train_cycle --mode full  # one-off full train
     cd server && .venv/bin/python -m training.train_cycle --dry-run  # assemble only, no train
 
 Steps:
@@ -179,7 +193,8 @@ from training.build_history import BuildHistory                # noqa: E402
 from training.build_snapshot import write_snapshot             # noqa: E402
 from training.decay import (  # noqa: E402
     ConsolidationConfig, TRAIN_LR_DEFAULT, TRAIN_PLATEAU_EPOCHS_DEFAULT,
-    TRAIN_LORA_R_DEFAULT, TRAIN_LORA_ALPHA)
+    TRAIN_LORA_R_DEFAULT, TRAIN_LORA_ALPHA, TRAIN_MODES, incremental_settings, train_mode)
+from training import dose_ledger                               # noqa: E402
 from training.label_policy import find_subsequences, row_label_policy  # noqa: E402
 from training.ledger import ConsolidationLedger                # noqa: E402
 from training.render import answer_of, has_cot                # noqa: E402
@@ -418,6 +433,80 @@ def _is_perexpert_moe(model) -> bool:
 
 def _lora_target_modules(model) -> list:
     return _MOE_LORA_TARGETS if _is_perexpert_moe(model) else _DENSE_LORA_TARGETS
+
+
+def _incremental_parent(adapter_dir, *, model_id: str, lora_r: int,
+                        build_history: "BuildHistory") -> tuple[dict, str]:
+    """The dose ledger an incremental build resumes, plus a one-line note.
+
+    *adapter_dir* is the serving adapter (``server_config.json`` ``adapter_id``). Raises
+    ``RuntimeError`` when the step would be invalid: a lineage mismatch (model, rank,
+    alpha, rsLoRA — INCREMENTAL_TRAINING.md §2.5), or an adapter with neither a
+    ``dose_ledger.jsonl`` nor a build snapshot to seed one from. Both mean: run a full
+    train. An adapter that predates ledgers (the transition, §2.4) gets one seeded from
+    the snapshot of the build that produced it — the only time a ledger is read back from
+    a snapshot.
+    """
+    reasons = dose_ledger.lineage_mismatch(adapter_dir, model_id=model_id, lora_r=lora_r,
+                                           lora_alpha=_TRAIN_LORA_ALPHA, use_rslora=True)
+    if reasons:
+        raise RuntimeError(f"adapter {Path(adapter_dir).name} does not match this build "
+                           f"({'; '.join(reasons)}) — run a full train")
+    ledger = dose_ledger.load(adapter_dir)
+    if ledger is not None:
+        return ledger, (f"incremental: resuming {Path(adapter_dir).name} "
+                        f"({len(ledger)} ledger row(s))")
+    rec = dose_ledger.find_parent_snapshot(build_history._read(), adapter_dir)
+    render_file = (Path(rec["snapshot_dir"]) / SFT_RENDER_FILE
+                   if rec and rec.get("snapshot_dir") else None)
+    if render_file is None or not render_file.is_file():
+        raise RuntimeError(f"adapter {Path(adapter_dir).name} has no {dose_ledger.LEDGER_FILE} "
+                           f"and no build snapshot to seed one from — run a full train")
+    ledger = dose_ledger.seed_from_render(render_file, built_at=rec.get("built_at") or "",
+                                          build_id=rec.get("build_id") or "")
+    return ledger, (f"incremental: resuming {Path(adapter_dir).name}; dose ledger seeded "
+                    f"from {rec.get('build_id')} ({len(ledger)} row(s), the transition)")
+
+
+def _load_parent_lora(model, adapter_dir) -> dict:
+    """Load the parent adapter's weights into the freshly attached LoRA, in fp32.
+
+    The LoRA is attached by the same ``get_peft_model`` call a full train makes (so
+    unsloth's training patches are in place), then the parent's ``adapter_model.safetensors``
+    — read from DISK, never from a server's bf16-cast copy — is copied into it. A missing
+    or unexpected LoRA key (target modules or layout differ) refuses the build; a LoRA
+    whose ``lora_B`` is still all zero after the load (nothing landed) refuses too. Any
+    LoRA parameter not already fp32 is upcast: the adapter is never quantized.
+    """
+    import torch
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+    path = Path(adapter_dir) / "adapter_model.safetensors"
+    state = load_file(str(path))
+    result = set_peft_model_state_dict(model, state)
+    unexpected = [k for k in (getattr(result, "unexpected_keys", None) or []) if "lora_" in k]
+    missing = [k for k in (getattr(result, "missing_keys", None) or []) if "lora_" in k]
+    if unexpected or missing:
+        raise RuntimeError(
+            f"parent adapter {Path(adapter_dir).name} does not fit this LoRA: "
+            f"{len(missing)} missing / {len(unexpected)} unexpected LoRA key(s) "
+            f"(e.g. {(missing or unexpected)[0]}) — run a full train")
+    cast = 0
+    n_lora = 0
+    nonzero_b = False
+    for name, p in model.named_parameters():
+        if "lora_" not in name:
+            continue
+        n_lora += 1
+        if p.dtype != torch.float32:
+            p.data = p.data.float()
+            cast += 1
+        if "lora_B" in name and not nonzero_b and bool(p.detach().abs().sum() > 0):
+            nonzero_b = True
+    if not nonzero_b:
+        raise RuntimeError(f"parent adapter {Path(adapter_dir).name}: every lora_B is zero "
+                           f"after the load — its weights did not land")
+    return {"tensors": len(state), "lora_params": n_lora, "cast_to_fp32": cast}
 
 
 def _model_family(model_id: str) -> str:
@@ -801,12 +890,31 @@ def _prepare_training_rows(examples: list, tokenizer, family: str,
     Each retained item carries its original chronological ``train_row_id`` plus the exact
     text/ids SFTTrainer will receive. Oversized irreducible or structurally incomplete rows
     are returned as quarantine records; they never reach TRL's head-slice truncation.
+    A stray Latin capital glued onto a Cyrillic word is deleted from every assistant turn
+    where it is word-final (``render.repair_stray_latin``; the count rides on the example
+    as ``stray_latin_repaired``); one still glued inside the final target refuses the row.
     """
     response_part = _MARKERS[family][1]
     prepared, quarantined = [], []
     turns_dropped = 0
     for row_id, original in enumerate(examples):
         ex = dict(original)
+        messages, repaired = [], 0
+        for msg in ex.get("messages") or []:
+            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                content, n = render.repair_stray_latin(msg["content"])
+                if n:
+                    msg, repaired = {**msg, "content": content}, repaired + n
+            messages.append(msg)
+        ex["messages"] = messages
+        if repaired:
+            ex["stray_latin_repaired"] = repaired
+        glue = (render.stray_latin_glue(messages[-1].get("content"))
+                if messages and messages[-1].get("role") == "assistant" else None)
+        if glue:
+            quarantined.append(_quarantine_record(
+                ex, row_id, "stray_latin_glue", cap=cap, detail=glue))
+            continue
         try:
             messages, dropped = _truncate_messages_to_fit(
                 list(ex.get("messages") or []), tokenizer, family, cap)
@@ -1590,11 +1698,13 @@ def _ensure_expandable_segments() -> None:
     ensure_expandable_segments()
 
 
-def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: int = 1,
+def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None,
+              epochs: Optional[int] = None,
               learning_rate: Optional[float] = None, use_staging: bool = False,
               model_id_override: Optional[str] = None,
               run_id: Optional[str] = None, skip_validation: bool = False,
-              seed: int = 42, include_fresh: bool = False) -> dict:
+              seed: int = 42, include_fresh: bool = False,
+              mode: Optional[str] = None) -> dict:
     # Structured progress log (server/train_progress.jsonl). Reset per cycle so it
     # always describes the current run. The watchdog serves it to the Sleep tab,
     # which can't watch training over the (down) inference WebSocket. Best-effort.
@@ -1618,18 +1728,41 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     except Exception as _log_err:  # telemetry must never take the cycle down
         print(f"[train] activity journal unavailable: {_log_err}", flush=True)
     config = load_server_config()
+    # Build mode (INCREMENTAL_TRAINING.md): an explicit caller override (CLI --mode / Sleep
+    # train_params.mode — the one-off full train) wins; otherwise `train_mode`. Incremental
+    # with no serving adapter to resume (a fresh box) is a full train: it starts the lineage.
+    mode = (mode or train_mode(config)).strip().lower()
+    if mode not in TRAIN_MODES:
+        progress.emit("done", f"Unknown train mode {mode!r}", status="error")
+        raise SystemExit(f"unknown train mode {mode!r} (valid: {', '.join(TRAIN_MODES)})")
+    parent_dir: Optional[Path] = None
+    if mode == "incremental":
+        _parent = str(config.get("adapter_id") or "").strip()
+        if _parent and Path(_parent).is_dir():
+            parent_dir = Path(_parent)
+        else:
+            print("train_mode incremental, but no serving adapter to resume — this build is "
+                  "a full train (it starts the lineage).", flush=True)
+            mode = "full"
+    incremental = mode == "incremental"
+    inc_cfg = incremental_settings(config)
     # Base LR: an explicit caller override (CLI --lr / Sleep train_params.lr) wins; otherwise
-    # read it from server_config.json (`train_lr`, default _TRAIN_LR_DEFAULT). The per-row
-    # multipliers + LR-schedule shape below scale this reference value.
+    # read it from server_config.json — `incremental.lr` for an incremental build, else
+    # `train_lr` (default _TRAIN_LR_DEFAULT). The per-row multipliers + LR-schedule shape
+    # below scale this reference value.
     if learning_rate is None:
-        learning_rate = float(config.get("train_lr", _TRAIN_LR_DEFAULT))
+        learning_rate = (inc_cfg["lr"] if incremental
+                         else float(config.get("train_lr", _TRAIN_LR_DEFAULT)))
+    if epochs is None:
+        epochs = inc_cfg["epochs"] if incremental else 1
     # LoRA rank: an explicit caller override (CLI --lora-r / Sleep train_params.lora_r) wins;
     # otherwise read it from server_config.json (`lora_r`, default _TRAIN_LORA_R_DEFAULT).
     if lora_r is None:
         lora_r = int(config.get("lora_r", _TRAIN_LORA_R_DEFAULT))
     lora_r = max(1, int(lora_r))
-    progress.emit("start", "Train cycle starting...", run_id=run_id,
-                  lora_r=lora_r, epochs=epochs, lr=learning_rate, dry_run=dry_run)
+    progress.emit("start", f"Train cycle starting ({mode})...", run_id=run_id,
+                  lora_r=lora_r, epochs=epochs, lr=learning_rate, dry_run=dry_run,
+                  mode=mode)
     if not dry_run:
         _ensure_expandable_segments()
     # Reproducibility spine (REBUILD §7): seed the RNGs so a build is a function of
@@ -1671,6 +1804,14 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
         print(f"unknown train_lr_schedule {lr_schedule!r}; using {_LR_SCHEDULE_DEFAULT!r} "
               f"(valid: {', '.join(_LR_SCHEDULES)}).", flush=True)
         lr_schedule = _LR_SCHEDULE_DEFAULT
+    # An incremental build has its own schedule: `incremental.lr_schedule` "constant" is the
+    # flat per-row path ("age_ramp" here — LR = base x row increment), "triangular" the same
+    # trapezoid as the full train. `incremental.warmup_steps` adds a linear warmup over the
+    # first optimizer steps (the optimizer starts fresh on a resumed adapter).
+    warmup_steps = 0
+    if incremental:
+        lr_schedule = "triangular" if inc_cfg["lr_schedule"] == "triangular" else "age_ramp"
+        warmup_steps = inc_cfg["warmup_steps"]
     # Plateau (full-LR hold) epoch count for the trapezoid (server_config.json
     # `train_plateau_epochs`; default 3). Clamped to >=0: 0 means a plateau-free
     # warmup+decay pass (2 epochs) where every row still sees exactly 1 multiplier's
@@ -1699,6 +1840,20 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     # The build's as_of timestamp: every row's wall-clock age is (built_at − chat_ts), and
     # the same value is recorded on the build history so the build is reproducible (§7).
     built_at = datetime.now().isoformat()
+    # Incremental: the parent's dose ledger (seeded once from its build snapshot when the
+    # parent predates ledgers). A lineage mismatch or an unseedable parent refuses the
+    # build — both are fixed by a full train.
+    parent_ledger: dict = {}
+    inc_stats: Optional[dict] = None
+    if incremental:
+        try:
+            parent_ledger, _parent_note = _incremental_parent(
+                parent_dir, model_id=model_id, lora_r=lora_r, build_history=build_history)
+        except RuntimeError as e:
+            progress.emit("done", f"Incremental build refused: {e}", status="error")
+            raise SystemExit(f"incremental build refused: {e}")
+        print(_parent_note, flush=True)
+        progress.emit("render", _parent_note[:1].upper() + _parent_note[1:] + ".")
 
     # REBUILD.md §5a — from-scratch build corpus. Every FROZEN bundle (a reflect-once
     # chat = transcript + sidecar) contributes one row per revisable exchange: no
@@ -1713,9 +1868,9 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     # nonexistent dir here would make ChatSidecar recreate a phantom archive/chats).
     chats_dirs = [chats_dir] if use_staging else [hot_chats_dir()]
     wander_pending = load_wander_pending()
-    print(f"assembling from-scratch build corpus from {len(chats_dirs)} chat dir(s) "
+    print(f"assembling {mode} build corpus from {len(chats_dirs)} chat dir(s) "
           f"(+ {len(wander_pending)} pending wander) ...", flush=True)
-    progress.emit("render", "Assembling from-scratch build corpus (chronological, "
+    progress.emit("render", f"Assembling {mode} build corpus (chronological, "
                             "age-keyed LR ramp)...")
     rows = build_dataset(chats_dirs=chats_dirs, ledger=ledger, ccfg=ccfg,
                          built_at=built_at, wander_pending=wander_pending,
@@ -1736,6 +1891,40 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                               f"{_fresh_note}",
                       status="rejected")
         return {"examples": 0, "rows": 0, "preview_rows": len(preview_rows)}
+
+    # Incremental (INCREMENTAL_TRAINING.md §2.1): each row's multiplier is its cumulative
+    # target D(age); train only what the parent's ledger says it is still owed. Rows owing
+    # nothing (at cap and fully delivered, or a wander row already trained) drop out —
+    # that is the forgetting: nothing refreshes them any more.
+    if incremental:
+        # Foreign-adapter guard: a ledger written elsewhere knows almost none of this box's
+        # rows, and resuming it would train the whole local history at full dose at once.
+        _coverage = dose_ledger.coverage(rows, parent_ledger)
+        if _coverage < inc_cfg["min_coverage"]:
+            _why = (f"the serving adapter's dose ledger knows {_coverage:.0%} of this box's "
+                    f"{len(rows)} trainable rows (< incremental.min_coverage "
+                    f"{inc_cfg['min_coverage']:.0%}) — it was trained on another box. Adopt "
+                    f"it (Migrate tab Adopt adapter… / python -m training.adopt_adapter) or "
+                    f"run a full train")
+            progress.emit("done", f"Incremental build refused: {_why}.", status="error")
+            raise SystemExit(f"incremental build refused: {_why}")
+        rows, inc_stats = dose_ledger.apply_increments(rows, parent_ledger)
+        _inc_msg = (f"Incremental: {inc_stats['owed']} of {inc_stats['rows']} row(s) owed a "
+                    f"dose ({inc_stats['new']} never trained; total owed "
+                    f"{inc_stats['dose_owed']:.2f}); {inc_stats['done']} fully delivered.")
+        if inc_stats["changed_targets"]:
+            _inc_msg += (f" {inc_stats['changed_targets']} trained row(s) have a changed "
+                         f"target since — not retrained (only a full train applies a "
+                         f"correction retroactively).")
+        print(_inc_msg, flush=True)
+        progress.emit("render", _inc_msg, owed_rows=inc_stats["owed"],
+                      done_rows=inc_stats["done"], new_rows=inc_stats["new"],
+                      changed_targets=inc_stats["changed_targets"])
+        if not rows:
+            progress.emit("done", "Incremental build: no row is owed a dose — adapter "
+                                  "and dose ledger untouched.", status="info", skipped=True)
+            return {"examples": 0, "rows": 0, "preview_rows": len(preview_rows),
+                    "mode": mode, "skipped": True}
 
     # Flat chronological corpus rows. Row identity + multiplier stay on each example through
     # tokenization/masking; only the final retained dataset becomes the optimizer schedule.
@@ -1788,14 +1977,14 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
         progress.emit("done", "Dry-run: corpus assembled, no training.", status="info")
         return {"examples": len(examples), "rows": len(rows), "chat_rows": n_chat,
                 "wander_rows": n_wander, "preview_rows": len(preview_examples),
-                "corpus_fingerprint": fingerprint}
+                "corpus_fingerprint": fingerprint, "mode": mode}
 
     family = _model_family(model_id)
-    # REBUILD.md §5b — from-scratch build: NEVER resume a prior adapter. Each build loads
-    # the FROZEN base by model_id and fits a fresh LoRA (get_peft_model below), so a bad
-    # build is discarded and never inherited (the collapse failure mode is unrepresentable).
-    # The previously-promoted adapter is untouched on disk and keeps serving until this
-    # build promotes. `--lora-r` therefore always takes effect now.
+    # Every build loads the FROZEN base by model_id and attaches a LoRA (get_peft_model
+    # below). A full train (REBUILD.md §5b) fits it fresh; an incremental build then copies
+    # the parent adapter's weights into it from disk (_load_parent_lora, after the
+    # min_increment check) — INCREMENTAL_TRAINING.md §2.5. Either way the previously-
+    # promoted adapter is untouched on disk and keeps serving until this build promotes.
     # Belt-and-suspenders for the recompile fix above: UNSLOTH_COMPILE_DISABLE stops
     # unsloth from *regenerating* the torch.compile-wrapped forwards, but a cache written
     # by an earlier (pre-fix) run still holds the crash-prone compiled module on disk and
@@ -1939,11 +2128,13 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                 import torch
                 torch.cuda.empty_cache()
 
-    # REBUILD.md §5b — every build fits a FRESH LoRA on the frozen base (never resumed),
-    # so `--lora-r` always takes effect and no build inherits a prior trajectory's dose.
+    # A full train fits this LoRA fresh (REBUILD.md §5b); an incremental build attaches the
+    # same LoRA and loads the parent's weights into it below, once the build is known to be
+    # big enough to run (the lineage check already matched rank / alpha / rsLoRA).
     _gamma = _TRAIN_LORA_ALPHA / math.sqrt(lora_r)
-    print(f"Initializing a fresh LoRA adapter (from-scratch, r={lora_r}, "
-          f"alpha={_TRAIN_LORA_ALPHA}, rslora scaling={_gamma:.4f})...", flush=True)
+    print(f"Initializing a LoRA adapter ({'parent weights load after preparation' if incremental else 'from-scratch'}, "
+          f"r={lora_r}, alpha={_TRAIN_LORA_ALPHA}, rslora scaling={_gamma:.4f})...",
+          flush=True)
     model = _Fast.get_peft_model(
         model, r=lora_r, lora_alpha=_TRAIN_LORA_ALPHA,
         # Rank-stabilized scaling: gamma = alpha/sqrt(r), NOT peft's default alpha/r.
@@ -1997,9 +2188,11 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     _n_trimmed = sum(1 for row in prepared
                      if len(row["example"].get("messages") or []) <
                         len(examples[row["train_row_id"]].get("messages") or []))
+    _n_latin_repaired = sum(1 for row in prepared if row["example"].get("stray_latin_repaired"))
     print(f"training preparation: retained {len(prepared)}/{corpus_row_count} rows; "
           f"quarantined {_initial_quarantine}; trimmed {_n_trimmed} row(s) "
-          f"({_turns_dropped} oldest history turn(s)); cap={train_max_seq_length}.",
+          f"({_turns_dropped} oldest history turn(s)); stray-Latin repaired in "
+          f"{_n_latin_repaired} row(s); cap={train_max_seq_length}.",
           flush=True)
     if quarantined_rows:
         _reason_counts = {}
@@ -2010,11 +2203,40 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     progress.emit(
         "render",
         f"Prepared {len(prepared)}/{corpus_row_count} complete rows; "
-        f"quarantined {_initial_quarantine} over-cap/incomplete row(s).",
+        f"quarantined {_initial_quarantine} over-cap/incomplete/stray-Latin row(s).",
         corpus_rows=corpus_row_count, prepared_rows=len(prepared),
         quarantined_rows=_initial_quarantine, quarantine_path=str(quarantine_path),
         turns_dropped=_turns_dropped, train_max_seq_length=train_max_seq_length,
+        stray_latin_repaired_rows=_n_latin_repaired,
     )
+
+    # Incremental: run only when the owed rows are big enough to be worth a fit
+    # (`incremental.min_increment` tokens on the retained rows); below it nothing changes —
+    # adapter and ledger untouched — so every owed increment carries to the next build.
+    # Then load the parent's weights into the attached LoRA.
+    if incremental:
+        _owed_tokens = sum(len(row["input_ids"]) for row in prepared)
+        _min_tokens = inc_cfg["min_increment"]
+        if _owed_tokens < _min_tokens:
+            _skip = (f"Incremental build skipped: {len(prepared)} owed row(s), "
+                     f"{_owed_tokens} tokens < incremental.min_increment {_min_tokens}. "
+                     f"Adapter and dose ledger untouched; the owed doses carry to the next "
+                     f"build.")
+            print(_skip, flush=True)
+            progress.emit("done", _skip, status="info", skipped=True,
+                          owed_rows=len(prepared), owed_tokens=_owed_tokens,
+                          min_increment=_min_tokens)
+            render_path.unlink(missing_ok=True)
+            return {"examples": len(prepared), "rows": len(prepared), "mode": mode,
+                    "skipped": True, "owed_tokens": _owed_tokens,
+                    "min_increment": _min_tokens}
+        _parent_info = _load_parent_lora(model, parent_dir)
+        _load_msg = (f"Loaded parent adapter {parent_dir.name} into the LoRA "
+                     f"({_parent_info['tensors']} tensors, fp32"
+                     + (f"; upcast {_parent_info['cast_to_fp32']}" if _parent_info['cast_to_fp32'] else "")
+                     + f"); {len(prepared)} owed row(s), {_owed_tokens} tokens.")
+        print(_load_msg, flush=True)
+        progress.emit("load", _load_msg, owed_tokens=_owed_tokens)
 
     instruction_part, response_part = _MARKERS[family]
     # Folded contamination rows carry a per-token loss weight (contamination_fold). The column
@@ -2128,8 +2350,11 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                     # Layer the trapezoid on top: warmup 0->max (epoch 1), hold max across the
                     # `plateau_epochs` middle epochs, decay max->0 (final epoch).
                     # Order-independent average per row (§ helper).
-                    return row_mult * _triangular_lr_fraction(
-                        step, _n_rows, plateau_epochs)
+                    row_mult *= _triangular_lr_fraction(step, _n_rows, plateau_epochs)
+                if warmup_steps and step < warmup_steps:
+                    # Incremental warmup (`incremental.warmup_steps`): a linear ramp over the
+                    # first optimizer steps of a resumed adapter's fresh optimizer.
+                    row_mult *= (step + 1) / warmup_steps
                 return row_mult
             self.lr_scheduler = LambdaLR(opt, lr_lambda)
             return self.lr_scheduler
@@ -2403,6 +2628,9 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
         probe_passed, probe_results = run_regression_probe(
             model, tokenizer, context_length, retention_anchors, continuity_prompts,
             baselines, baseline_vecs, embedder, capability_baselines, progress=progress,
+            # False under an incremental build too: its baselines were captured before the
+            # parent's weights loaded (the bare base), so a continuity delta would compare
+            # against the base, not the parent.
             had_prior_adapter=False,
         )
 
@@ -2418,7 +2646,8 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     except Exception as e:
         print(f"Warning: could not write probe_results json: {e}", flush=True)
 
-    def _record_build(*, outcome: str, adapter_dir, probe_summary: dict) -> str:
+    def _record_build(*, outcome: str, adapter_dir, probe_summary: dict,
+                      build_id: Optional[str] = None) -> str:
         """Write the immutable forensic snapshot (REBUILD §7) and append the build line.
 
         Runs for BOTH outcomes — a rejected build's snapshot is the investigation packet.
@@ -2426,7 +2655,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
         active persona digest, and a meta of config + effective wall-clock params + seed +
         built_at, so the build is reproducible/triageable from data we already have.
         """
-        build_id = build_history.new_build_id()
+        build_id = build_id or build_history.new_build_id()
         try:
             from core.reflection_digest import latest_digest
             persona = latest_digest(persona_dir())
@@ -2448,6 +2677,11 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                 "contamination_additive": ccfg.wall.contamination_additive,
             },
             "probe_summary": probe_summary,
+            "mode": mode,
+            "parent_adapter": str(parent_dir) if incremental else None,
+            "incremental": ({**inc_cfg, **{k: v for k, v in (inc_stats or {}).items()
+                                           if k != "targets"}}
+                            if incremental else None),
             "server_config": config,
         }
         snap = write_snapshot(models_dir=_MODELS_DIR, build_id=build_id, meta=meta,
@@ -2461,7 +2695,8 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
             corpus_fingerprint=fingerprint, probe_summary=probe_summary,
             adapter_dir=str(adapter_dir) if adapter_dir else None,
             build_id=build_id, built_at=built_at, seed=seed,
-            snapshot_dir=str(snap) if snap else None)
+            snapshot_dir=str(snap) if snap else None, mode=mode,
+            parent_adapter=str(parent_dir) if incremental else None)
 
     if not probe_passed:
         print("\n" + "!"*80)
@@ -2487,6 +2722,34 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                 "probe_passed": False, "probe_results": probe_results}
 
     # -- Save Adapter & Repoint Config --
+    build_id = build_history.new_build_id()
+
+    def _write_ledger(adapter_dir: Path) -> None:
+        """The adapter's dose ledger + lineage (INCREMENTAL_TRAINING.md §2.3), written by
+        EVERY build from the rows it actually trained: a full train writes a fresh ledger
+        (each row delivered its multiplier), an incremental build the parent's copied
+        forward plus its increments. Also confirms the saved weights are fp32."""
+        new_ledger = dose_ledger.advance(parent_ledger, examples, built_at=built_at,
+                                         build_id=build_id, incremental=incremental)
+        dose_ledger.save(adapter_dir, new_ledger)
+        dose_ledger.save_lineage(adapter_dir, {
+            "mode": mode, "model_id": model_id, "lora_r": lora_r,
+            "lora_alpha": _TRAIN_LORA_ALPHA, "use_rslora": True,
+            "parent_adapter": str(parent_dir) if incremental else None,
+            "build_id": build_id, "built_at": built_at, "run_id": run_id,
+        })
+        print(f"dose ledger -> {adapter_dir.name}/{dose_ledger.LEDGER_FILE} "
+              f"({len(new_ledger)} row(s), {mode})", flush=True)
+        try:
+            dtypes = dose_ledger.safetensors_dtypes(adapter_dir / "adapter_model.safetensors")
+        except Exception as exc:
+            dtypes = {"unreadable": str(exc)}
+        if set(dtypes) != {"F32"}:
+            _warn = (f"WARNING: saved adapter is not all fp32 ({dtypes}) — the adapter must "
+                     f"never be quantized; investigate before the next incremental build.")
+            print(_warn, flush=True)
+            progress.emit("save", _warn, status="warn")
+
     if use_staging:
         adapter_dir = _MODELS_DIR / "candidate"
         if adapter_dir.exists():
@@ -2496,6 +2759,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                       status="promoted")
         model.save_pretrained(str(adapter_dir))
         tokenizer.save_pretrained(str(adapter_dir))
+        _write_ledger(adapter_dir)
         print("Staged run: candidate adapter saved (server_config.json untouched).", flush=True)
     else:
         adapter_dir = _adapter_dir_for(run_id)
@@ -2504,6 +2768,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
                       status="promoted", adapter=adapter_dir.name)
         model.save_pretrained(str(adapter_dir))
         tokenizer.save_pretrained(str(adapter_dir))
+        _write_ledger(adapter_dir)
         config["adapter_id"] = str(adapter_dir)
         save_server_config(config)
         print(f"server_config.json adapter_id -> {adapter_dir}", flush=True)
@@ -2533,7 +2798,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     _tier_pass = {k: v.get("passed") for k, v in (probe_results or {}).items()
                   if isinstance(v, dict)}
     build_id = _record_build(outcome="promoted", adapter_dir=adapter_dir,
-                             probe_summary=_tier_pass)
+                             probe_summary=_tier_pass, build_id=build_id)
     render_path.unlink(missing_ok=True)
 
     # -- Produce the persona: the frozen, runnable product of this reflection -- #
@@ -2561,10 +2826,10 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
     # bounded upstream by the user-token wander budget, not by post-train retirement.
     _fresh_done = (f" + {len(preview_examples)} fresh preview (untrained)"
                    if preview_examples else "")
-    print(f"promoted build {build_id}: adapter {adapter_dir.name} from {len(examples)} rows "
+    print(f"promoted {mode} build {build_id}: adapter {adapter_dir.name} from {len(examples)} rows "
           f"({n_chat} chat + {n_wander} wander{_fresh_done}); corpus {fingerprint}; deleted "
           f"{render_path.name}.", flush=True)
-    progress.emit("done", f"Build {build_id} promoted — adapter {adapter_dir.name}; "
+    progress.emit("done", f"Build {build_id} ({mode}) promoted — adapter {adapter_dir.name}; "
                           f"avg loss {loss_str}; {len(examples)} rows "
                           f"({n_chat} chat + {n_wander} wander{_fresh_done}).",
                   status="promoted", adapter=adapter_dir.name, build_id=build_id,
@@ -2583,7 +2848,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None, epochs: in
             "corpus_fingerprint": fingerprint, "avg_loss": avg_loss,
             "train_runtime": train_runtime,
             "adapter_dir": str(adapter_dir), "render_file": SFT_RENDER_FILE,
-            "probe_passed": True, "probe_results": probe_results}
+            "probe_passed": True, "probe_results": probe_results, "mode": mode}
 
 
 def main() -> None:
@@ -2595,7 +2860,15 @@ def main() -> None:
                          "for this run only. Scaling is rank-stabilized "
                          "(gamma = alpha/sqrt(r), alpha fixed at 4), so changing rank "
                          "changes capacity without changing the effective LR")
-    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--epochs", type=int, default=None,
+                    help="passes over the rows (default: 1 for a full train, "
+                         "`incremental.epochs` for an incremental one; the triangular "
+                         "schedule forces its own count)")
+    ap.add_argument("--mode", choices=list(TRAIN_MODES), default=None,
+                    help="build mode for this run only; overrides server_config.json "
+                         "`train_mode` — 'full' fits a fresh LoRA over the whole corpus "
+                         "(the reset path), 'incremental' resumes the serving adapter and "
+                         "trains only the dose each row is still owed")
     ap.add_argument("--lr", type=float, default=None,
                     help="base/peak LR; overrides server_config.json `train_lr` "
                          "(default 8e-6) for this run only")
@@ -2627,7 +2900,7 @@ def main() -> None:
                   epochs=args.epochs, learning_rate=args.lr,
                   use_staging=args.use_staging, model_id_override=args.model_id,
                   run_id=args.run_id, skip_validation=args.skip_validation,
-                  seed=args.seed, include_fresh=args.include_fresh)
+                  seed=args.seed, include_fresh=args.include_fresh, mode=args.mode)
     except Exception as e:
         # Append a terminal event so the Sleep tab's live poll reports the failure
         # rather than just seeing the process vanish. The client also stops on the

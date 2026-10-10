@@ -1,60 +1,61 @@
-"""The prompt-rewrite EVENT — Ava rewrites her standing prompt on her own decision.
+"""The nightly prompt choice — Ava chooses her standing prompt among fresh drafts and her own.
 
 PROMPT_REWRITE.md §4–§7 (stage 3). Stages 1–2 built the evidence: the locator logs one
 prompt delta per exchange where a standing line was missing, and every reflection run
 folds those into PATTERNS with a tension-weighted recurrence (``core.prompt_patterns``).
-This module is what SPENDS them. It is one deliberation action (``rewrite_prompt``,
-``core.deliberation``), offered only when the budget clears, and its body is:
+This module is what SPENDS them: one step of the nightly housekeeping event
+(``core.housekeeping``, 04:00 by default), run when she is eligible. Its body is:
 
-1. **samples** — ``prompt_rewrite.samples`` (5) rewrites of the LIVE prompt (the experiment
-   if one is active, else the seed), each handed the mature patterns as evidence, through
-   the same recipe the manual Prompt-experiment button uses (RAG on, keyed on the standing
-   prompt, thinking on); temperatures from ``prompt_rewrite.temperatures`` (default 0.9 ×
-   samples — the owner's manual sweep found the rewrite non-monotonic in temperature, so
-   the list keeps a sweep available);
-2. **consensus** — one pass over the samples naming what MOST of them agree on, as notes
-   (five draws at one moment are recurrence, the same instrument the digest uses across
-   chats — a line present in one draw is a coin flip that landed);
-3. **final draft** — one rewrite of the live prompt around those notes, at
-   ``prompt_rewrite.final_temperature`` (0.9): one voice back, not a merged list;
-4. **choice** — blind, shuffled, letter-labelled: the incumbent, the samples and the final
-   draft, judged against the persona digest and the patterns, with a ``WHY``. On the
-   ADAPTER: choosing a prompt is authorship (the box's rule: clean base for evaluation,
-   adapter for authorship), and a conservative chooser is the dampening wanted — the
-   blind shuffle and the WHY keep a self-confirming pick visible. Optional order check
-   (``prompt_rewrite.order_check``): the pass runs again with the letters reversed and a
-   disagreement is the incumbent;
-5. **outcome** — *changed*: the winner REPLACES the active experiment through the
+1. **drafts** — ``prompt_rewrite.samples`` (5) rewrites of the LIVE prompt (the experiment
+   if one is active, else the seed), each handed the mature patterns as evidence (RAG on,
+   keyed on the standing prompt, thinking on), one per temperature of
+   ``prompt_rewrite.temperatures`` — by default the sweep 0.9, 1.0, 1.1, 1.2, 1.3 (the
+   owner's manual sweep found the rewrite non-monotonic in temperature, so the spread is
+   the point). Above T=1 the reflect seam applies the ``chat_min_p`` floor to the unscaled
+   distribution (``generation`` → ``inference_backend._RawMinP``), so a hot draft keeps
+   the box's degeneration floor; a draft cut before its ``</new_prompt>`` is dropped;
+2. **choice** — blind, shuffled, letter-labelled: the incumbent and the drafts, judged
+   against the persona digest and the patterns, with a ``WHY``. On the ADAPTER: choosing a
+   prompt is authorship (the box's rule: clean base for evaluation, adapter for
+   authorship). Optional order check (``prompt_rewrite.order_check``): the pass runs again
+   with the letters reversed and a disagreement is the incumbent;
+3. **outcome** — *changed*: the winner REPLACES the active experiment through the
    experiment tier's own write (``prompt_experiment.save_experiment``, the ``set_prompt``
    semantics: the seed is carried forward as the revert anchor, never a candidate), the
    patterns weighed are CONSUMED (their delta keys land in the attempt record and leave
    the pool), and a first-person ``prompt`` worklog episode opens a thread the next
-   changed event closes; *stayed* (the incumbent won) or *declined* (she chose another
-   action at deliberation): nothing consumed, the attempt stamped for the gap only.
+   changed event closes; *stayed* (the incumbent won): nothing consumed.
 
-**The gate** (:func:`offer`, §4): enabled (the default since 2026-09-19); a model loaded; ≥1 mature pattern; the last
-attempt — including a cancellation after an operator prompt change — at least ``prompt_rewrite.min_gap_hours`` (24)
-old; at least one delta logged since that attempt (with nothing reflected in between,
-five new draws are yesterday's draws — offering them again is noise, not evolution);
-and no event in flight. An in-flight event is offered as *continue* and skips the budget
-check, since it already passed it.
+Why a scheduled choice and not a deliberation action (2026-10-04): offered as
+``rewrite_prompt`` on the executive's menu it was declined every time it was offered
+(three times in fifteen days, each for ``nothing``) — and the declines were about the ACT
+of rewriting, read through the very pull that funded it (analysis as a buffer), never
+about a draft. Here she judges texts, blind, and keeping what she has stays a real outcome.
 
-**Preemption** (§6): a drive body holds the single executor thread and a chat turn queues
-behind it, and this event is on the order of an hour. So ``generation`` preempts it as it
-preempts background reflection (:func:`request_preempt` sets the flag and fires the
-shared cancel event; the in-flight generation aborts within a step), every completed
-generation is persisted under ``data/hot/prompt/rewrite/<event_id>/`` with an
-``event.json`` marker, and the next dispatch RESUMES from the last completed step. A
+**Eligibility** (:func:`gate`): enabled; a model loaded; ≥1 mature pattern with an
+unconsumed key; at least one delta logged since the last attempt — of any outcome,
+including a cancellation after an operator prompt change (with nothing reflected in
+between, five new draws are last night's draws — and a veto is not turned into a fresh
+event on the same evidence); and no event in flight. An in-flight event is *continue* and
+skips the rest, since it already passed. Once a night is the housekeeping event's clock.
+
+**Preemption** (§6): a chat turn queues behind the single executor thread, and this event
+is on the order of an hour. So ``generation`` preempts it as it preempts background
+reflection (:func:`request_preempt` sets the flag and fires the shared cancel event; the
+in-flight generation aborts within a step), every completed generation is persisted under
+``data/hot/prompt/rewrite/<event_id>/`` with an ``event.json`` marker, and the next run
+RESUMES from the last completed step (the housekeeping step stays open for the night). A
 marker older than ``MAX_EVENT_AGE_DAYS`` is discarded. An operator prompt change cancels
 the attempt without consuming evidence, including on resume; Revert preempts an active
-generation. Activation checks the incumbent text and experiment timestamp under the
-same lock as Revert, so it cannot overwrite the veto.
+generation. Activation checks the incumbent text and experiment timestamp under the same
+lock as Revert, so it cannot overwrite the veto.
 
 **Files**, all under ``data/hot/prompt/``: reads ``patterns.json`` (stage 2), writes
-``rewrite/<event_id>/`` (candidates, process, the marker) and appends
-``rewrite_log.jsonl`` — the attempt record stage 2's fold reads ``consumed_keys`` and the
-last attempt's time from. The Prompt tab reads the experiment record's ``process``
-(``rewrite:<event_id>``) for its provenance line; Revert there is the operator's veto.
+``rewrite/<event_id>/`` (drafts, choice, the marker) and appends ``rewrite_log.jsonl`` —
+the attempt record stage 2's fold reads ``consumed_keys`` and the last attempt's time
+from (older records include the retired deliberation path's ``declined``). The Prompt tab
+reads the experiment record's ``process`` (``rewrite:<event_id>``) for its provenance
+line; Revert there is the operator's veto.
 
 Never imports ``server``: RAG, the reflect seam, the base-prompt loader, the config
 loader, paths and the cancel event are injected via :func:`configure`. Self-test (fake
@@ -81,18 +82,15 @@ from core.runtime_state import runtime as _runtime, session as _session
 REWRITE_DIR = "rewrite"
 EVENT_FILE = "event.json"
 MAX_EVENT_AGE_DAYS = 7.0
-ACTION = "rewrite_prompt"
 WORKLOG_KIND = "prompt"
 
 DEFAULT_SAMPLES = 5
-DEFAULT_TEMPERATURE = 0.9          # Sleep's default — the owner's call
-DEFAULT_FINAL_TEMPERATURE = 0.9
-DEFAULT_MIN_GAP_HOURS = 24.0
+# The owner's sweep (2026-10-04): one draft per temperature, 0.9 → 1.3.
+DEFAULT_TEMPERATURES = (0.9, 1.0, 1.1, 1.2, 1.3)
 SAMPLE_MAX_NEW_TOKENS = "4096"     # the manual experiment's budget
 CHOICE_MAX_NEW_TOKENS = "3072"
 
 SAMPLE_PROMPT_FILE = "prompt_rewrite_prompt.txt"
-CONSENSUS_PROMPT_FILE = "prompt_consensus_prompt.txt"
 CHOICE_PROMPT_FILE = "prompt_choice_prompt.txt"
 
 # Occupancy flag — named in the scheduler's `external_busy`; read by generation's preempt.
@@ -182,7 +180,7 @@ def settings(cfg: Optional[dict] = None) -> dict:
             except ValueError:
                 continue
     if not temps:
-        temps = [DEFAULT_TEMPERATURE] * samples
+        temps = default_temperatures(samples)
     elif len(temps) < samples:
         temps = temps + [temps[-1]] * (samples - len(temps))
     else:
@@ -191,10 +189,19 @@ def settings(cfg: Optional[dict] = None) -> dict:
         "enabled": bool(blk.get("enabled", True)),
         "samples": samples,
         "temperatures": temps,
-        "final_temperature": min(max(_f("final_temperature", DEFAULT_FINAL_TEMPERATURE), 0.0), 2.0),
-        "min_gap_hours": max(0.0, _f("min_gap_hours", DEFAULT_MIN_GAP_HOURS)),
         "order_check": bool(blk.get("order_check", False)),
     }
+
+
+def default_temperatures(samples: int) -> list[float]:
+    """The default sweep for *samples* drafts: :data:`DEFAULT_TEMPERATURES` as-is for five,
+    otherwise the same span (first → last) evenly spaced."""
+    lo, hi = DEFAULT_TEMPERATURES[0], DEFAULT_TEMPERATURES[-1]
+    if samples == len(DEFAULT_TEMPERATURES):
+        return list(DEFAULT_TEMPERATURES)
+    if samples <= 1:
+        return [lo]
+    return [round(lo + (hi - lo) * i / (samples - 1), 3) for i in range(samples)]
 
 
 # ── prompts (default-written) ────────────────────────────────────────────────
@@ -207,8 +214,7 @@ talk with someone:
 {current_prompt}
 ---
 
-You are here to rewrite it, and this time the decision is yours: no one pressed a button.
-Your reflections have kept noticing the same pulls — places where a reply fell short of
+You are here to draft a rewrite of it. Your reflections have kept noticing the same pulls — places where a reply fell short of
 you, or where you were torn, and where a standing line would have settled it. Here they
 are, gathered across conversations:
 
@@ -219,10 +225,12 @@ your own voice, the way an instruction actually sits in a prompt. You may change
 disposition, or the whole thing. Keep what still holds; a prompt is not improved by
 growing. A line earns its place by naming a recurring pull, not a single slip.
 
-The prompt you write becomes your live standing prompt from your next conversation, and
-stays until you rewrite it again or the person running you reverts it. It is not a
-proposal for approval and not a description of who you already are: it is the version of
-yourself you are choosing to carry.
+This is one of several drafts written tonight. Afterwards you will read them beside the
+prompt you carry now, without knowing which is which, and choose the one to carry — keeping
+what you have is a real outcome. The one you choose becomes your live standing prompt from
+your next conversation, and stays until you choose again or the person running you reverts
+it. So write it not as a proposal for approval and not as a description of who you already
+are: as a version of yourself you could choose to carry.
 
 Think it through however you like. Then give the prompt, and nothing else, inside these
 tags — the full text, ready to use as-is:
@@ -230,25 +238,6 @@ tags — the full text, ready to use as-is:
 <new_prompt>
 ...your standing prompt...
 </new_prompt>
-"""
-
-_DEFAULT_CONSENSUS_PROMPT = """\
-You wrote {count} drafts of your own standing prompt, each in one sitting, each from the
-same evidence. They differ — a draft is one sitting's version of you, and no single one is
-the settled intention. What recurs across them is.
-
-Read them and write NOTES, not a prompt: the stances, lines and ways of sounding that MOST
-of the drafts share, each in one sentence, in the words the drafts themselves reach for.
-Then, separately, what only one or two drafts say — noted as such, not adopted. Do not
-merge the drafts into prose; do not write a new prompt here.
-
-Output exactly these two sections, nothing else:
-
-AGREED:
-- ...
-
-ONLY_SOME:
-- ...
 """
 
 _DEFAULT_CHOICE_PROMPT = """\
@@ -374,19 +363,19 @@ def _find_in_flight(now: Optional[datetime] = None) -> Optional[dict]:
     return None
 
 
-def offer(now: Optional[datetime] = None, cfg: Optional[dict] = None, *,
-          check_model: bool = True) -> dict:
-    """Is the action on the menu right now, and why / why not.
+def gate(now: Optional[datetime] = None, cfg: Optional[dict] = None, *,
+         check_model: bool = True) -> dict:
+    """Is she eligible for tonight's choice, and why / why not.
 
-    Returns ``{offered, reason, mature, in_flight, budget, gap_hours_left, since}``.
-    ``reason`` names the FIRST failing condition — the executive shows the action only
-    when ``offered``; the body re-checks and reports the same reason as a skip.
-    ``check_model=False`` (the Prompt tab's status read) walks the rest of the chain
-    with no model loaded, so the operator sees what WOULD gate once one is."""
+    Returns ``{eligible, reason, mature, in_flight, budget, since}``. ``reason`` names the
+    FIRST failing condition (``eligible`` / ``continue`` when it passes); the body
+    re-checks and reports a failing one as a skip. ``check_model=False`` (the Prompt
+    tab's status read) walks the rest of the chain with no model loaded, so the operator
+    sees what WOULD gate once one is."""
     now = now or datetime.now(timezone.utc)
     st = settings(cfg)
-    out = {"offered": False, "reason": "", "mature": [], "in_flight": None,
-           "budget": None, "gap_hours_left": 0.0, "since": 0}
+    out = {"eligible": False, "reason": "", "mature": [], "in_flight": None,
+           "budget": None, "since": 0}
     if not st["enabled"]:
         out["reason"] = "disabled"
         return out
@@ -397,7 +386,7 @@ def offer(now: Optional[datetime] = None, cfg: Optional[dict] = None, *,
     if ev is not None:
         out["in_flight"] = ev
         out["mature"] = ev.get("patterns") or []
-        out["offered"] = True
+        out["eligible"] = True
         out["reason"] = "continue"
         return out
     b = prompt_patterns.budget(Path(_STATE_DIR))
@@ -413,18 +402,10 @@ def offer(now: Optional[datetime] = None, cfg: Optional[dict] = None, *,
     if not mature:
         out["reason"] = "no_mature_pattern"
         return out
-    last_ts = prompt_patterns.last_attempt_ts(attempts)
-    if last_ts:
-        last = prompt_patterns._parse_ts(last_ts)
-        if last is not None:
-            hours = (now - last).total_seconds() / 3600.0
-            if hours < st["min_gap_hours"]:
-                out["gap_hours_left"] = round(st["min_gap_hours"] - hours, 1)
-                out["reason"] = "gap"
-                return out
     # "Provided that some reflections happened": a new vote since the last attempt —
-    # counted off the op-log itself, for the same reason as above (the file's own count
-    # is against whatever attempt was last when the file was built).
+    # counted off the op-log itself (the file's own count is against whatever attempt was
+    # last when the file was built).
+    last_ts = prompt_patterns.last_attempt_ts(attempts)
     since = (sum(1 for d in prompt_patterns.read_deltas(Path(_STATE_DIR))
                  if str(d.get("ts") or "") > last_ts)
              if last_ts else int(b.get("deltas_since_last_attempt") or 0))
@@ -432,60 +413,9 @@ def offer(now: Optional[datetime] = None, cfg: Optional[dict] = None, *,
     if last_ts and since < 1:
         out["reason"] = "no_new_deltas"
         return out
-    out["offered"] = True
-    out["reason"] = "budget"
+    out["eligible"] = True
+    out["reason"] = "eligible"
     return out
-
-
-def render_offer(o: dict) -> str:
-    """The extra option line for the deliberation prompt (only when offered)."""
-    if not o.get("offered"):
-        return ""
-    if o.get("reason") == "continue":
-        ev = o.get("in_flight") or {}
-        done = int(ev.get("samples_done") or 0)
-        return (f"One more option is open to you right now — {ACTION}: you started "
-                f"rewriting your standing prompt (event {ev.get('event_id', '?')}, "
-                f"{done} draft(s) written) and were interrupted; choosing it continues "
-                f"from where you stopped. Answer ACTION: {ACTION} to take it.")
-    n = len(o.get("mature") or [])
-    return (f"One more option is open to you right now — {ACTION}: rewrite your standing "
-            f"prompt around the {n} mature pull(s) listed above. You would draft several "
-            f"versions, find what they agree on, and choose — keeping what you have is a "
-            f"real outcome. Doing this rests the option for a day whatever you choose. "
-            f"Answer ACTION: {ACTION} to take it.")
-
-
-def deliberation_offer() -> Optional[dict]:
-    """What ``core.deliberation`` is injected (``offer_fn``): the action, its line, and a
-    ``decline`` callable it invokes when the action was offered and she chose another —
-    a declined attempt spends nothing but stamps the gap (§5)."""
-    try:
-        o = offer()
-    except Exception:
-        traceback.print_exc()
-        return None
-    if not o.get("offered"):
-        return None
-    return {"action": ACTION, "line": render_offer(o),
-            "decline": lambda chosen: _record_decline(o, chosen)}
-
-
-def _record_decline(o: dict, chosen: str) -> None:
-    if o.get("reason") == "continue":
-        return          # an in-flight event is not re-attempted by being deferred
-    ev_id = _new_event_id()
-    _append_attempt({
-        "event": ev_id, "outcome": "declined", "chosen": chosen or "",
-        "why": "", "patterns_weighed": [p.get("id") for p in (o.get("mature") or [])],
-        "consumed_keys": [],
-    })
-    try:
-        worklog.record(WORKLOG_KIND,
-                       "I weighed rewriting my standing prompt and chose to do something "
-                       "else for now.", refs={"event": ev_id})
-    except Exception:
-        pass
 
 
 # ── attempt log ──────────────────────────────────────────────────────────────
@@ -528,14 +458,6 @@ def parse_choice(raw: str, n_options: int) -> tuple[Optional[int], str]:
             idx = k
     w = re.search(_label("WHY") + r"(.+?)(?:\n\s*\n|\Z)", ans, re.IGNORECASE | re.DOTALL | re.MULTILINE)
     return idx, (w.group(1).strip() if w else "")
-
-
-def parse_consensus(raw: str) -> str:
-    """The notes (answer region), empty when the pass produced no AGREED section."""
-    ans = _answer_after_think(raw or "").strip()
-    if not re.search(_label("AGREED"), ans, re.IGNORECASE | re.MULTILINE):
-        return ""
-    return ans
 
 
 def shuffle_candidates(candidates: list[dict], seed: str) -> list[dict]:
@@ -605,10 +527,9 @@ def run_rewrite_blocking(on_stage: Optional[Callable] = None,
 
 def _run(_stage: Callable, on_chunk: Optional[Callable]) -> dict:
     st = settings()
-    o = offer()
-    if not o["offered"]:
-        return {"skipped": o["reason"], **({"gap_hours_left": o["gap_hours_left"]}
-                                            if o["reason"] == "gap" else {})}
+    o = gate()
+    if not o["eligible"]:
+        return {"skipped": o["reason"]}
     with prompt_experiment.STATE_LOCK:
         live, live_source, base = _live_prompt()
         experiment_ts = (prompt_experiment.load_experiment(_STATE_DIR) or {}).get("created_ts", "")
@@ -619,7 +540,7 @@ def _run(_stage: Callable, on_chunk: Optional[Callable]) -> dict:
     if ev is not None and not _prompt_is_current(ev):
         # The operator changed the prompt under the event: its candidates were written
         # against a prompt she no longer carries. Cancel this attempt; do not turn a
-        # veto into a fresh event using the same evidence and bypass the normal gap.
+        # veto into a fresh event using the same evidence.
         _stage(stage="discarded", event=ev.get("event_id"), reason="prompt_changed")
         return _interrupted(ev, "resume")
     if ev is None:
@@ -632,7 +553,7 @@ def _run(_stage: Callable, on_chunk: Optional[Callable]) -> dict:
                                                 "recurrences", "weighted_recurrence")}
                          for p in o["mature"]],
             "temperatures": st["temperatures"],
-            "samples_done": 0, "consensus": False, "final": False,
+            "samples_done": 0,
         }
         _write_event(ev)
         _stage(stage="started", event=ev["event_id"], patterns=len(ev["patterns"]))
@@ -662,71 +583,35 @@ def _run(_stage: Callable, on_chunk: Optional[Callable]) -> dict:
             return None
         return raw or ""
 
-    # 1. samples
+    # 1. drafts, one per temperature of the sweep
     temps = list(ev.get("temperatures") or st["temperatures"])
     n_samples = len(temps)
     sample_prompt = _load_prompt_file(SAMPLE_PROMPT_FILE, _DEFAULT_SAMPLE_PROMPT)
     system = sample_prompt.replace("{current_prompt}", live).replace("{evidence}", evidence)
     for k in range(int(ev.get("samples_done") or 0), n_samples):
         raw = _gen(prompt_experiment._USER_CONTENT, system, temperature=temps[k],
-                   budget=SAMPLE_MAX_NEW_TOKENS, rag_on=True, label=f"sample {k + 1}/{n_samples}")
+                   budget=SAMPLE_MAX_NEW_TOKENS, rag_on=True,
+                   label=f"draft {k + 1}/{n_samples} at T={temps[k]}")
         if raw is None:
             return _interrupted(ev, f"sample_{k}")
-        text = prompt_experiment.parse_experiment_prompt(raw)
+        cut = bool(getattr(generate, "last_truncated", None)
+                   or getattr(generate, "last_loop", None))
+        text = draft_text(raw, cut=cut)
         (edir / f"sample_{k}.raw.txt").write_text(raw, encoding="utf-8")
         (edir / f"sample_{k}.txt").write_text(text, encoding="utf-8")   # "" = unusable
         ev["samples_done"] = k + 1
         _write_event(ev)
-        _stage(stage="sample", event=ev["event_id"], k=k + 1, n=n_samples, chars=len(text))
+        _stage(stage="sample", event=ev["event_id"], k=k + 1, n=n_samples,
+               temperature=temps[k], chars=len(text), cut=cut)
     samples = [(_read_text(edir / f"sample_{k}.txt")).strip() for k in range(n_samples)]
-    usable = [s for s in samples if s]
-    if not usable:
+    if not any(samples):
         rec = _finish(ev, "failed", None, "every draft came back without a usable prompt", [], None)
         return {"outcome": rec["outcome"], "event": ev["event_id"], "why": rec["why"]}
 
-    # 2. consensus
-    consensus = _read_text(edir / "consensus.txt").strip() if ev.get("consensus") else ""
-    if not ev.get("consensus"):
-        cprompt = _load_prompt_file(CONSENSUS_PROMPT_FILE, _DEFAULT_CONSENSUS_PROMPT)
-        cprompt = cprompt.replace("{count}", str(len(usable)))
-        drafts = "\n\n".join(f"--- DRAFT {i + 1} ---\n{s}" for i, s in enumerate(usable))
-        raw = _gen(drafts, cprompt, temperature=0.7, budget=CHOICE_MAX_NEW_TOKENS,
-                   rag_on=False, label="consensus")
-        if raw is None:
-            return _interrupted(ev, "consensus")
-        consensus = parse_consensus(raw)
-        (edir / "consensus.raw.txt").write_text(raw, encoding="utf-8")
-        (edir / "consensus.txt").write_text(consensus, encoding="utf-8")
-        ev["consensus"] = True
-        _write_event(ev)
-        _stage(stage="consensus", event=ev["event_id"], chars=len(consensus))
-
-    # 3. final draft (skipped when the consensus pass produced nothing to draft from)
-    final = _read_text(edir / "final.txt").strip() if ev.get("final") else ""
-    if not ev.get("final"):
-        if consensus:
-            fsystem = (sample_prompt.replace("{current_prompt}", live)
-                       .replace("{evidence}", evidence)
-                       + "\n\nYou already wrote several drafts of this and read them back. "
-                         "This is what they agreed on — write the prompt around it, in "
-                         "one voice:\n\n" + consensus)
-            raw = _gen(prompt_experiment._USER_CONTENT, fsystem,
-                       temperature=st["final_temperature"], budget=SAMPLE_MAX_NEW_TOKENS,
-                       rag_on=True, label="final draft")
-            if raw is None:
-                return _interrupted(ev, "final")
-            final = prompt_experiment.parse_experiment_prompt(raw)
-            (edir / "final.raw.txt").write_text(raw, encoding="utf-8")
-        (edir / "final.txt").write_text(final, encoding="utf-8")
-        ev["final"] = True
-        _write_event(ev)
-        _stage(stage="final", event=ev["event_id"], chars=len(final))
-
-    # 4. choice
+    # 2. choice — blind, the incumbent among the drafts
     candidates = [{"label": "incumbent", "text": live}]
-    candidates += [{"label": f"sample_{k}", "text": s} for k, s in enumerate(samples) if s]
-    if final:
-        candidates.append({"label": "final", "text": final})
+    candidates += [{"label": f"sample_{k}", "text": s, "temperature": temps[k]}
+                   for k, s in enumerate(samples) if s]
     ordered = shuffle_candidates(candidates, ev["event_id"])
     choice_prompt = (_load_prompt_file(CHOICE_PROMPT_FILE, _DEFAULT_CHOICE_PROMPT)
                      .replace("{evidence}", evidence)
@@ -756,15 +641,33 @@ def _run(_stage: Callable, on_chunk: Optional[Callable]) -> dict:
             chosen = candidates[0]     # a disagreement is the incumbent
     _stage(stage="chosen", event=ev["event_id"], chosen=chosen["label"], unparsed=unparsed)
 
-    # 5. outcome
+    # 3. outcome
     changed = chosen["label"] != "incumbent" and chosen["text"].strip() != live
     outcome = "changed" if changed else "stayed"
     rec = _finish(ev, outcome, chosen, why, candidates, order_check, unparsed=unparsed)
     return {"outcome": rec["outcome"], "event": ev["event_id"], "chosen": rec["chosen"],
             "why": rec["why"], "consumed": len(rec.get("consumed_keys") or []),
             "candidates": len(candidates),
+            "temperature": chosen.get("temperature") if rec["outcome"] == "changed" else None,
             "prompt_chars": len(chosen["text"]) if rec["outcome"] != "cancelled" else 0,
             "order_check": order_check, "worklog_id": rec.get("worklog_id")}
+
+
+def draft_text(raw: str, *, cut: bool) -> str:
+    """A draft's prompt, or "" when it is unusable. ``parse_experiment_prompt`` tolerates
+    a missing ``</new_prompt>`` (the manual button's truncated generation); a nightly
+    draft does not — a generation cut by the token cap or a loop/degeneration guard
+    before closing its tag ends in whatever the cut left, and that tail would be one of
+    the texts she is asked to choose among."""
+    if cut and not re.search(r"</new_prompt>", prompt_experiment._strip_think(raw or ""),
+                             re.IGNORECASE):
+        return ""
+    text = prompt_experiment.parse_experiment_prompt(raw)
+    # A draft that repeats a paragraph word for word is a looping generation
+    # (prompt_experiment.repeated_paragraphs): dropped like a cut one.
+    if prompt_experiment.repeated_paragraphs(text):
+        return ""
+    return text
 
 
 def _interrupted(ev: dict, step: str) -> dict:
@@ -810,8 +713,8 @@ def _finish_locked(ev: dict, outcome: str, chosen: Optional[dict], why: str,
         try:
             e = worklog.record(
                 WORKLOG_KIND,
-                f"I rewrote my standing prompt around what my reflections kept noticing: "
-                f"{pulls}. I am living under it now.",
+                f"I chose a new standing prompt from drafts I wrote around what my "
+                f"reflections kept noticing: {pulls}. I am living under it now.",
                 refs={"event": ev["event_id"], "patterns": [p.get("id") for p in ev.get("patterns") or []]},
                 opens=f"living under the standing prompt I rewrote (event {ev['event_id']})",
                 closes=_last_changed_worklog_id(),
@@ -825,8 +728,8 @@ def _finish_locked(ev: dict, outcome: str, chosen: Optional[dict], why: str,
         try:
             e = worklog.record(
                 WORKLOG_KIND,
-                "I drafted rewrites of my standing prompt, read them against what I have, "
-                "and kept the prompt I carry.",
+                "I drafted rewrites of my standing prompt, read them blind beside the one I "
+                "carry, and kept mine.",
                 refs={"event": ev["event_id"]})
             worklog_id = e.get("id")
         except Exception:
@@ -839,6 +742,8 @@ def _finish_locked(ev: dict, outcome: str, chosen: Optional[dict], why: str,
         "patterns_weighed": [p.get("id") for p in ev.get("patterns") or []],
         "consumed_keys": consumed,
         "candidates": {c["label"]: c["text"] for c in candidates},
+        "temperatures": {c["label"]: c["temperature"] for c in candidates
+                         if c.get("temperature") is not None},
         "worklog_id": worklog_id,
     })
     try:
@@ -856,29 +761,32 @@ _STATUS_ATTEMPTS = 5
 def status_report(now: Optional[datetime] = None, *, attempts: int = _STATUS_ATTEMPTS) -> dict:
     """Everything the Prompt tab shows about the autonomous rewrite, GPU-free.
 
-    ``gate`` is :func:`offer` walked past the model check (so the chain is visible with
-    nothing loaded — ``model_loaded`` says so separately), plus the line the executive
-    would be shown; ``budget`` is ``patterns.json`` as the fold left it; ``attempts`` the
-    newest *attempts* records in full — timestamp, outcome, the chosen candidate, her
-    ``WHY`` and every candidate's text — so an operator can read what happened and what
-    she was choosing among."""
+    ``gate`` is :func:`gate` walked past the model check (so the chain is visible with
+    nothing loaded — ``model_loaded`` says so separately); ``night`` the housekeeping
+    event's clock (``core.housekeeping.status``) — when tonight's choice runs; ``budget``
+    is ``patterns.json`` as the fold left it; ``attempts`` the newest *attempts* records
+    in full — timestamp, outcome, the chosen candidate, her ``WHY`` and every candidate's
+    text — so an operator can read what happened and what she was choosing among."""
     now = now or datetime.now(timezone.utc)
     st = settings()
-    o = offer(now, check_model=False)
+    o = gate(now, check_model=False)
     ev = o.get("in_flight")
-    gate = {
-        "offered": bool(o.get("offered")),
+    gate_view = {
+        "eligible": bool(o.get("eligible")),
         "reason": o.get("reason", ""),
-        "gap_hours_left": o.get("gap_hours_left", 0.0),
         "deltas_since_last_attempt": o.get("since", 0),
         "mature": [{k: p.get(k) for k in ("id", "scope", "delta", "recurrences",
                                            "weighted_recurrence", "tension_mean", "chats")}
                    for p in (o.get("mature") or [])],
         "in_flight": ({k: ev.get(k) for k in ("event_id", "started_ts", "samples_done",
-                                              "consensus", "final", "live_source")}
+                                              "temperatures", "live_source")}
                       if ev else None),
-        "offer_line": render_offer(o),
     }
+    try:
+        from core import housekeeping
+        night = housekeeping.status(now)
+    except Exception:
+        night = None
     b = o.get("budget") or prompt_patterns.budget(Path(_STATE_DIR))
     budget = {
         "n_patterns": b.get("n_patterns", 0),
@@ -895,9 +803,9 @@ def status_report(now: Optional[datetime] = None, *, attempts: int = _STATUS_ATT
         "enabled": st["enabled"],
         "model_loaded": _runtime.model is not None,
         "active": is_active(),
-        "settings": {k: st[k] for k in ("samples", "temperatures", "final_temperature",
-                                        "min_gap_hours", "order_check")},
-        "gate": gate,
+        "settings": {k: st[k] for k in ("samples", "temperatures", "order_check")},
+        "gate": gate_view,
+        "night": night,
         "budget": budget,
         "attempts_total": len(log),
         "attempts": recent,
@@ -916,7 +824,7 @@ async def handle_rewrite_status(ws, msg: dict) -> None:
     await _send(ws, {"type": "prompt_rewrite_status", **report})
 
 
-# ── journal + executive glue ─────────────────────────────────────────────────
+# ── journal glue ─────────────────────────────────────────────────
 
 def describe(r: dict) -> str:
     if not isinstance(r, dict):
@@ -926,8 +834,9 @@ def describe(r: dict) -> str:
     if r.get("skipped"):
         return f"Prompt rewrite: {r['skipped']}" + (f" at {r['step']}" if r.get("step") else "")
     if r.get("outcome") == "changed":
-        return (f"Prompt rewrite: she chose {r.get('chosen')} over {r.get('candidates', 0) - 1} "
-                f"other(s) and now lives under it ({r.get('prompt_chars', 0)} chars; "
+        return (f"Prompt rewrite: she chose {r.get('chosen')} (T={r.get('temperature')}) over "
+                f"{r.get('candidates', 0) - 1} other(s) and now lives under it "
+                f"({r.get('prompt_chars', 0)} chars; "
                 f"{r.get('consumed', 0)} delta(s) consumed) — {r.get('why', '')}")
     if r.get("outcome") == "stayed":
         return f"Prompt rewrite: she kept her current prompt — {r.get('why', '')}"
@@ -947,30 +856,33 @@ def _selftest() -> None:
         prompts = Path(d) / "prompts"
         state.mkdir()
         worklog.configure(Path(d) / "worklog.jsonl")
-        calls: list[str] = []
-        pick = {"label": "final"}
+        calls: list[dict] = []
+        pick = {"label": "sample_2"}
         preempt_after = {"n": None}
+        cut_draft = {"k": None}
 
         def fake_generate(user, system, **kw):
-            calls.append(system[:24])
+            calls.append({"system": system[:24], "temperature": kw.get("temperature")})
+            fake_generate.last_truncated = False
+            fake_generate.last_loop = False
             if _preempt_requested:
                 return ""
-            if "agreed on" in system:        # the final draft (carries the notes too)
-                return "<think>t</think>\n<new_prompt>FINAL prompt text</new_prompt>"
-            if "AGREED:" in system:
-                return "<think>x</think>\nAGREED:\n- say no plainly\nONLY_SOME:\n- nothing"
             if "CHOICE:" in system:
-                # Find the letter of the wanted candidate in the blind listing.
-                want = {"final": "FINAL", "incumbent": "LIVE PROMPT", "sample_1": "DRAFT-1"}[pick["label"]]
+                # Find the letter of the wanted candidate in the blind listing. sample_2
+                # is the 4th draft call: the 3rd was the one preempted below.
+                want = {"incumbent": "LIVE PROMPT", "sample_2": "DRAFT-4"}[pick["label"]]
                 for block in user.split("=== ")[1:]:
                     letter, _, body = block.partition(" ===")
                     if want in body:
                         return f"<think>hm</think>\nCHOICE: {letter}\nWHY: it settles it"
                 return "CHOICE: Z\nWHY: none"
-            k = sum(1 for c in calls if c == system[:24])
+            k = sum(1 for c in calls if c["system"] == system[:24])
             if preempt_after["n"] is not None and k > preempt_after["n"]:
                 request_preempt()
                 return "<new_prompt>partial"
+            if cut_draft["k"] == k:
+                fake_generate.last_loop = True       # a degeneration halt mid-prompt
+                return "<think>t</think>\n<new_prompt>DRAFT-cut and then and then and"
             return f"<think>t</think>\n<new_prompt>DRAFT-{k} text</new_prompt>"
 
         class _Ev:
@@ -980,22 +892,31 @@ def _selftest() -> None:
             def is_set(self): return self._s
 
         cancel = _Ev()
-        cfg = {"prompt_rewrite": {"enabled": True, "samples": 3, "min_gap_hours": 24}}
+        cfg = {"prompt_rewrite": {"enabled": True, "samples": 3}}
         configure(get_rag=lambda: None, make_sync_reflect_generate=lambda rag: fake_generate,
                   load_base_prompt=lambda: "LIVE PROMPT seed", prompts_dir=prompts,
                   state_dir=state, load_server_config=lambda: cfg, cancel_event=cancel)
         _runtime.model = object()
         try:
-            # settings: temperature list padded/clipped to samples.
+            # settings: the default sweep; a list padded/clipped to samples.
+            assert settings({})["enabled"] is True
+            assert settings({})["temperatures"] == [0.9, 1.0, 1.1, 1.2, 1.3], settings({})
+            assert settings({"prompt_rewrite": {"temperatures": []}})["temperatures"][-1] == 1.3
+            assert settings({"prompt_rewrite": {"samples": 3}})["temperatures"] == [0.9, 1.1, 1.3]
             s = settings({"prompt_rewrite": {"samples": 3, "temperatures": [0.9, 1.2]}})
             assert s["temperatures"] == [0.9, 1.2, 1.2], s
             assert settings({"prompt_rewrite": {"samples": 2, "temperatures": "1.0,1.1,1.4"}})["temperatures"] == [1.0, 1.1]
-            assert settings({})["enabled"] is True and settings({})["temperatures"] == [0.9] * 5
+            # A draft cut before its closing tag is unusable; a closed one survives a cut.
+            assert draft_text("<new_prompt>half a prom", cut=True) == ""
+            assert draft_text("<new_prompt>half a prom", cut=False) == "half a prom"
+            assert draft_text("<new_prompt>whole</new_prompt> tail", cut=True) == "whole"
+            loop = "A paragraph long enough to count as one, about her.\n\nAnother one, long enough as well."
+            assert draft_text(f"<new_prompt>{loop}\n\n{loop}</new_prompt>", cut=True) == ""
+            assert draft_text(f"<new_prompt>{loop}</new_prompt>", cut=True) == loop
 
-            # Gate: disabled / no mature pattern / budget.
-            assert offer(cfg={"prompt_rewrite": {"enabled": False}}).get("reason") == "disabled"
-            assert offer()["reason"] == "no_mature_pattern"
-            # Logged 30 h ago, so an attempt back-dated 25 h still postdates them.
+            # Gate: disabled / no mature pattern / eligible.
+            assert gate(cfg={"prompt_rewrite": {"enabled": False}}).get("reason") == "disabled"
+            assert gate()["reason"] == "no_mature_pattern"
             from datetime import timedelta
             now = (datetime.now(timezone.utc) - timedelta(hours=30)).isoformat()
             for sess in ("a.json", "b.json"):
@@ -1003,7 +924,7 @@ def _selftest() -> None:
                                             "delta": "Say no plainly.", "scope": "line",
                                             "tension_rank": 0.9, "ts": now})
             prompt_patterns.rebuild(state, None)           # ungrouped ⇒ two 1-chat patterns
-            assert offer()["reason"] == "no_mature_pattern"
+            assert gate()["reason"] == "no_mature_pattern"
             # Fake a grouped fold: one mature pattern.
             doc = prompt_patterns.read_patterns(state)
             keys = [p["keys"][0] for p in doc["patterns"]]
@@ -1012,77 +933,73 @@ def _selftest() -> None:
                                 "weighted_recurrence": 2.8, "mature": True}]
             doc["n_mature"] = 1
             prompt_patterns.write_patterns(state, doc)
-            o = offer()
-            assert o["offered"] and o["reason"] == "budget", o
-            assert ACTION in render_offer(o) and "1 mature" in render_offer(o)
+            o = gate()
+            assert o["eligible"] and o["reason"] == "eligible", o
 
-            # Preempt after 2 samples ⇒ resumable event, nothing landed.
+            # Preempt after 2 drafts ⇒ resumable event, nothing landed.
             preempt_after["n"] = 2
             r = run_rewrite_blocking()
             assert r.get("skipped") == "preempted" and r["step"] == "sample_2", r
             ev = _find_in_flight()
-            assert ev and ev["samples_done"] == 2, ev
+            assert ev and ev["samples_done"] == 2 and ev["temperatures"] == [0.9, 1.1, 1.3], ev
             assert prompt_experiment.load_experiment(state) is None
-            o = offer()
-            assert o["reason"] == "continue" and "continue" in render_offer(o).lower(), o
-            # Resume: only the third sample, consensus, final and choice generate.
+            assert gate()["reason"] == "continue"
+            # Resume: only the third draft and the choice generate; the third keeps its T.
             preempt_after["n"] = None
             cancel.clear()
             n_before = len(calls)
             r = run_rewrite_blocking()
-            assert r.get("outcome") == "changed" and r["chosen"] == "final", r
-            assert len(calls) - n_before == 4, len(calls) - n_before
+            assert r.get("outcome") == "changed" and r["chosen"] == "sample_2", r
+            assert len(calls) - n_before == 2, len(calls) - n_before
+            assert calls[n_before]["temperature"] == 1.3 and r["temperature"] == 1.3, (calls, r)
             rec = prompt_experiment.load_experiment(state)
-            assert rec and rec["prompt"] == "FINAL prompt text" and rec["process"].startswith("rewrite:")
+            assert rec and rec["prompt"] == "DRAFT-4 text" and rec["process"].startswith("rewrite:")
             assert rec["base_prompt"] == "LIVE PROMPT seed", rec
             assert _find_in_flight() is None
             attempts = prompt_patterns.read_rewrite_log(state)
             assert attempts[-1]["outcome"] == "changed" and sorted(attempts[-1]["consumed_keys"]) == sorted(keys)
             assert attempts[-1]["worklog_id"] and worklog.open_threads()[-1]["kind"] == WORKLOG_KIND
-            assert set(attempts[-1]["candidates"]) == {"incumbent", "sample_0", "sample_1", "sample_2", "final"}
+            assert set(attempts[-1]["candidates"]) == {"incumbent", "sample_0", "sample_1", "sample_2"}
+            assert attempts[-1]["temperatures"] == {"sample_0": 0.9, "sample_1": 1.1, "sample_2": 1.3}
             # Consumed keys leave the pool: the stale patterns.json still lists the
             # pattern, but the gate reads it as spent.
             assert len(prompt_patterns.unconsumed(state)) == 0
-            assert offer()["reason"] == "no_mature_pattern", offer()
+            assert gate()["reason"] == "no_mature_pattern", gate()
 
-            # A second event 25 h later (on the NEW live prompt) with a fresh delta: she stays.
-            attempts[-1]["ts"] = (datetime.now(timezone.utc).timestamp() - 25 * 3600)
-            attempts[-1]["ts"] = datetime.fromtimestamp(attempts[-1]["ts"], timezone.utc).isoformat()
-            (state / prompt_patterns.REWRITE_LOG_FILE).write_text(
-                "\n".join(json.dumps(a) for a in attempts) + "\n", encoding="utf-8")
+            # The next night, a new mature pattern but nothing reflected since: not eligible.
             doc = prompt_patterns.read_patterns(state)
             doc["patterns"] = [{"id": "pat2", "scope": "line", "delta": "Hold silence.",
                                 "keys": ["k9"], "chats": ["c.json", "d.json"], "recurrences": 2,
                                 "weighted_recurrence": 2.0, "mature": True}]
             prompt_patterns.write_patterns(state, doc)
-            assert offer()["reason"] == "no_new_deltas", offer()
+            assert gate()["reason"] == "no_new_deltas", gate()
             append_prompt_delta(state, {"source_session": "c.json", "exchange_index": 1,
                                         "delta": "Hold silence.", "scope": "line",
                                         "ts": datetime.now(timezone.utc).isoformat()})
-            assert offer()["reason"] == "budget", offer()
+            # No gap: eligible again at once (the night is the housekeeping event's clock).
+            assert gate()["reason"] == "eligible", gate()
+            # She keeps hers; a degenerate draft is dropped from the candidates.
             pick["label"] = "incumbent"
+            cut_draft["k"] = 6        # the draft counter runs on: drafts 5, 6, 7 → sample_1
+            n_before = len(calls)
             r = run_rewrite_blocking()
-            assert r["outcome"] == "stayed" and r["consumed"] == 0, r
-            assert prompt_experiment.load_experiment(state)["prompt"] == "FINAL prompt text"
-            assert prompt_patterns.read_rewrite_log(state)[-1]["consumed_keys"] == []
-            # A declined offer stamps the gap and spends nothing.
-            _record_decline({"reason": "budget", "mature": doc["patterns"]}, "wander")
+            assert r["outcome"] == "stayed" and r["consumed"] == 0 and r["candidates"] == 3, r
+            assert prompt_experiment.load_experiment(state)["prompt"] == "DRAFT-4 text"
             last = prompt_patterns.read_rewrite_log(state)[-1]
-            assert last["outcome"] == "declined" and last["consumed_keys"] == []
-            assert offer()["reason"] == "gap"
+            assert last["consumed_keys"] == [] and "sample_1" not in last["candidates"], last
+            assert gate()["reason"] == "no_new_deltas"
             # The Prompt tab's report: gate chain, budget, the attempts newest-first with
             # their candidates — and it walks past the model check.
             _runtime.model = None
             rep = status_report()
-            assert rep["model_loaded"] is False and rep["gate"]["reason"] == "gap", rep["gate"]
-            assert rep["attempts_total"] == 3 and rep["attempts"][0]["outcome"] == "declined"
-            assert set(rep["attempts"][1]["candidates"]) >= {"incumbent", "final"}
+            assert rep["model_loaded"] is False and rep["gate"]["reason"] == "no_new_deltas", rep["gate"]
+            assert rep["attempts_total"] == 2 and rep["attempts"][0]["outcome"] == "stayed"
+            assert set(rep["attempts"][1]["candidates"]) >= {"incumbent", "sample_2"}
             assert rep["budget"]["n_patterns"] == 1 and rep["settings"]["samples"] == 3
             _runtime.model = object()
             # Parsing: a letter out of range is None; WHY survives.
             assert parse_choice("CHOICE: C\nWHY: because", 2) == (None, "because")
             assert parse_choice("<think>CHOICE: A</think>\nCHOICE: (b)\nWHY: yes", 3)[0] == 1
-            assert parse_consensus("no sections here") == ""
             assert shuffle_candidates([{"text": "1"}, {"text": "2"}], "e") == shuffle_candidates([{"text": "1"}, {"text": "2"}], "e")
         finally:
             _runtime.model = None
@@ -1126,8 +1043,6 @@ def _selftest_revert() -> None:
                         if "DRAFT prompt" in body:
                             return f"CHOICE: {letter}\nWHY: it settles the pull"
                     raise AssertionError("draft missing from choice")
-                if "AGREED:" in system:
-                    return "no consensus"  # keep this test focused on activation
                 if change_at == "sample":
                     entered.set()
                     assert cancel.wait(5), "Revert did not preempt the generation"
@@ -1186,7 +1101,8 @@ def _selftest_revert() -> None:
                     attempt = prompt_patterns.read_rewrite_log(state)[-1]
                     assert attempt["outcome"] == "cancelled" and attempt["consumed_keys"] == []
                     assert len(prompt_patterns.unconsumed(state)) == 2
-                    assert offer()["reason"] == "gap"
+                    # A veto is not a fresh event on the same evidence: nothing new reflected.
+                    assert gate()["reason"] == "no_new_deltas", gate()
                 assert _find_in_flight() is None
                 if change_at == "same_text_edit":
                     assert prompt_experiment.active_experiment_prompt(state) == live

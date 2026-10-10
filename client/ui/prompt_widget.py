@@ -219,17 +219,17 @@ class PromptWidget(QWidget):
         )
         splitter.addWidget(self.txt_log)
 
-        # The autonomous rewrite (core/prompt_rewrite.py): why the `rewrite_prompt` action
-        # is or is not on Ava's menu right now (the currency gate, condition by condition),
-        # the pattern budget, and the last attempts in full — timestamp, outcome, what she
-        # chose, her WHY, and every candidate she was choosing among. Read-only; refreshed
+        # The nightly prompt choice (core/prompt_rewrite.py, a step of core/housekeeping.py):
+        # whether she is eligible tonight (the gate, condition by condition), when the night
+        # runs, the pattern budget, and the last attempts in full — timestamp, outcome, what
+        # she chose, her WHY, and every candidate (with its temperature) she chose among. Read-only; refreshed
         # with the tab, independent of unsaved edits in the prompt box (it never touches it).
         self.txt_rewrite = QPlainTextEdit()
         self.txt_rewrite.setReadOnly(True)
         self.txt_rewrite.setFont(self.text_font)
         self.txt_rewrite.setPlaceholderText(
-            "Autonomous rewrite: the gate's verdict, the pattern budget and the last "
-            "attempts (variants + her choice) load here on Refresh."
+            "Nightly prompt choice: eligibility, the night's schedule, the pattern budget "
+            "and the last attempts (drafts + her choice) load here on Refresh."
         )
         splitter.addWidget(self.txt_rewrite)
 
@@ -434,23 +434,37 @@ class PromptWidget(QWidget):
         st = r.get("settings") or {}
         budget = r.get("budget") or {}
         reason_text = {
-            "budget": "on her menu — a mature pattern funds it",
-            "continue": "on her menu — an interrupted event resumes",
+            "eligible": "she is eligible — a mature pattern funds it",
+            "continue": "an interrupted event resumes",
             "disabled": "prompt_rewrite.enabled is false",
             "no_model": "no model loaded",
             "no_mature_pattern": "no mature pattern (spent ones excluded)",
-            "gap": f"last attempt too recent — {gate.get('gap_hours_left', 0)} h of the "
-                   f"{st.get('min_gap_hours', 24)} h gap left",
             "no_new_deltas": "nothing reflected since the last attempt (no new delta)",
         }.get(gate.get("reason", ""), gate.get("reason", "?"))
-        verdict = "OFFERED" if gate.get("offered") else "NOT OFFERED"
-        lines.append(f"AUTONOMOUS REWRITE — {verdict}: {reason_text}")
+        verdict = "ELIGIBLE" if gate.get("eligible") else "NOT ELIGIBLE"
+        lines.append(f"NIGHTLY PROMPT CHOICE — {verdict}: {reason_text}")
+        night = r.get("night") or {}
+        if night:
+            if not night.get("enabled"):
+                when = "housekeeping.enabled is false"
+            elif night.get("active"):
+                when = f"running now (night {night.get('night')})"
+            elif night.get("finished"):
+                when = (f"night {night.get('night')} done — next from "
+                        f"{self._fmt_ts(night.get('next_start', ''))[:16]}")
+            elif night.get("in_window"):
+                when = (f"night {night.get('night')} open — runs at the next free poll "
+                        f"(window {night.get('window_hours')} h from {night.get('hour', 4):02d}:00)")
+            else:
+                when = f"next night from {self._fmt_ts(night.get('next_start', ''))[:16]}"
+            lines.append(f"  housekeeping: {when}")
+            for step, summary in (night.get("done") or {}).items():
+                lines.append(f"    {step}: {summary}")
         lines.append(
             f"  enabled={'yes' if r.get('enabled') else 'NO'} · "
             f"model={'loaded' if r.get('model_loaded') else 'NOT loaded'} · "
             f"event running={'yes' if r.get('active') else 'no'} · "
-            f"samples={st.get('samples')} @ {st.get('temperatures')} · "
-            f"final={st.get('final_temperature')} · gap={st.get('min_gap_hours')} h · "
+            f"drafts={st.get('samples')} @ T={st.get('temperatures')} · "
             f"order_check={'on' if st.get('order_check') else 'off'}")
         lines.append(
             f"  budget: {budget.get('n_patterns', 0)} pattern(s) in patterns.json "
@@ -464,9 +478,8 @@ class PromptWidget(QWidget):
             ev = gate["in_flight"]
             lines.append(
                 f"  IN FLIGHT: event {ev.get('event_id')} started "
-                f"{self._fmt_ts(ev.get('started_ts', ''))} — {ev.get('samples_done', 0)} draft(s) "
-                f"done, consensus={'yes' if ev.get('consensus') else 'no'}, "
-                f"final={'yes' if ev.get('final') else 'no'}")
+                f"{self._fmt_ts(ev.get('started_ts', ''))} — {ev.get('samples_done', 0)} of "
+                f"{len(ev.get('temperatures') or []) or '?'} draft(s) done")
         pats = budget.get("patterns") or []
         if pats:
             lines.append("  patterns (weight = tension-weighted recurrence over distinct chats):")
@@ -474,8 +487,6 @@ class PromptWidget(QWidget):
                 tag = "MATURE" if p_.get("mature") else "forming"
                 lines.append(f"    - [{p_.get('scope') or '?'}] {tag} w={p_.get('weighted_recurrence')} "
                              f"chats={p_.get('recurrences')}: {(p_.get('delta') or '')[:200]}")
-        if gate.get("offer_line"):
-            lines.append("  the line she would see: " + gate["offer_line"])
 
         attempts = r.get("attempts") or []
         lines.append("")
@@ -507,7 +518,9 @@ class PromptWidget(QWidget):
                     if label not in cands:
                         continue
                     mark = "  ← CHOSEN" if label == a.get("chosen") else ""
-                    lines.append(f"  ===== {label}{mark} =====")
+                    temp = (a.get("temperatures") or {}).get(label)
+                    lines.append(f"  ===== {label}" + (f" (T={temp})" if temp is not None else "")
+                                 + f"{mark} =====")
                     lines.append((cands[label] or "").strip() or "(empty)")
                     lines.append("")
             elif cands:

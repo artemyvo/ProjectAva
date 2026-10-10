@@ -35,7 +35,7 @@ from typing import Callable, Optional, Sequence
 
 # ── per-token signal from one step's raw logits ──────────────────────────────
 
-def step_signals_tensor(logits, target_id=None):
+def step_signals_tensor(logits, target_id=None, softcap=None):
     """(entropy, probability-margin, top2-token-ids, target-prob) on the logits' device.
 
     Kept on-device so a per-token capture loop can defer the GPU->CPU sync to a
@@ -50,10 +50,19 @@ def step_signals_tensor(logits, target_id=None):
     Folded into the same softmax so it costs ~nothing — used to read how strongly
     the model wanted to open a thinking block (e.g. gemma-4's ``<|channel>``) at the
     first generated step.
+
+    `softcap` (optional): the model's final logit softcap (``final_logit_softcapping`` in
+    its config — 30.0 on gemma-4). The capture hooks ``lm_head``, but such a model caps
+    its logits AFTER the head (``cap · tanh(z / cap)``, in the model forward), and that
+    capped distribution is the one the sampler draws from. Applied here so the signals
+    describe the distribution the token was actually drawn from. tanh is monotonic, so
+    `top2_ids` are the same either way; entropy, margin and `target_prob` are not.
     """
     import torch
 
     v = logits.detach().float().reshape(-1)
+    if softcap:
+        v = torch.tanh(v / softcap) * softcap
     logp = torch.log_softmax(v, dim=-1)
     p = logp.exp()
     entropy = -(p * logp).sum()
@@ -63,9 +72,9 @@ def step_signals_tensor(logits, target_id=None):
     return entropy, margin, top2.indices, target_prob
 
 
-def step_signals(logits) -> tuple[float, float]:
+def step_signals(logits, softcap=None) -> tuple[float, float]:
     """(entropy in nats, top1-top2 probability margin in [0,1]) for one logit vector."""
-    entropy, margin, _, _ = step_signals_tensor(logits)
+    entropy, margin, _, _ = step_signals_tensor(logits, softcap=softcap)
     return float(entropy), float(margin)
 
 
@@ -265,8 +274,16 @@ def summarize(
     decode: Optional[Callable[[Sequence[int]], str]] = None,
     top2_ids: Optional[Sequence[Sequence[int]]] = None,
     axes: Optional[dict] = None,
+    logit_softcap: Optional[float] = None,
+    axes_created: Optional[dict] = None,
 ) -> Optional[dict]:
     """Build the `tension` block from the per-token series.
+
+    `logit_softcap` (optional): the final logit softcap the signals were computed under
+    (see `step_signals_tensor`). Stored as ``logit_softcap`` only when one was applied;
+    a block without it was read off the uncapped head — the sampler's distribution for a
+    model with no cap, a sharper one than the sampler's for a pre-2026-10-04 gemma-4
+    block. The two are not comparable, so a consumer that pools series keys on it.
 
     `axes` (optional): per-token projections onto stored hidden-state directions,
     ``{name: [z per token]}`` from `hidden_capture.reduce_capture`, aligned with
@@ -319,6 +336,8 @@ def summarize(
         "model_id": model_id,
         "raw_logits": raw_logits,
     }
+    if logit_softcap:
+        block["logit_softcap"] = float(logit_softcap)
     if token_ids is not None:
         # Full per-token raw series, all aligned with `token_ids` (length n_tokens).
         # The per-segment summary stats and the contested trace above are *derived*
@@ -339,6 +358,10 @@ def summarize(
         block["axes"] = {str(k): [float(x) for x in v] for k, v in axes.items() if v}
         if not block["axes"]:
             del block["axes"]
+        elif axes_created:
+            # Which extraction each series was projected on (the axis file's `created`).
+            block["axes_created"] = {k: str(v) for k, v in axes_created.items()
+                                     if k in block["axes"] and v}
     return block
 
 
@@ -366,3 +389,19 @@ if __name__ == "__main__":
     # A constant series has zero std and must not divide by it.
     assert all(v == 0.0 for v in relief_series([1.5] * 40))
     print("tension relief_series self-test: OK")
+
+    # The final logit softcap (when torch is present): a sharp uncapped head reads as
+    # decided, the capped distribution the sampler draws from does not; top-2 unchanged.
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None:
+        z = torch.full((1000,), 20.0)
+        z[0], z[1] = 50.0, 40.0
+        e_raw, m_raw, t_raw, _ = step_signals_tensor(z)
+        e_cap, m_cap, t_cap, p0 = step_signals_tensor(z, 0, softcap=30.0)
+        assert float(m_raw) > 0.999 and float(m_cap) < 0.9, (float(m_raw), float(m_cap))
+        assert float(e_cap) > float(e_raw) and t_raw.tolist() == t_cap.tolist() == [0, 1]
+        assert abs(float(p0) - float(torch.softmax(torch.tanh(z / 30) * 30, -1)[0])) < 1e-6
+        print("tension softcap self-test: OK")

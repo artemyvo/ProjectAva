@@ -469,7 +469,7 @@ def _train_params_to_args(params: dict) -> list[str]:
 
     The watchdog job runner is semantics-free: it appends this list verbatim to the
     ``train`` job's manifest cmd (``-m training.train_cycle``). So the mapping from
-    ``{lora_r, epochs, lr, model_id, run_id, skip_validation, include_fresh}`` to CLI
+    ``{lora_r, epochs, lr, model_id, run_id, skip_validation, include_fresh, mode}`` to CLI
     flags lives HERE, in the inference server (which git-pulls freely), not in the
     watchdog.
     """
@@ -488,6 +488,10 @@ def _train_params_to_args(params: dict) -> list[str]:
         args += ["--skip-validation"]
     if params.get("include_fresh"):
         args += ["--include-fresh"]
+    # Build mode for this run only (the Sleep tab's one-off "Full train"); absent, the
+    # cycle follows server_config.json `train_mode`.
+    if params.get("mode") in ("full", "incremental"):
+        args += ["--mode", str(params["mode"])]
     return args
 
 
@@ -661,6 +665,74 @@ def _run_stale_reachout_sweep(store, run_id: str, send_event_fn: Optional[Callab
         run_id, "phase_done", phase="stale-reachout",
         message=(f"Removed {len(deleted)} chat(s) Ava opened herself that went unanswered "
                  f"for over {hours:.0f}h: {names}."))
+    if ev and send_event_fn:
+        try:
+            send_event_fn(ev)
+        except Exception:
+            pass
+
+
+def run_stray_latin_sweep(*, model_repair: bool = False) -> dict:
+    """Repair stray Latin capitals glued onto Cyrillic words across the live corpus.
+
+    The **policy** half of ``core/stray_latin.sweep``, shared by the Sleep run's head phase
+    (:func:`_run_stray_latin_sweep`, *model_repair* on) and the background wake (word-final
+    deletion only, GPU-free): the knobs, the live session's exemption, and the chat-RAG
+    re-embed when a transcript changed. *model_repair* restores a mid-word glue with a
+    short thinking-off pass on the loaded model — the caller must hold the GPU (a Sleep run
+    on the executor thread). Best-effort: returns ``{}`` when off or on failure."""
+    cfg = ((_load_server_config() if _load_server_config else None) or {}).get("stray_latin") or {}
+    if not bool(cfg.get("sweep", True)):
+        return {}
+    from core import stray_latin
+
+    exclude = set()
+    try:
+        lg = _session.logger
+        if lg is not None and lg.current_file is not None:
+            exclude.add(lg.current_file.name)
+    except Exception:
+        pass
+
+    repair_word_fn = None
+    if model_repair and bool(cfg.get("model_repair", True)) and _runtime.model is not None:
+        from core.ask_judge import make_backend_generate_fn
+        context = max(int(_runtime.context_length or 0),
+                      int(_runtime.reflect_context_length or 0)) or 8192
+        repair_word_fn = stray_latin.make_repair_word_fn(make_backend_generate_fn(
+            _backend, lambda: _runtime.model, lambda: _runtime.tokenizer,
+            str(_runtime.model_id or ""), context))
+    try:
+        report = stray_latin.sweep(_CHATS_DIR, exclude=exclude, repair_word_fn=repair_word_fn,
+                                   log=lambda m: print(m, flush=True))
+    except Exception:
+        traceback.print_exc()
+        return {}
+    if report.get("changed_transcripts"):
+        try:
+            _get_rag().refresh_chat_index()
+        except Exception:
+            traceback.print_exc()
+    return report
+
+
+def _run_stray_latin_sweep(store, run_id: str, send_event_fn: Optional[Callable]) -> None:
+    """The stray-Latin sweep at the head of a Sleep run, with the mid-word model repair,
+    reported as a ``stray-latin`` phase event. Before the revisit head-phase and the
+    per-session passes, so the revision pass re-reads clean text and the targets this run
+    keeps start clean (``write_verdict`` repairs the word-final ones it writes)."""
+    report = run_stray_latin_sweep(model_repair=True)
+    if not report.get("sessions") and not report.get("left"):
+        return
+    fixed = report.get("fixed") or []
+    left = report.get("left") or []
+    msg = (f"Stray Latin repaired in {len(report['sessions'])} chat(s): "
+           f"{report.get('exchanges', 0)} exchange(s), {report.get('targets', 0)} target(s); "
+           f"{report.get('deleted', 0)} deleted, {len(fixed)} word(s) restored"
+           + (f" ({', '.join(f'{a} → {b}' for a, b in fixed[:4])})" if fixed else "")
+           + (f"; {len(left)} left as stored (the build quarantines them): "
+              + "; ".join(left[:3]) if left else "") + ".")
+    ev = store.append_event(run_id, "phase_done", phase="stray-latin", message=msg)
     if ev and send_event_fn:
         try:
             send_event_fn(ev)
@@ -1502,15 +1574,31 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
             tally = cj.run(sidecar=sidecar, judge=judge, key=key, limit=cj.policy()["sleep_max"],
                            say=say, should_stop=should_stop)
             # ...and the [persona] statements of every gated exchange (P7), withheld, and the
-            # ones a lifted gate had withheld, restored: staged with the run.
+            # ones a lifted gate had withheld, restored: staged with the run. The staged ledger
+            # holds only the run's ops, so a restore re-registers from the live ledger's fold.
+            live_fold = ConsolidationLedger(_CONSOLIDATION_DIR).fold() if _CONSOLIDATION_DIR else None
             tally.update(cj.sync_persona(sidecar, memory_dirs, writer=writer,
                                          ledger=ConsolidationLedger(consolidation_dir),
-                                         run_id=run_id, say=say))
+                                         ledger_fold=live_fold, run_id=run_id, say=say))
+            # ...and the stored reply behind each revised target, graded by the same judge into
+            # its own store: the capture probe's label, never a gate (cj.run_originals). Before
+            # the shadow step, so its log carries the stored reply's grade.
+            from core import ask_judge as aj
+            from core import capture_probe as cp
+            if key and judge is not None and cp.originals_enabled():
+                try:
+                    _okey, ojudge = cj.make_originals_judge_fn(
+                        backend=_backend, runtime=_runtime, live_chats_dir=_CHATS_DIR,
+                        prompts_dir=_PROMPTS_DIR, run_id=run_id, runner="sleep")
+                    tally.update(cj.run_originals(sidecar=sidecar, judge=ojudge, key=key,
+                                                  limit=cp.policy()["sleep_max"], say=say,
+                                                  should_stop=should_stop))
+                except Exception as e:  # noqa: BLE001 — a label lost, never the gate's work
+                    say(f"capture judge, stored replies: {type(e).__name__}: {e}; nothing graded")
+                    tally["original_error"] += 1
             # ...and the capture probe's shadow reading (§4.5): the base's state before each
             # newly graded pushback reply, stored, and every frozen probe's score beside the
             # verdict. An instrument record (core/capture_probe.py, P3): nothing reads it.
-            from core import ask_judge as aj
-            from core import capture_probe as cp
             if key and cp.shadow_enabled():
                 try:
                     tally.update(cp.run_shadow(
@@ -1530,6 +1618,52 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
             return tally
 
         return _gate
+
+    def _make_thought_hygiene_fn():
+        """Thought hygiene for the clean-base batch (``core/thought_hygiene.py``), or None when
+        ``thought_hygiene.enabled`` is off. Called inside the batch, so the judge reads the
+        swapped-in base. Cuts go through the run's sidecar (staged); verdicts to the store
+        beside the live chats dir."""
+        from core import thought_hygiene as th
+        if not th.enabled() or th.policy()["sleep_max"] <= 0:
+            return None
+
+        def _hygiene(*, sidecar, run_id, say, should_stop):
+            try:
+                key, judge = th.make_judge_fn(backend=_backend, runtime=_runtime, prompts_dir=_PROMPTS_DIR,
+                                              run_id=run_id, runner="sleep")
+            except FileNotFoundError as e:
+                say(f"thought hygiene: {e} — nothing read")
+                return {}
+            return th.run(sidecar=sidecar, judge=judge, key=key, prompts_dir=_PROMPTS_DIR,
+                          live_chats_dir=_CHATS_DIR, limit=th.policy()["sleep_max"], say=say,
+                          should_stop=should_stop)
+
+        return _hygiene
+
+    def _make_persona_hygiene_fn():
+        """Persona hygiene for the clean-base batch (``core/persona_hygiene.py``), or None when
+        ``persona_hygiene.enabled`` is off. Called inside the batch, so the judge reads the
+        swapped-in base. Supersedes go through the run's writer and ledger (staged); a restore
+        reads the anchor from the live ledger; verdicts to the store beside the live chats dir."""
+        from core import persona_hygiene as ph
+        if not ph.enabled():
+            return None
+
+        def _hygiene(*, writer, consolidation_dir, memory_dirs, run_id, say, should_stop):
+            from training.ledger import ConsolidationLedger
+            try:
+                key, judge = ph.make_judge_fn(backend=_backend, runtime=_runtime, prompts_dir=_PROMPTS_DIR,
+                                              run_id=run_id, runner="sleep")
+            except FileNotFoundError as e:
+                say(f"persona hygiene: {e} — nothing read")
+                return {}, []
+            live_fold = ConsolidationLedger(_CONSOLIDATION_DIR).fold() if _CONSOLIDATION_DIR else None
+            return ph.run(memory_dirs=memory_dirs, judge=judge, key=key, store=ph.store_path(_CHATS_DIR),
+                          writer=writer, ledger=ConsolidationLedger(consolidation_dir), ledger_fold=live_fold,
+                          run_id=run_id, limit=ph.policy()["sleep_max"], say=say, should_stop=should_stop)
+
+        return _hygiene
 
     def _make_reset_conversations_fn():
         """The context-reset test's conversations for the positions waiting on it
@@ -1564,6 +1698,23 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                                      should_stop=should_stop)
 
         return _children
+
+    def _make_aspiration_fn():
+        """What she wants to become (``core/aspiration.py``, §4.10) for the step after the child
+        ask, on the ADAPTER — or None when it is off or has nothing it may do."""
+        from core import aspiration as asp
+        pol = asp.policy()
+        if (not asp.enabled() or (pol["review_max"] <= 0 and pol["new_max"] <= 0)
+                or _make_sync_reflect_generate is None):
+            return None
+
+        def _aspire(*, writer, memory_dirs, run_id, say, should_stop):
+            generate = asp.make_generate(_make_sync_reflect_generate, _get_rag() if _get_rag else None)
+            return asp.sleep_step(memory_dirs=memory_dirs, chats_dir=_CHATS_DIR, prompts_dir=_PROMPTS_DIR,
+                                  persona_dir=_DATA_DIR / "hot" / "persona", writer=writer, generate_fn=generate,
+                                  run_id=run_id, say=say, should_stop=should_stop)
+
+        return _aspire
 
     def _consume_pending_clean_base(filename: str) -> dict:
         # Two-stage freeze — stage two: LOAD the clean-base job payloads the background
@@ -1662,6 +1813,26 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
             if not revisit:
                 try:
                     _run_stale_reachout_sweep(store, run_id, _send_event_fn)
+                except Exception:
+                    traceback.print_exc()
+            # Stray-Latin sweep: repair the glitch "болееC стабильную" in the live
+            # transcripts and targets (mid-word glue restored on the loaded model) before
+            # anything re-reads them. Corpus maintenance like the stale sweep, so a revisit
+            # run is exempt, and a dry run writes nothing live.
+            if not revisit and not (dry_run or dry_full):
+                try:
+                    _run_stray_latin_sweep(store, run_id, _send_event_fn)
+                except Exception:
+                    traceback.print_exc()
+            # The analytic-register monitor (core/register_monitor.py): one line per run,
+            # read-only, gates nothing — the drift is watched, never trained against.
+            if not revisit:
+                try:
+                    from core import register_monitor
+                    ev = store.append_event(run_id, "phase_done", phase="register",
+                                            message=register_monitor.summary_line(_CHATS_DIR))
+                    if ev and _send_event_fn:
+                        _send_event_fn(ev)
                 except Exception:
                     traceback.print_exc()
             # Revisit head-phase: on a normal run, first re-derive ONE aged chat and
@@ -1803,9 +1974,18 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                     # ...and the capture gate: the frozen base grades the training targets it
                     # has not graded, last in that batch (P3: a judge gates training).
                     capture_gate_fn=_make_capture_gate_fn(),
+                    # ...and just before it, thought hygiene: the lines of each target's thought
+                    # that only recite her description are cut from what trains.
+                    thought_hygiene_fn=_make_thought_hygiene_fn(),
+                    # ...and before the persona digest is grouped, persona hygiene: a
+                    # [persona] statement that describes a habit of hers is withheld.
+                    persona_hygiene_fn=_make_persona_hygiene_fn(),
                     # ...and after that batch, on the adapter: the child ask, the question an
                     # accepted closure that rejected its question's terms leaves open (§3.4).
                     child_ask_fn=_make_child_ask_fn(),
+                    # ...and what she wants to become: her self-review of her portrait and the
+                    # aspirations she writes from a habit she caught herself in (phase 1).
+                    aspiration_fn=_make_aspiration_fn(),
                     # The runner is one stage of this lifecycle; THIS function owns the
                     # terminal status (merge / commit / persona / train still follow).
                     finalize=False,
