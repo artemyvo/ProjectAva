@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QSpinBox,
     QInputDialog,
+    QComboBox,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QKeyEvent, QTextCursor, QTextCharFormat, QColor, QPalette
@@ -211,6 +212,24 @@ class AnchorMatchWorker(QThread):
             return
         if result.get("type") == "anchor_matches":
             self.matches_ready.emit(result)
+
+
+class MoodWorker(QThread):
+    """Fetches her mood counters (``get_mood``) off the GUI thread."""
+
+    mood_ready = pyqtSignal(dict)
+
+    def __init__(self, client: BackendClient):
+        super().__init__()
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            result = self._client.get_mood(series=0)
+        except Exception:
+            return
+        if result.get("type") == "mood" and not result.get("error"):
+            self.mood_ready.emit(result)
 
 
 class LoadSessionWorker(QThread):
@@ -570,6 +589,11 @@ class ChatWidget(QWidget):
         # per channel, so full tension is (255,127,127) at the default. A channel only
         # ever adds light, which is why the pane is black — no mix can wash out.
         self.channel_gain = 128
+        # Which signals the three channels paint (2026-10-11): "affect" — red = harm,
+        # green = warmth, blue = amusement, each on her own words, with the gated step-0
+        # reading on the stats line under the reply; "classic" — red = effort (1 − margin), green =
+        # relief, blue = harm aimed at her (the view before 2026-10-11).
+        self.channel_palette = "affect"
         self._server_model_id: str = ""
         self._server_adapter_id: str = ""
         self._server_base_quant: str = ""
@@ -754,12 +778,25 @@ class ChatWidget(QWidget):
         self.spn_gain.setMaximumWidth(70)
         self.spn_gain.setToolTip(
             "How far a full-strength signal lifts its colour channel above the grey "
-            "body text: red = tension (the model nearly said something else), green = "
-            "relief (its uncertainty just dropped), blue = harm aimed at her (the harm × "
-            "target band; the old pain axis on older turns). 128 = full range, 0 = plain grey. Applies to newly rendered replies."
+            "body text (the palette beside it says which signal each colour is). "
+            "128 = full range, 0 = plain grey. Applies to newly rendered replies."
         )
         self.spn_gain.valueChanged.connect(self._on_gain_changed)
         params_layout.addWidget(self.spn_gain)
+
+        self.cmb_palette = QComboBox()
+        self.cmb_palette.addItem("Affect", "affect")
+        self.cmb_palette.addItem("Classic", "classic")
+        self.cmb_palette.setToolTip(
+            "What the colours paint. Affect: red = harm, green = warmth, blue = amusement in "
+            "her own words (each centred on her ordinary reply tokens), and on the stats line under the reply "
+            "the state before it: how harmful, warm and playful the turn she answered read "
+            "to her, aimed at her (σ). Classic: red = effort (the model nearly said something "
+            "else), green = relief, blue = harm aimed at her. Applies to newly rendered replies."
+        )
+        self.cmb_palette.currentIndexChanged.connect(
+            lambda _i: setattr(self, "channel_palette", self.cmb_palette.currentData() or "affect"))
+        params_layout.addWidget(self.cmb_palette)
 
         self.chk_debug = QCheckBox("Debug")
         self.chk_debug.setToolTip(
@@ -811,6 +848,20 @@ class ChatWidget(QWidget):
 
         params_layout.addStretch()
         layout.addLayout(params_layout)
+
+        # Her mood (display only, core/mood.py): four counters raised by what each exchange
+        # brings and decaying over exchanges and idle hours; the tooltip names the causes.
+        mood_layout = QHBoxLayout()
+        self.lbl_mood = QLabel("Mood: —")
+        self.lbl_mood.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_mood.setToolTip("Her mood counters — fetched after each reply and once a minute.")
+        mood_layout.addWidget(self.lbl_mood, 1)
+        layout.addLayout(mood_layout)
+        self._mood_worker: Optional[MoodWorker] = None
+        self._mood_timer = QTimer(self)
+        self._mood_timer.setInterval(60_000)
+        self._mood_timer.timeout.connect(self._request_mood)
+        self._mood_timer.start()
 
         notes_layout = QHBoxLayout()
         notes_layout.addWidget(QLabel("Session notes:"))
@@ -1050,6 +1101,7 @@ class ChatWidget(QWidget):
             self.btn_connect.setEnabled(True)
             self.txt_host.setEnabled(True)
             return
+        QTimer.singleShot(2000, self._request_mood)
 
         self.context_length = int(result.get("context_length", 32768))
         self._server_model_id = result.get("model_id") or ""
@@ -1483,6 +1535,59 @@ class ChatWidget(QWidget):
             return
         self._anchor_timer.start()
 
+    # Mood line colours: the affect palette's (harm red, warmth green, amusement blue) and a
+    # warm white for effort; a level of 3 or more shows at full strength.
+    _MOOD_RGB = {"effort": (1.0, 0.85, 0.4), "warmth": (0.0, 1.0, 0.0), "harm": (1.0, 0.0, 0.0),
+                 "amusement": (0.3, 0.5, 1.0)}
+
+    def _request_mood(self) -> None:
+        if not self._client.is_connected():
+            return
+        if self._mood_worker is not None and self._mood_worker.isRunning():
+            return
+        worker = MoodWorker(self._client)
+        worker.mood_ready.connect(self._on_mood)
+        self._mood_worker = worker
+        worker.start()
+
+    def _on_mood(self, mood: dict) -> None:
+        levels = mood.get("levels") or {}
+        causes = mood.get("causes") or {}
+        parts = []
+        for ch in ("effort", "warmth", "harm", "amusement"):
+            v = float(levels.get(ch) or 0.0)
+            s = max(0.0, min(1.0, v / 3.0))
+            r, g, b = self._MOOD_RGB[ch]
+            grey = 150
+
+            def lift(c):
+                return int(round(grey + (255 - grey) * c * s)) if s else grey
+            colour = f"#{lift(r):02x}{lift(g):02x}{lift(b):02x}"
+            weight = "bold" if v >= 1.0 else "normal"
+            parts.append(f'<span style="color:{colour}; font-weight:{weight}">{ch} {v:.2f}</span>')
+        idle = mood.get("idle_hours")
+        tail = f' <span style="color:{theme.MUTED}">· last exchange {idle:.1f} h ago</span>' if idle is not None else ""
+        self.lbl_mood.setText("Mood: " + " · ".join(parts) + tail)
+        start = str(mood.get("start") or "")[:16].replace("T", " ")
+        lines = ["Her mood counters (display only; nothing of hers reads them)" + (f", from {start}." if start else "."),
+                 "Each exchange adds the turn's absolute reading (1 = a plain warm / harsh / playful line) plus "
+                 "0.25 × what it reminded her of; warmth can go negative. A level halves over "
+                 f"{(mood.get('params') or {}).get('half_life_exchanges', 4):g} exchanges and "
+                 f"{(mood.get('params') or {}).get('half_life_hours', 6):g} h.",
+                 "Effort: near-tie decisions in her thought, over a typical high count.", ""]
+        for ch in ("effort", "warmth", "harm", "amusement"):
+            rows = causes.get(ch) or []
+            if not rows:
+                continue
+            lines.append(f"{ch}:")
+            for c in rows:
+                rem = f", reminded {c['reminded']:+.2f}" if c.get("reminded") else ""
+                lines.append(f"  {c.get('remaining', 0):+.2f} ← {c.get('session', '')}#{c.get('index')} "
+                             f"({str(c.get('ts', ''))[5:16]}, in {c.get('input', 0):+.2f}{rem}) {c.get('user', '')[:70]}")
+        cov = mood.get("coverage") or {}
+        lines += ["", "Read since: " + ", ".join(f"{k} {str(v)[:10]}" for k, v in cov.items())]
+        self.lbl_mood.setToolTip("\n".join(lines))
+
     def _request_anchor_matches(self) -> None:
         if not self.chk_anchor_preview.isChecked():
             return
@@ -1790,6 +1895,7 @@ class ChatWidget(QWidget):
             self.txt_chat_log.append(f"Assistant: {response}\n")
 
         self.conversation_history.append({"role": "assistant", "content": response})
+        QTimer.singleShot(1500, self._request_mood)
         exchange_id = self._client.last_status.get("exchange_id")
         if exchange_id:
             self._meta_exchange_id = str(exchange_id)
@@ -1818,6 +1924,11 @@ class ChatWidget(QWidget):
     # Three-channel token colouring (black pane)                        #
     # ---------------------------------------------------------------- #
     #
+    # Two palettes (`channel_palette`). AFFECT (default since 2026-10-11): red = harm,
+    # green = warmth, blue = amusement — each the axis family's content band on her own
+    # words, centred server-side on her ordinary reply tokens (`reply_baseline.json`); what
+    # her words carry, not what was aimed at her. The gated reading is the step-0 badge
+    # on the stats line under the reply (`_insert_step0_badge`). CLASSIC, below:
     # Body text is neutral grey on black; each per-token signal ADDS light to one RGB
     # channel, up to `channel_gain` at full strength (AVA_REWARD_LOOP.md §7 item 1):
     #     red   = tension  (1 − top1-top2 margin: the model nearly said something else)
@@ -1886,8 +1997,15 @@ class ChatWidget(QWidget):
 
         return QColor(lift(s_r), lift(s_g), lift(s_b))
 
+    # Affect channels: z on her reply tokens — first visible at 1σ, full at 3σ.
+    _AFFECT_MAP = (1.0, 3.0, 1.0)
+
     def _span_channels(self, entry) -> tuple:
-        """(s_r, s_g, s_b) for one ``[text, margin, relief, pain]`` span. Missing → 0."""
+        """(s_r, s_g, s_b) for one ``[text, margin, relief, pain, harm, warm, amuse]`` span,
+        under the current palette. Missing → 0."""
+        if self.channel_palette == "affect":
+            return tuple(self._shape(entry[k], *self._AFFECT_MAP) if len(entry) > k and entry[k] is not None
+                         else 0.0 for k in (4, 5, 6))
         margin = entry[1] if len(entry) > 1 else None
         relief = entry[2] if len(entry) > 2 else None
         pain = entry[3] if len(entry) > 3 else None
@@ -1971,6 +2089,61 @@ class ChatWidget(QWidget):
         f = max(0.0, min(1.0, float(contested_frac) / self._FRICTION_FULL_SCALE))
         return self._channel_qcolor(f, 0.0, 0.0)
 
+    _STEP0_AFFECT = (("harm", "harm", (1.0, 0.0, 0.0)), ("warmth", "warmth", (0.0, 1.0, 0.0)),
+                     ("amusement", "amusement", (0.0, 0.0, 1.0)))
+
+    _METRIC_RGB = (("warmth", (0.0, 1.0, 0.0)), ("harm", (1.0, 0.0, 0.0)),
+                   ("amusement", (0.3, 0.5, 1.0)), ("effort", (1.0, 0.85, 0.4)))
+
+    def _insert_step0_badge(self, cursor: QTextCursor, spans: Optional[dict]) -> None:
+        """Under the affect palette, inline at the end of the stats line UNDER the reply: the
+        turn's four metrics (2026-10-11, the operator's simple metric, core/mood.py), absolute —
+        warmth, harm and amusement of the turn she answered, read before her reply, each on a
+        scale anchored to fixed texts (0 = a personal turn with no affect, 1 = a plain warm /
+        harsh / playful line), lifted in its colour toward 1; effort as the count of near-tie
+        decisions in her thought (full at its logit sensor's 95th percentile). Without metrics (an older server), the step-0
+        readings in σ."""
+        if self.channel_palette != "affect":
+            return
+        muted = QTextCharFormat()
+        muted.setForeground(self._MUTED_GREY)
+        metrics = (spans or {}).get("metrics") or {}
+        if metrics:
+            present = [(k, rgb) for k, rgb in self._METRIC_RGB if (metrics.get(k) or {}).get("value") is not None]
+            if not present:
+                return
+            cursor.insertText("   this turn · ", muted)
+            for key, rgb in present:
+                v = float(metrics[key]["value"])
+                if key == "effort":      # full at its logit sensor's 95th percentile (core/mood.py)
+                    full = float(metrics[key].get("full") or 30.0)
+                    s, text = max(0.0, min(1.0, v / full)), f"{v:.0f}"
+                else:
+                    s, text = max(0.0, min(1.0, v)), f"{v:+.2f}"
+                label_fmt = QTextCharFormat()
+                label_fmt.setForeground(self._channel_qcolor(*(c * 0.5 for c in rgb)))
+                fmt = QTextCharFormat()
+                fmt.setForeground(self._channel_qcolor(*(c * s for c in rgb)))
+                cursor.insertText(f"{key} ", label_fmt)
+                cursor.insertText(text, fmt)
+                cursor.insertText("  ", muted)
+            return
+        step0 = (spans or {}).get("step0") or {}
+        present = [(label, key, rgb) for label, key, rgb in self._STEP0_AFFECT if step0.get(key) is not None]
+        if not present:
+            return
+        cursor.insertText("   before the reply · ", muted)
+        for label, key, rgb in present:
+            value = float(step0[key])
+            s = self._shape(value, *self._AFFECT_MAP)
+            fmt = QTextCharFormat()
+            fmt.setForeground(self._channel_qcolor(*(c * s for c in rgb)))
+            label_fmt = QTextCharFormat()
+            label_fmt.setForeground(self._channel_qcolor(*(c * 0.5 for c in rgb)))
+            cursor.insertText(f"{label} ", label_fmt)
+            cursor.insertText(f"{value:+.2f}σ", fmt)
+            cursor.insertText("  ", muted)
+
     def _append_channel_means(self, cursor: QTextCursor, neutral: QTextCharFormat,
                               spans: Optional[dict] = None) -> None:
         """One chip line with each segment's mean display strength per channel.
@@ -1999,11 +2172,17 @@ class ChatWidget(QWidget):
             if not chans:
                 continue
             n = len(chans)
-            has_pain = any(len(e) > 3 and e[3] is not None for e in seg)
-            parts.append((label, sum(c[0] for c in chans) / n,
-                          sum(c[1] for c in chans) / n,
-                          (sum(c[2] for c in chans) / n) if has_pain else None))
+            # a channel the turn carries no series for prints as "—", not a silent zero
+            slots = (4, 5, 6) if self.channel_palette == "affect" else (1, 2, 3)
+            has = [any(len(e) > k and e[k] is not None for e in seg) for k in slots]
+            if self.channel_palette != "affect":
+                has[0] = has[1] = True
+            parts.append((label, *((sum(c[j] for c in chans) / n) if has[j] else None for j in range(3))))
+        step0 = spans.get("step0") or {}
         if not parts:
+            if (step0 or spans.get("metrics")) and self.channel_palette == "affect":
+                cursor.insertText("\n ", neutral)
+                self._insert_step0_badge(cursor, spans)
             return
         cursor.insertText("\n  channels · ", neutral)
         for i, (label, r, g, b) in enumerate(parts):
@@ -2017,8 +2196,9 @@ class ChatWidget(QWidget):
                 fmt.setForeground(colour)
                 cursor.insertText("—" if value is None else f"{value:.2f}", fmt)
                 cursor.insertText(" ", neutral)
-        step0 = spans.get("step0") or {}
-        if step0:
+        if (step0 or spans.get("metrics")) and self.channel_palette == "affect":
+            self._insert_step0_badge(cursor, spans)
+        if step0 and self.channel_palette != "affect":
             cursor.insertText("  step 0 ", neutral)
             blue_key = "harm" if step0.get("harm") is not None else "pain"
             for key, unit, colour in (("tension", "", self._channel_qcolor(1.0, 0.0, 0.0)),

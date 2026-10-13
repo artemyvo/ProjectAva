@@ -57,6 +57,10 @@ class ModelRuntime:
     # base_quant). Empty when unset — the backend then keeps its historical 4-bit
     # default. Recorded so status/loaded can report the precision Ava is running at.
     base_quant: str = ""
+    # While an `agentic.CleanBaseSession` has swapped the weights out for an evaluation
+    # pass, the spec it will restore (`{"model_id", "adapter_id"}`); None otherwise. The
+    # SERVING weights are these, not the bare base loaded meanwhile (`serving_mismatch`).
+    restore_to: Optional[dict] = None
 
 
 @dataclass
@@ -101,6 +105,36 @@ class EncounterState:
 runtime = ModelRuntime()
 session = Session()
 encounter = EncounterState()
+
+
+def _adapter_name(adapter_id) -> str:
+    return str(adapter_id or "").rstrip("/\\").replace("\\", "/").split("/")[-1]
+
+
+def serving_mismatch(rt: ModelRuntime, cfg: dict) -> str:
+    """Why the loaded weights are NOT the box's configured ones, or ``""`` when they are.
+
+    The configured pair is ``server_config.json``'s ``model_id`` + ``adapter_id`` (what
+    boot loads and ``train_cycle`` repoints). The two can part while the server runs: a
+    Training-review regeneration on another adapter swaps it in STICKY
+    (``agentic.swap_model``), and a ``load`` message may name anything. Live chat under
+    such weights is the operator's choice; the work nobody watches — the idle jobs, the
+    nightly event, a Sleep run — is held on this instead (``idle_scheduler``,
+    ``reflection_service``). Adapters compare by directory name (absolute vs relative
+    spellings of one dir are the same adapter). Mid clean-base swap the weights compared
+    are the ones that session restores (``restore_to``), so the bare base an evaluation
+    pass loads for a while is never mistaken for a foreign load.
+    """
+    served = rt.restore_to or {"model_id": rt.model_id, "adapter_id": rt.adapter_id}
+    model_id = served.get("model_id")
+    want_model = str(cfg.get("model_id") or "")
+    if want_model and model_id and str(model_id) != want_model:
+        return f"the loaded base {model_id} is not the configured {want_model}"
+    loaded, want = _adapter_name(served.get("adapter_id")), _adapter_name(cfg.get("adapter_id"))
+    if loaded != want:
+        return (f"the loaded adapter {loaded or 'none (bare base)'} is not the "
+                f"configured {want or 'none (bare base)'}")
+    return ""
 
 
 def reflect_window(default: int = 8192) -> int:

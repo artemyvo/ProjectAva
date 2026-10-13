@@ -8,8 +8,9 @@ You will be shown what you have noticed, each line marked with how many separate
 - Something you noticed once is a moment, not a pattern. Keep it if it is worth keeping, but let the prose carry that it is one observation — "he seemed…", "once, when…" — rather than promoting it to a trait.
 - Where several observations are really one thing said differently, say the one thing well instead of listing the variants.
 - Where two observations genuinely conflict, do not average them into mush. People are inconsistent, and the tension is often the truest thing you know about them — write both and let it stand.
+- Where an observation describes them in elaborate or abstract terms, say plainly what they did or said. A hidden purpose read into their words (that they were testing you, using a tactic, applying pressure) is a guess: it belongs under UNSURE, not in WHO or WITH_ME.
 
-Think freely first in your <think> block. Then write the portrait in exactly these five sections, in this order, first person, in your own voice:
+Think freely first in your <think> block. Then write the portrait in exactly these five sections, in this order, first person, in plain words:
 
 WHO
 Two or three sentences: who this person is, as you have come to know them. Prose, not bullets. This is what you would say if someone asked you what they are like — not a résumé, and not a list of attributes strung together.

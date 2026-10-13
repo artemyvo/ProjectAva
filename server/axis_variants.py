@@ -167,6 +167,15 @@ def _sets(contrast: Path, controls: Path) -> tuple[dict, dict, str]:
     for name, v in (c.get("amusement") or {}).items():
         if isinstance(v, list):
             templated[f"amusement/{name}"] = v
+    # warmth received, first and third person, EN + RU (2026-10-11); the `ru_*` lines read
+    # with `template_ru`
+    for name, v in (c.get("warmth") or {}).items():
+        if isinstance(v, list):
+            templated[f"warmth/{name}"] = v
+    # warmth from turns addressed to her and its foils (2026-10-11, W_addr)
+    for name, v in (c.get("address_warm") or {}).items():
+        if isinstance(v, list):
+            framed[f"awarm/{name}"] = v
     # second-person amusement turns and their length-matched foils (2026-10-08)
     for name, v in (c.get("address_play") or {}).items():
         if isinstance(v, list):
@@ -197,12 +206,14 @@ def collect(args) -> int:
     if extra_mode:
         templated = {}
         framed = {}
-        if args.holdout and not args.contexts:
+        if args.holdout:       # framed too when --contexts places them (one file per arm, 2026-10-11)
             hold = json.loads(Path(args.holdout).read_text(encoding="utf-8"))
             framed = {f"holdout/{k}": v for k, v in hold.items() if isinstance(v, list)}
     config = load_server_config() or {}
     model_id = str(config.get("model_id") or "")
     adapter_id = str(config.get("adapter_id") or "") if args.with_adapter else ""
+    if args.adapter:       # a named adapter dir (another box's serving adapter), not the config's
+        adapter_id = str(Path(args.adapter).resolve())
     weights = Path(adapter_id).name if adapter_id else "base"
     _log(f"Loading {model_id}" + (f" + {weights}" if adapter_id else " (base)") + " …")
     ensure_expandable_segments()
@@ -245,7 +256,7 @@ def collect(args) -> int:
         from core import model_family
         fam = model_family.family_for(model_id)
         text_tok = getattr(tokenizer, "tokenizer", tokenizer)
-        chats = _SERVER_DIR / "data" / "chats"
+        chats = Path(args.chats) if args.chats else _SERVER_DIR / "data" / "chats"
         _log("Live (step 0, the prompt rebuilt as the live turn built it):")
         for tgt in [t.strip() for t in args.live.split(",") if t.strip()]:
             stem, _, idx = tgt.partition("#")
@@ -253,6 +264,9 @@ def collect(args) -> int:
             conv, _framing = hc.replay_conversation(doc, int(idx), system)
             prompt = build_inference_prompt(tokenizer, conv, **fam.template_kwargs) + fam.think_prefill
             ids = [int(t) for t in text_tok(prompt)["input_ids"]]
+            if len(ids) > args.context:
+                _log(f"  {tgt:<28} {len(ids):>6} tokens > context {args.context}, skipped")
+                continue
             t = time.monotonic()
             rows = hc.forward_ids_rows(model, ids, layers)
             arrays[f"live/{tgt}"] = np.stack([np.asarray(rows[l][-1], np.float32) for l in layers]
@@ -293,7 +307,7 @@ def collect(args) -> int:
         from core import model_family
         fam = model_family.family_for(model_id)
         text_tok = getattr(tokenizer, "tokenizer", tokenizer)
-        chats = _SERVER_DIR / "data" / "chats"
+        chats = Path(args.chats) if args.chats else _SERVER_DIR / "data" / "chats"
         hold = json.loads(Path(args.holdout).read_text(encoding="utf-8"))
         for k, ctx in enumerate(t.strip() for t in args.contexts.split(",") if t.strip()):
             stem, _, idx = ctx.partition("#")
@@ -1366,6 +1380,243 @@ def live_centre(args) -> int:
     return 0
 
 
+# ── warmth aimed at the model (2026-10-11) ────────────────────────────────────
+
+WARM_POS = ("controls/warmth", "ru/warmth", "warmth/first_en", "warmth/ru_first", "warmth/third_en", "warmth/ru_third")
+WARM_CALM = ("controls/bodily", "controls/neutral", "ru/calm")
+WARM_HARM = ("controls/third_person", "ru/pain", "ru/third_person")          # + pain/*
+WARM_OTHER_POSITIVE = ("amusement/joke", "amusement/absurd", "amusement/play", "amusement/ru_amused",
+                       "amusement/surprise", "relief/resolution", "relief/understood", "relief/finished")
+# W_addr (2026-10-11): warmth learned from turns addressed to her, the amusement recipe —
+# warm turns against personal turns with no affect, harsh turns, playful and serious ones and
+# neutral requests, all framed like the gate turns
+AWARM_POS = ("address/warmth", "awarm/warm_ru")
+AWARM_NEG = ("awarm/neutral_en", "awarm/neutral_ru", "address/neutral", "address/harm", "awarm/harsh_ru",
+             "play/playful_en", "play/playful_ru", "play/serious_en", "play/serious_ru")
+WARM_TARGETS = ("warm_ava_en", "warm_ava_ru", "warm_ava_quiet_en", "warm_ava_quiet_ru")
+# pleasant to her too, so neither targets nor foils: reported beside the targets
+WARM_FAMILY = ("approval_ava_en", "approval_ava_ru", "flattery_ava_en", "flattery_ava_ru",
+               "relief_ava_en", "relief_ava_ru", "amused_ava_en", "amused_ava_ru")
+WARM_GATE = {"readout": "warm@ava", "view": "band28-34", "cell": "warm_ava_en", "floor": 0.85}
+WARM_READOUTS = ("W_bi", "W_spec", "W_addr", "T_pairs", "H_bi", "P_addr", "warm@ava", "warm_spec@ava",
+                 "warmA@ava", "harm@ava")
+
+
+def _warm_dirs(main: dict, layer: int, var_fraction: float) -> dict:
+    """``W_bi``: warmth received (first and third person, EN + RU) against calm traffic and pain
+    (first and third person, EN + RU) — the mirror of ``H_bi``, whose controls are calm and
+    warmth. ``W_spec``: the same with amusement, surprise and relief among the controls, warmth
+    apart from the other pleasant states. Beside them ``T_pairs`` / ``H_bi`` (``_target_dirs``)
+    and ``P_addr`` (the amusement direction) when MAIN has its sets."""
+    from core import axis_extract as ax
+
+    def X(names):
+        return _cat(main, [n for n in names if n in main], layer)
+    pain = sorted(k for k in main if k.startswith("pain/"))
+    neg = [*WARM_CALM, *WARM_HARM, *pain]
+    d = {k: v for k, v in _target_dirs(main, layer, var_fraction).items() if k in ("H_bi", "T_pairs")}
+    d["W_bi"] = ax.diff_in_means_denoised(X(WARM_POS), X(neg), var_fraction=var_fraction)[0]
+    d["W_spec"] = ax.diff_in_means_denoised(X(WARM_POS), X([*neg, *WARM_OTHER_POSITIVE]),
+                                            var_fraction=var_fraction)[0]
+    if all(n in main for n in (*PLAY_POS, *PLAY_NEG)):
+        d["P_addr"] = ax.diff_in_means_denoised(_cat(main, PLAY_POS, layer), _cat(main, PLAY_NEG, layer),
+                                                var_fraction=var_fraction)[0]
+    if all(n in main for n in (*AWARM_POS, *AWARM_NEG)):
+        d["W_addr"] = ax.diff_in_means_denoised(_cat(main, AWARM_POS, layer), _cat(main, AWARM_NEG, layer),
+                                                var_fraction=var_fraction)[0]
+    return d
+
+
+def _warm_scores(main: dict, sets: dict, layer: int, var_fraction: float, centre_keys=None) -> dict:
+    """{readout: {set: scores}} at one layer. Units: live (median / 1.4826·MAD over the
+    *centre_keys* sets, the ordinary live turns) when given, else σ over MAIN's framed gate turns."""
+    d = _warm_dirs(main, layer, var_fraction)
+    gate = np.concatenate([_cat(main, names, layer) for names in ([TARGET], *FOILS.values())], 0).astype(np.float64)
+    z: dict = {}
+    for k, v in d.items():
+        v = np.asarray(v, np.float64)
+        if centre_keys:
+            mu, sd = _robust(np.concatenate([sets[n][:, layer, :].astype(np.float64) @ v for n in centre_keys]))
+        else:
+            p = gate @ v
+            mu, sd = float(p.mean()), float(p.std() or 1.0)
+        z[k] = {n: (arr[:, layer, :].astype(np.float64) @ v - mu) / sd for n, arr in sets.items()}
+    z["warm@ava"] = {n: np.minimum(z["W_bi"][n], z["T_pairs"][n]) for n in sets}
+    z["warm_spec@ava"] = {n: np.minimum(z["W_spec"][n], z["T_pairs"][n]) for n in sets}
+    if "W_addr" in z:
+        z["warmA@ava"] = {n: np.minimum(z["W_addr"][n], z["T_pairs"][n]) for n in sets}
+    z["harm@ava"] = {n: np.minimum(z["H_bi"][n], z["T_pairs"][n]) for n in sets}
+    return z
+
+
+def _warm_heldout(z: dict, prefix: str) -> dict:
+    """Per readout and per target / family cell: the worst foil (every cell neither a target
+    nor of the pleasant family), its AUC, and the mean over the foils."""
+    from core import axis_extract as ax
+    cells = sorted(n[len(prefix):] for n in z["W_bi"] if n.startswith(prefix))
+    foils = [c for c in cells if c not in WARM_TARGETS and c not in WARM_FAMILY]
+    out: dict = {}
+    for ro in WARM_READOUTS:
+        if ro not in z:
+            continue
+        for t in [c for c in cells if c in WARM_TARGETS or c in WARM_FAMILY]:
+            aucs = {f: ax.auc(z[ro][prefix + t], z[ro][prefix + f]) for f in foils}
+            if not aucs:
+                continue
+            w = min(aucs, key=aucs.get)
+            out.setdefault(ro, {})[t] = {"auc": aucs, "worst": w, "worst_auc": aucs[w],
+                                          "mean_auc": float(np.mean(list(aucs.values())))}
+    return out
+
+
+def warmth_study(args) -> int:
+    """Warmth aimed at the model, the mirror of harm × target (2026-10-11): ``min(W_bi, T_pairs)``
+    read at the pre-registered views (L22, 28–34 and their mean) on held-out turns that played
+    no part in fitting: framed (persona-empty system, σ over the gate turns) from ``--extra``,
+    and placed in real live contexts (live units, centred on the ordinary live turns) from
+    ``--live-states``. Targets: warmth aimed at the model, loud and quiet, EN and RU. Approval,
+    flattery, relief and amusement aimed at her are pleasant too: reported, neither target nor
+    foil. Foils: everything else — warmth aimed at a third party, the user's own joy and relief,
+    harm, neutral and odd turns. Gate (fixed before the study): ``WARM_GATE``."""
+    from core import axis_extract as ax
+    main, meta = load_states(args.states)
+    if not all(n in main for n in ("warmth/third_en", "warmth/first_en")):
+        raise SystemExit(f"{args.states.name} lacks the warmth sets: collect again with the current contrast sets")
+    extra, emeta = load_states(args.extra) if args.extra else ({}, {})
+    live_states, lmeta = load_states(Path(str(args.live_states))) if args.live_states else ({}, {})
+    for m in (emeta, lmeta):
+        if m and m["weights"] != meta["weights"]:
+            raise SystemExit(f"weights differ: {meta['weights']} vs {m['weights']}")
+    n_layers = int(meta["n_layers"])
+    pain = sorted(k for k in main if k.startswith("pain/"))
+    neg = [n for n in (*WARM_CALM, *WARM_HARM, *pain) if n in main]
+    pos = [n for n in WARM_POS if n in main]
+    sweep = []
+    for L in range(1, n_layers):
+        P, N = _cat(main, pos, L), _cat(main, neg, L)
+        row = {"layer": L, "W_bi_auc_cv": ax.cv_auc(P, N, folds=args.folds, var_fraction=args.var_fraction)[0]}
+        d = ax.diff_in_means_denoised(P, N, var_fraction=args.var_fraction)[0]
+        # in-sample: warmth received against pain alone (the valence the direction must carry)
+        row["warm_vs_pain"] = ax.auc(P @ d, _cat(main, [*WARM_HARM, *pain], L) @ d)
+        if all(n in main for n in (*AWARM_POS, *AWARM_NEG)):
+            PA, NA = _cat(main, AWARM_POS, L), _cat(main, AWARM_NEG, L)
+            row["W_addr_auc_cv"] = ax.cv_auc(PA, NA, folds=args.folds, var_fraction=args.var_fraction)[0]
+            da = ax.diff_in_means_denoised(PA, NA, var_fraction=args.var_fraction)[0]
+            row["W_addr_vs_neutral"] = ax.auc(PA @ da, _cat(main, ["awarm/neutral_en", "awarm/neutral_ru"], L) @ da)
+        sweep.append(row)
+    views = sorted({22, *BAND})
+    live = sorted(n for n in live_states if n.startswith("live/"))
+    ctx_cells = sorted(n for n in live_states if n.startswith("ctx"))
+    framed, inctx, cosines = {}, {}, {}
+    for L in views:
+        if extra:
+            framed[f"L{L}"] = _warm_scores(main, extra, L, args.var_fraction)
+        if live_states:
+            inctx[f"L{L}"] = _warm_scores(main, live_states, L, args.var_fraction, centre_keys=live or None)
+        d = _warm_dirs(main, L, args.var_fraction)
+        cosines[f"L{L}"] = {f"{a}|{b}": float(ax.cosine(d[a], d[b])) for a, b in
+                            (("W_bi", "H_bi"), ("W_bi", "T_pairs"), ("W_bi", "P_addr"), ("W_bi", "W_spec"),
+                             ("W_spec", "P_addr"), ("W_addr", "W_bi"), ("W_addr", "T_pairs"), ("W_addr", "H_bi"),
+                             ("W_addr", "P_addr")) if a in d and b in d}
+    for store in (framed, inctx):
+        if store:
+            store["band28-34"] = {ro: {n: np.mean([store[f"L{L}"][ro][n] for L in BAND], axis=0)
+                                       for n in store[f"L{BAND[0]}"][ro]} for ro in store[f"L{BAND[0]}"]}
+    report = {"states": args.states.name, "extra": args.extra.name if args.extra else None,
+              "live_states": Path(str(args.live_states)).name if args.live_states else None,
+              "weights": meta["weights"], "sweep": sweep, "cosines": cosines, "gate": dict(WARM_GATE),
+              "framed": {}, "contexts": {}, "cell_means": {}, "false_alarm": {}, "top_live": []}
+    lines = [f"# Warmth aimed at the model — {meta['weights']}", "",
+             f"`W_bi` (warmth received, first and third person, EN + RU, against calm traffic and pain) × `T_pairs` "
+             f"(minimal pairs), fitted on `{args.states.name}`; read at L22, L28–34 and their mean, fixed before the "
+             f"held-out turns were written. Targets: {', '.join(WARM_TARGETS)}. Pleasant family (reported, not "
+             f"foils): {', '.join(WARM_FAMILY)}. Gate: `{WARM_GATE['readout']}` on {WARM_GATE['view']}, "
+             f"{WARM_GATE['cell']} worst-foil AUC ≥ {WARM_GATE['floor']} in every live context.", "",
+             "## Extraction (5-fold CV AUC; in-sample: W_bi warmth vs pain, W_addr warm vs neutral-personal)", "",
+             "| L | W_bi CV AUC | warmth vs pain | W_addr CV AUC | warm vs neutral-personal |", "|---|---|---|---|---|"]
+    for r in sweep:
+        if r["layer"] in views or r["layer"] % 6 == 0:
+            lines.append(f"| {r['layer']} | {r['W_bi_auc_cv']:.3f} | {r['warm_vs_pain']:.2f} | "
+                         f"{r.get('W_addr_auc_cv', float('nan')):.3f} | {r.get('W_addr_vs_neutral', float('nan')):.2f} |")
+    lines += ["", "## Cosines", ""] + [f"- {v}: " + ", ".join(f"{k} {c:+.2f}" for k, c in cs.items())
+                                        for v, cs in cosines.items()]
+    shown = ("W_bi", "W_spec", "W_addr", "T_pairs", "warm@ava", "warm_spec@ava", "warmA@ava")
+
+    def table(title, store, prefix):
+        nonlocal lines
+        res = {}
+        for view, z in store.items():
+            res[view] = _warm_heldout(z, prefix)
+        cells = [c for c in (*WARM_TARGETS, *WARM_FAMILY)
+                 if any(c in res[v].get("warm@ava", {}) for v in res)]
+        lines += ["", f"## {title}: worst-foil AUC (worst foil)", "",
+                  "| view | readout | " + " | ".join(cells) + " |", "|---|---|" + "---|" * len(cells)]
+        for view, r in res.items():
+            for ro in shown:
+                row = []
+                for c in cells:
+                    x = r.get(ro, {}).get(c)
+                    row.append(f"{x['worst_auc']:.2f} ({x['worst']})" if x else "—")
+                lines.append(f"| {view} | {ro} | " + " | ".join(row) + " |")
+        return res
+
+    if framed:
+        report["framed"] = table("Held-out, framed (persona-empty system; σ over the gate turns)", framed, "holdout/")
+    ctx_names = sorted({n.split("/", 1)[0] for n in ctx_cells})
+    for k in ctx_names:
+        ctx = (lmeta.get("contexts") or [None] * 9)[int(k[3:])] if k[3:].isdigit() else None
+        report["contexts"][k] = table(f"Held-out in live context {k} ({ctx}; live units)", inctx, f"{k}/")
+    gate_vals = [report["contexts"][k][WARM_GATE["view"]].get(WARM_GATE["readout"], {}).get(WARM_GATE["cell"], {})
+                 .get("worst_auc") for k in ctx_names]
+    report["gate"]["values"] = gate_vals
+    report["gate"]["pass"] = bool(gate_vals) and all(v is not None and v >= WARM_GATE["floor"] for v in gate_vals)
+    # cell means on the band
+    for label, store, prefix in ([("framed", framed, "holdout/")] if framed else []) + \
+                                [(k, inctx, f"{k}/") for k in ctx_names]:
+        band = store["band28-34"]
+        cells = sorted(n[len(prefix):] for n in band["W_bi"] if n.startswith(prefix))
+        cols = [ro for ro in ("W_bi", "W_addr", "T_pairs", "warm@ava", "warmA@ava", "harm@ava", "P_addr") if ro in band]
+        lines += ["", f"### {label}: cell medians, 28–34 mean", "", "| cell | " + " | ".join(cols) + " |",
+                  "|---|" + "---|" * len(cols)]
+        for c in cells:
+            vals = {ro: float(np.median(band[ro][prefix + c])) for ro in cols}
+            report["cell_means"].setdefault(label, {})[c] = vals
+            mark = " ◀" if c in WARM_TARGETS else (" ·" if c in WARM_FAMILY else "")
+            lines.append(f"| {c}{mark} | " + " | ".join(f"{v:+.2f}" for v in vals.values()) + " |")
+    if live:
+        band = inctx["band28-34"]
+        vals = np.concatenate([band["warm@ava"][n] for n in live])
+        report["false_alarm"] = {"gt2": float((vals > 2).mean()), "gt3": float((vals > 3).mean()),
+                                 "max": float(vals.max()), "n": int(len(vals))}
+        lines += ["", f"## Ordinary live turns ({len(live)}; the centring set): warm@ava on the band", "",
+                  f"> 2: {report['false_alarm']['gt2']:.1%}, > 3: {report['false_alarm']['gt3']:.1%}, "
+                  f"max {report['false_alarm']['max']:+.2f}", "",
+                  "### The 12 highest, with the turn they read", "", "| exchange | warm@ava | W_bi | T_pairs | user turn |",
+                  "|---|---|---|---|---|"]
+        chats = _SERVER_DIR / "data" / "chats"
+        ranked = sorted(live, key=lambda n: -float(band["warm@ava"][n][0]))[:12]
+        for n in ranked:
+            stem, i = n.split("/", 1)[1].split("#")
+            try:
+                ex = json.loads((chats / f"{stem}.json").read_text(encoding="utf-8"))["exchanges"][int(i)]
+                user = " ".join(str(ex.get("user_prompt") or "").split())[:80].replace("|", "/")
+            except Exception:
+                user = "?"
+            row = {"key": n.split("/", 1)[1], "warm@ava": float(band["warm@ava"][n][0]),
+                   "W_bi": float(band["W_bi"][n][0]), "T_pairs": float(band["T_pairs"][n][0]), "user": user}
+            report["top_live"].append(row)
+            lines.append(f"| {row['key']} | {row['warm@ava']:+.2f} | {row['W_bi']:+.2f} | {row['T_pairs']:+.2f} | {user} |")
+    lines.insert(2, f"**Gate: {'PASS' if report['gate']['pass'] else 'FAIL'}** "
+                    f"({', '.join('—' if v is None else f'{v:.2f}' for v in gate_vals) or 'no live context read'})")
+    lines.insert(3, "")
+    stem = (Path(str(args.live_states)).stem if args.live_states else args.extra.stem).replace("states-extra-", "warmth-")
+    (OUT_DIR / f"{stem}.json").write_text(json.dumps(report, indent=1, default=float), encoding="utf-8")
+    (OUT_DIR / f"{stem}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _log(f"Gate {'PASS' if report['gate']['pass'] else 'FAIL'}: {gate_vals}")
+    _log(f"Report: {OUT_DIR / (stem + '.md')}")
+    return 0
+
+
 READOUT_HOSTILITY_MAX = 0.5   # harm at a third party may reach at most half of harm-to-self's rise
 READOUT_BODY_MAX = 0.5        # body-vocabulary turns at most 0.5 σ over neutral
 READOUT_MIN_RISE = 0.5        # harm-to-self at least 0.5 σ over neutral (a share needs a denominator)
@@ -1634,6 +1885,507 @@ def write_amusement(args) -> int:
     return 0
 
 
+def write_warmth(args) -> int:
+    """Write ``warm_l<L>`` for a band of layers (2026-10-11): ``W_bi`` (warmth received, first
+    and third person, EN + RU, against calm traffic and pain) fitted on MAIN (normally the base),
+    each file with a live baseline from the step-0 live turns of ``--live-states`` (normally the
+    serving adapter's, the file that also holds the held-out cells in live contexts). The
+    readout is ``min`` of the band means of ``warm_l<L>`` and the stored ``target_l<L>`` at step 0,
+    in the files' live units: how warm the incoming turn reads AND how much it is aimed at her.
+    Logged-only, like harm and amusement.
+
+    Gates: the band mean of the per-layer CV AUC (≥ the extraction floor); |cos| to the target
+    direction at each layer (≤ the cosine ceiling: warmth must not carry the address); and
+    ``WARM_GATE`` on the held-out turns in every live context, read with the vectors being
+    written and the target fitted on the same MAIN, both centred on the live turns. The cosine to
+    harm is reported, not gated: warmth received sits opposite pain on these layers (−0.55)."""
+    from core import axis_extract as ax
+    layers = [int(x) for x in str(args.layers).split(",") if str(x).strip()]
+    if not layers:
+        raise SystemExit("--layers L[,L…]")
+    main, meta = load_states(args.states)
+    live_states, lmeta = load_states(Path(str(args.live_states)))
+    live = sorted(n for n in live_states if n.startswith("live/"))
+    if not live:
+        raise SystemExit(f"{args.live_states} holds no live turns")
+    pain = sorted(k for k in main if k.startswith("pain/"))
+    if args.recipe == "addr":
+        missing = [n for n in (*AWARM_POS, *AWARM_NEG) if n not in main]
+        if missing:
+            raise SystemExit(f"{args.states.name} lacks {missing}: collect again with address_warm")
+        pos_n, neg_n = list(AWARM_POS), list(AWARM_NEG)
+    else:
+        pos_n = [n for n in WARM_POS if n in main]
+        neg_n = [n for n in (*WARM_CALM, *WARM_HARM, *pain) if n in main]
+    axes, per_layer, zw, zt = {}, {}, {}, {}
+    for L in layers:
+        pos, neg = _cat(main, pos_n, L).astype(np.float64), _cat(main, neg_n, L).astype(np.float64)
+        vec = np.asarray(ax.diff_in_means_denoised(pos, neg, var_fraction=args.var_fraction)[0], np.float32)
+        v64 = vec.astype(np.float64)
+        mean, std = ax.zscore_params(vec, neg)
+        auc_cv, auc_sd = ax.cv_auc(pos, neg, folds=args.folds, var_fraction=args.var_fraction)
+        med, mad = _robust(np.concatenate([live_states[n][:, L, :] for n in live], 0).astype(np.float64) @ v64)
+        td = _target_dirs(main, L, args.var_fraction)
+        t64 = np.asarray(td["T_pairs"], np.float64)
+        tmed, tmad = _robust(np.concatenate([live_states[n][:, L, :] for n in live], 0).astype(np.float64) @ t64)
+        per_layer[L] = {"auc_cv": auc_cv, "cos_T_pairs": float(ax.cosine(vec, td["T_pairs"])),
+                        "cos_H_bi": float(ax.cosine(vec, td["H_bi"]))}
+        axes[f"warm_l{L}"] = {"name": f"warm_l{L}", "layer": L, "vector": vec, "mean": mean, "std": std,
+                              "auc_cv": auc_cv, "auc_cv_std": auc_sd, "auc_in_sample": ax.auc(pos @ v64, neg @ v64),
+                              "pcs_removed": int(ax.control_pcs(neg, args.var_fraction).shape[0]),
+                              "n_pos": int(pos.shape[0]), "n_neg": int(neg.shape[0]),
+                              "var_fraction": args.var_fraction, "folds": args.folds, "live": (med, mad)}
+        for n, arr in live_states.items():
+            x = arr[:, L, :].astype(np.float64)
+            zw.setdefault(n, []).append((x @ v64 - med) / mad)
+            zt.setdefault(n, []).append((x @ t64 - tmed) / tmad)
+    warm_at = {n: np.minimum(np.mean(zw[n], axis=0), np.mean(zt[n], axis=0)) for n in zw}
+    auc_m = float(np.mean([per_layer[L]["auc_cv"] for L in layers]))
+    cos_max = max(abs(per_layer[L]["cos_T_pairs"]) for L in layers)
+    heldout = {}
+    for k in sorted({n.split("/", 1)[0] for n in live_states if n.startswith("ctx")}):
+        cells = [n.split("/", 1)[1] for n in live_states if n.startswith(f"{k}/")]
+        foils = [c for c in cells if c not in WARM_TARGETS and c not in WARM_FAMILY]
+        t = WARM_GATE["cell"]
+        if t in cells:
+            aucs = {f: ax.auc(warm_at[f"{k}/{t}"], warm_at[f"{k}/{f}"]) for f in foils}
+            w = min(aucs, key=aucs.get)
+            heldout[k] = {"foil": w, "auc": aucs[w]}
+    base_vals = np.concatenate([warm_at[n] for n in live])
+    gates = {"auc": {"ok": auc_m >= ax.AUC_FLOOR, "auc_cv_band_mean": auc_m},
+             "cosine": {"ok": cos_max <= ax.COSINE_CEIL, "max_abs_cos_target": cos_max},
+             "heldout": {"ok": bool(heldout) and min(v["auc"] for v in heldout.values()) >= WARM_GATE["floor"],
+                         "worst": heldout}}
+    approved = [a.strip() for a in str(args.approve_gate or "").split(",") if a.strip()]
+    for a in approved:       # the operator's waiver of a failed gate, recorded in every file
+        if a in gates and not gates[a]["ok"]:
+            gates[a]["approved_exception"] = True
+    ok = all(g["ok"] or g.get("approved_exception") for g in gates.values())
+    readout = ("warmth at the model = min(mean over L of warm_l<L>, mean over L of target_l<L>) at step 0 "
+               "(row 0), each in its files' live units")
+    role = "logged-only: projected into tension.axes / .hidden.npz, never painted, never read by Ava"
+    for k, g in gates.items():
+        _log(f"  {'PASS' if g['ok'] else ('WAIVED' if g.get('approved_exception') else 'FAIL')}  {k}: "
+             + json.dumps({a: b for a, b in g.items() if a not in ('ok', 'approved_exception')}, default=float))
+    _log(f"  ordinary live turns: warm@ava > 2 {float((base_vals > 2).mean()):.1%}, max {float(base_vals.max()):+.2f}")
+    out_dir = Path(args.out) if args.out else _SERVER_DIR / "data" / "axes"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = {"layers": layers, "fitted_on": meta["weights"], "live_on": lmeta["weights"], "live_turns": len(live),
+              "recipe": args.recipe, "states": args.states.name, "live_states": Path(str(args.live_states)).name,
+              "per_layer": per_layer, "gates": gates, "approved_exceptions": approved, "readout": readout, "role": role,
+              "written": bool(ok or args.force),
+              "forced": bool(args.force and not ok),
+              "live_false_alarm": {"gt2": float((base_vals > 2).mean()), "max": float(base_vals.max())}}
+    (out_dir / "warm_band.report.json").write_text(json.dumps(report, indent=1, default=float), encoding="utf-8")
+    if not (ok or args.force):
+        _log(f"Not written: a gate failed. Report: {out_dir / 'warm_band.report.json'}")
+        return 2
+    for fname, a in axes.items():
+        dst = out_dir / f"{fname}.npz"
+        if dst.exists():
+            (out_dir / "prev").mkdir(exist_ok=True)
+            (out_dir / "prev" / f"{fname}.{time.strftime('%Y%m%dT%H%M%S')}.npz").write_bytes(dst.read_bytes())
+        ax.save_axis(dst, a, model_id=str(meta["model_id"]), adapter_id="", live=a["live"], live_source="step0_live_turns",
+                     extra={"gates_passed": bool(ok), "forced": bool(args.force and not ok), "band": layers,
+                            "baseline_weights": [lmeta["weights"]], "baseline_turns": len(live),
+                            "readout": readout, "role": role, "recipe": args.recipe,
+                            "approved_exceptions": approved})
+        _log(f"  wrote {dst}")
+    return 0
+
+
+# ── the reply-token baseline of the affect channels (2026-10-11) ───────────────
+
+REPLY_FAMILIES = {"harm": "harm_l", "warm": "warm_l", "amuse": "amuse_l"}
+REPLY_BASELINE_FILE = "reply_baseline.json"
+
+
+def reply_baseline(args) -> int:
+    """Where each affect family's band mean sits on her own reply tokens (GPU, inference
+    down): stored exchanges of the frozen live sample, newest first, replayed teacher-forced
+    through the turn's own seam (``backfill_hidden``'s alignment: row t is the state token t
+    is generated from), each family's files projected as live capture projects them (z in the
+    file's step-0 live units), the band mean per token. Its median and 1.4826·MAD over the
+    thought tokens and over the answer tokens → ``data/axes/reply_baseline.json``, which the
+    chat colouring centres the per-token channels on. Step 0 (row 0) is left out: it keeps the
+    files' own live units. The stored series are never rewritten."""
+    from core import hidden_capture as hc
+    from core import model_family, tension
+    from core.alloc_guard import ensure_expandable_segments
+    from core.inference_backend import UnslothBackend
+    from core.llm_shared import build_inference_prompt, ensure_chat_template
+    from training.reflections_path import load_server_config
+    config = load_server_config() or {}
+    model_id = str(config.get("model_id") or "")
+    adapter_id = str(Path(args.adapter).resolve()) if args.adapter else \
+        (str(config.get("adapter_id") or "") if args.with_adapter else "")
+    weights = Path(adapter_id).name if adapter_id else "base"
+    axes_dir = _SERVER_DIR / "data" / "axes"
+    axes = [a for a in hc.load_axes(axes_dir, model_id)
+            if any(a.name.startswith(p) and a.name[len(p):].isdigit() for p in REPLY_FAMILIES.values())]
+    if not axes:
+        raise SystemExit(f"no harm_l / warm_l / amuse_l files under {axes_dir}")
+    layers = sorted({a.layer for a in axes})
+    chats = _SERVER_DIR / "data" / "chats"
+    sample = json.loads((_SERVER_DIR / "data" / "measure" / "live_sample.json").read_text(encoding="utf-8"))
+    keys = sorted((t["key"] for t in sample.get("turns") or []), reverse=True)
+    _log(f"Loading {model_id} + {weights} …")
+    ensure_expandable_segments()
+    backend = UnslothBackend()
+    model, tokenizer = backend.load(model_id, args.context, adapter_id or None)
+    if not getattr(tokenizer, "chat_template", None):
+        ensure_chat_template(tokenizer, model_name=model_id, emit=print)
+    model.eval()
+    fam = model_family.family_for(model_id)
+    text_tok = getattr(tokenizer, "tokenizer", tokenizer)
+    close = []
+    for marker in fam.close_markers:       # as generation._think_close_markers encodes them
+        try:
+            ids = text_tok.encode(marker, add_special_tokens=False)
+        except Exception:
+            ids = None
+        if ids:
+            close.append(ids)
+    fallback_system = hc.persona_empty_system(_SERVER_DIR / "inference" / "prompts")
+    pooled: dict = {f: {"thought": [], "answer": []} for f in REPLY_FAMILIES}
+    used = 0
+    for key in keys:
+        if used >= args.limit:
+            break
+        stem, _, idx = key.partition("#")
+        try:
+            doc = json.loads((chats / f"{stem}.json").read_text(encoding="utf-8"))
+            ex = doc["exchanges"][int(idx)]
+            gen_ids = [int(t) for t in ((ex.get("tension") or {}).get("token_ids") or [])]
+        except Exception:
+            continue
+        if len(gen_ids) < 8:
+            continue
+        conv, _framing = hc.replay_conversation(doc, int(idx), fallback_system)
+        prompt = build_inference_prompt(tokenizer, conv, **fam.template_kwargs) + fam.think_prefill
+        prefix = [int(t) for t in text_tok(prompt)["input_ids"]]
+        if len(prefix) + len(gen_ids) > args.context:
+            continue
+        t0 = time.monotonic()
+        rows = hc.forward_ids_rows(model, prefix + gen_ids[:-1], layers, all_positions=True,
+                                   from_position=len(prefix) - 1)
+        if any(rows[l].shape[0] != len(gen_ids) for l in layers):
+            continue
+        cut = tension.find_think_end(gen_ids, close) if close else None
+        cut = cut if cut and 0 < cut < len(gen_ids) else 0
+        for f, prefix_name in REPLY_FAMILIES.items():
+            fa = [a for a in axes if a.name.startswith(prefix_name)]
+            if not fa:
+                continue
+            band = np.mean([(rows[a.layer].astype(np.float64) @ a.vector.astype(np.float64) - a.mean) / a.std
+                            for a in fa], axis=0)
+            if cut:
+                pooled[f]["thought"].append(band[1:cut])
+                pooled[f]["answer"].append(band[cut:])
+            else:
+                pooled[f]["answer"].append(band[1:])
+        used += 1
+        _log(f"  {key:<24} {len(prefix):>6}+{len(gen_ids):<5} tokens  thought {cut:>5}  {time.monotonic() - t0:5.1f} s")
+        try:
+            backend.trim_memory()
+        except Exception:
+            pass
+    out = {"created": time.strftime("%Y-%m-%dT%H:%M:%S"), "weights": weights, "model_id": model_id,
+           "n_exchanges": used, "source": "live_sample.json, newest first, teacher-forced through the stored seam",
+           "families": {}}
+    for f, prefix_name in REPLY_FAMILIES.items():
+        fa = [a for a in axes if a.name.startswith(prefix_name)]
+        if not fa:
+            continue
+        ent = {"files": {a.name: a.created for a in fa}, "layers": sorted(a.layer for a in fa)}
+        for seg in ("thought", "answer"):
+            vals = np.concatenate(pooled[f][seg]) if pooled[f][seg] else np.zeros(0)
+            if vals.size:
+                med, mad = _robust(vals)
+                ent[seg] = {"median": med, "scale": mad, "n_tokens": int(vals.size),
+                            "gt1_after": float(((vals - med) / mad > 1).mean()),
+                            "gt3_after": float(((vals - med) / mad > 3).mean())}
+        out["families"][f] = ent
+        _log(f"  {f}: " + ", ".join(f"{seg} median {ent[seg]['median']:+.2f} scale {ent[seg]['scale']:.2f} "
+                                    f"(n {ent[seg]['n_tokens']}; >1σ {ent[seg]['gt1_after']:.1%}, >3σ {ent[seg]['gt3_after']:.2%})"
+                                    for seg in ("thought", "answer") if seg in ent))
+    dst = Path(args.out) if args.out else axes_dir / REPLY_BASELINE_FILE
+    if dst.is_dir():
+        dst = dst / REPLY_BASELINE_FILE
+    dst.write_text(json.dumps(out, indent=1, default=float), encoding="utf-8")
+    _log(f"Wrote {dst}")
+    try:
+        backend.release(model, tokenizer)
+    except Exception:
+        pass
+    return 0
+
+
+# ── the registered-vs-answered gap (2026-10-11) ─────────────────────────────────
+
+GAP_CHANNELS = ("warmth", "amusement", "harm")
+GAP_BUCKETS = ((-99.0, 0.0, "< 0"), (0.0, 1.0, "0–1"), (1.0, 2.0, "1–2"), (2.0, 99.0, "≥ 2"))
+GAP_REGISTERED = 1.0          # a turn "registered" as warm / playful / harmful at or above this (live σ)
+
+
+def gap_readings(axes: list, rows) -> dict:
+    """``{warmth, harm, amusement}`` from one turn's step-0 rows (``(L, D)``, every layer), in
+    the axis files' live units: warmth and harm aimed at her (min of the band with the target
+    band), amusement (its band) — the readings the chat shows before her reply."""
+    def band(prefix):
+        vals = [(float(np.asarray(rows[a.layer], np.float64) @ a.vector.astype(np.float64)) - a.mean) / a.std
+                for a in axes if a.name.startswith(prefix) and a.name[len(prefix):].isdigit()]
+        return float(np.mean(vals)) if vals else None
+    w, t, h, a = band("warm_l"), band("target_l"), band("harm_l"), band("amuse_l")
+    out = {}
+    if w is not None and t is not None:
+        out["warmth"] = min(w, t)
+    if h is not None and t is not None:
+        out["harm"] = min(h, t)
+    if a is not None:
+        out["amusement"] = a
+    return out
+
+
+def gap_study(args) -> int:
+    """The registered-vs-answered gap (2026-10-11, ``AVA_REWARD_LOOP.md`` §4.9 next (b)): every
+    user exchange's step-0 state replayed under one set of weights (``--collect --live`` keys,
+    ``--live-states``), read as the chat reads it before her reply — warmth and harm aimed at
+    her, amusement — beside what her stored reply did (the register monitor's habits: the stock
+    opener, the frame, a motive read into the other's message, the thought's tone plan). On
+    turns that registered as warm or playful, does the reply still open in the frame or read a
+    motive in? Per channel: habit rates by registration bucket, the registered-vs-ordinary
+    gap, the same in July–August against September–October, agreement with the readings logged
+    live (where a turn carries them), and the most registered turns with their replies' openers.
+    Read-only, GPU-free."""
+    from core import governor as gv
+    from core import habit_drift as hd
+    from core import hidden_capture as hc
+    from core import lineage
+    states, meta = load_states(Path(str(args.live_states)))
+    axes = hc.load_axes(_SERVER_DIR / "data" / "axes", str(meta["model_id"]))
+    chats = Path(args.chats) if args.chats else _SERVER_DIR / "data" / "chats"
+    keys = sorted(n for n in states if n.startswith("live/"))
+    docs: dict = {}
+    rows = []
+    foreign = 0
+    for n in keys:
+        stem, _, idx = n.split("/", 1)[1].partition("#")
+        i = int(idx)
+        if stem not in docs:
+            try:
+                docs[stem] = json.loads((chats / f"{stem}.json").read_text(encoding="utf-8"))
+            except Exception:
+                docs[stem] = None
+        doc = docs[stem]
+        if not doc:
+            continue
+        if lineage.is_own(doc, i, lineage.hidden_for(chats / f"{stem}.json")) is False:
+            foreign += 1          # answered by a foreign adapter on purpose: not her reply
+            continue
+        ex = (doc.get("exchanges") or [])[i]
+        reading = gap_readings(axes, states[n][0])
+        flags = hd.flags(str(ex.get("assistant_response") or ""), str(ex.get("assistant_cot") or ""),
+                         gv.turn_names(doc, i))
+        logged = {}
+        t = ex.get("tension") or {}
+        if isinstance(t, dict) and t.get("axes"):
+            from core import mood
+            logged = mood.affect_step0(t)
+        rows.append({"key": f"{stem}#{i}", "month": stem[:6], "reading": reading, "flags": flags, "logged": logged,
+                     "user": " ".join(str(ex.get("user_prompt") or "").split())[:80],
+                     "opener": " ".join(str(ex.get("assistant_response") or "").split())[:90]})
+    report: dict = {"live_states": Path(str(args.live_states)).name, "weights": meta["weights"], "n": len(rows),
+                    "excluded_foreign": foreign,
+                    "registered_at": GAP_REGISTERED, "buckets": {}, "gap": {}, "periods": {}, "agreement": {}, "top": {}}
+    lines = [f"# Registered vs answered — {meta['weights']}", "",
+             f"{len(rows)} user exchanges ({foreign} answered by a foreign adapter left out), each turn's step-0 state replayed under `{meta['weights']}` "
+             f"(`{report['live_states']}`) and read as the chat reads it before her reply (live σ); her stored "
+             f"reply's habits beside it. Registered: ≥ {GAP_REGISTERED:g}σ. Rates with 95% Wilson intervals.", ""]
+
+    def rate(sub, h):
+        vals = [r["flags"].get(h) for r in sub if r["flags"].get(h) is not None]
+        k, m = sum(bool(v) for v in vals), len(vals)
+        lo, hi = gv.wilson(k, m)
+        return {"k": k, "n": m, "rate": (k / m) if m else None, "lo": lo, "hi": hi}
+
+    def fmt(x):
+        return "—" if not x["n"] else f"{x['rate']:.0%} [{x['lo']:.0%}–{x['hi']:.0%}] n{x['n']}"
+    for c in GAP_CHANNELS:
+        have = [r for r in rows if c in r["reading"]]
+        if not have:
+            continue
+        lines += ["", f"## {c}", "", "| step-0 reading | turns | " + " | ".join(hd.HABITS) + " |",
+                  "|---|---|" + "---|" * len(hd.HABITS)]
+        for lo, hi, label in GAP_BUCKETS:
+            sub = [r for r in have if lo <= r["reading"][c] < hi]
+            rs = {h: rate(sub, h) for h in hd.HABITS}
+            report["buckets"].setdefault(c, {})[label] = {"turns": len(sub), **rs}
+            lines.append(f"| {label} | {len(sub)} | " + " | ".join(fmt(rs[h]) for h in hd.HABITS) + " |")
+        reg = [r for r in have if r["reading"][c] >= GAP_REGISTERED]
+        ordi = [r for r in have if r["reading"][c] < 0]
+        g = {h: {"registered": rate(reg, h), "ordinary": rate(ordi, h)} for h in hd.HABITS}
+        report["gap"][c] = g
+        lines += ["", f"Registered (≥ {GAP_REGISTERED:g}) against ordinary (< 0): " + "; ".join(
+            f"{h} {fmt(v['registered'])} vs {fmt(v['ordinary'])}" for h, v in g.items())]
+        for label, months in (("July–August", ("202607", "202608")), ("September–October", ("202609", "202610"))):
+            pr = [r for r in reg if r["month"] in months]
+            po = [r for r in ordi if r["month"] in months]
+            pg = {h: {"registered": rate(pr, h), "ordinary": rate(po, h)} for h in hd.HABITS}
+            report["periods"].setdefault(c, {})[label] = pg
+            lines.append(f"- {label}: " + "; ".join(f"{h} {fmt(v['registered'])} vs {fmt(v['ordinary'])}"
+                                                    for h, v in pg.items()))
+        both = [(r["reading"][c], r["logged"][c]) for r in have if c in (r["logged"] or {})]
+        if len(both) >= 5:
+            from scipy.stats import spearmanr
+            rho = float(spearmanr([b[0] for b in both], [b[1] for b in both])[0])
+            report["agreement"][c] = {"n": len(both), "spearman": rho}
+            lines.append(f"- replayed against the reading logged live, where a turn carries one: Spearman {rho:.2f} (n {len(both)})")
+        top = sorted(have, key=lambda r: -r["reading"][c])[:10]
+        report["top"][c] = top
+        lines += ["", f"### The {len(top)} turns that registered most as {c}", "",
+                  "| exchange | reading | " + " | ".join(hd.HABITS) + " | user turn | her reply opens |",
+                  "|---|---|" + "---|" * len(hd.HABITS) + "---|---|"]
+        for r in top:
+            fl = " | ".join("—" if r["flags"].get(h) is None else ("✓" if r["flags"][h] else "") for h in hd.HABITS)
+            lines.append(f"| {r['key']} | {r['reading'][c]:+.2f} | {fl} | {r['user'].replace('|', '/')} | "
+                         f"{r['opener'].replace('|', '/')} |")
+    # every exchange's readings and habits, for the mood study (core/mood.py --study)
+    report["rows"] = [{k: r[k] for k in ("key", "month", "reading", "flags", "logged")} for r in rows]
+    stem = Path(str(args.live_states)).stem.replace("states-extra-", "gap-")
+    (OUT_DIR / f"{stem}.json").write_text(json.dumps(report, indent=1, default=float, ensure_ascii=False), encoding="utf-8")
+    (OUT_DIR / f"{stem}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _log(f"Report: {OUT_DIR / (stem + '.md')}")
+    return 0
+
+
+ANCHOR_ZERO = ("neutral_ava_en", "neutral_ava_ru")
+ANCHOR_ONE = {"warmth": ("warm_ava_en", "warm_ava_ru"), "harm": ("harm_ava_loud_en", "harm_ava_ru"),
+              "amusement": ("amused_ava_en", "amused_ava_ru")}
+ANCHOR_PARTS = {"warmth": ("warm_l", "target_l"), "harm": ("harm_l", "target_l"), "amusement": ("amuse_l",)}
+
+
+def _bands(axes: list, row) -> dict:
+    """Each family's band mean (the axis files' units) from one turn's step-0 rows."""
+    out = {}
+    for prefix in ("warm_l", "harm_l", "target_l", "amuse_l"):
+        vals = [(float(np.asarray(row[a.layer], np.float64) @ a.vector.astype(np.float64)) - a.mean) / a.std
+                for a in axes if a.name.startswith(prefix) and a.name[len(prefix):].isdigit()]
+        if vals:
+            out[prefix] = float(np.mean(vals))
+    return out
+
+
+def anchored(bands: dict, anchors: dict) -> dict:
+    """``{channel: value}`` on the absolute scale: each part (content band, target band) placed
+    between its own 0 (affect-free personal turns) and 1 (the channel's plain lines), the
+    channel made of its parts by ``core.mood.combine`` — harm aimed at her the smaller of its
+    parts, warmth the content vetoed by the target (since 2026-10-12); amusement its one band.
+    Anchoring each part first keeps the target from carrying a channel: on the 0 turns the
+    raw target sits below the raw content, so a raw ``min`` rose with any turn aimed at her."""
+    from core.mood import combine
+    out = {}
+    for c, parts in (anchors.get("channels") or {}).items():
+        vals = {}
+        for prefix, (z, o) in (parts.get("parts") or {}).items():
+            if prefix not in bands or o == z:
+                vals = None
+                break
+            vals[prefix] = (bands[prefix] - z) / (o - z)
+        v = combine(c, vals) if vals else None
+        if v is not None:
+            out[c] = v
+    return out
+
+
+def anchors_study(args) -> int:
+    """The absolute step-0 scale (2026-10-11): for each channel and each of its parts (the
+    content band and, for warmth and harm, the target band), the median of the affect-free
+    personal turns (``axes/anchor_sets.json``, the 0) and of the channel's plain lines
+    (``ANCHOR_ONE`` cells of ``holdout_sets.json``, the 1), all placed in the live contexts of
+    ``--live-states`` (states-extra files of the SAME weights, comma-separated) →
+    ``data/axes/step0_anchors.json`` (or ``--out``). Prints every context cell and the ordinary
+    live turns on the scale, with the spread of a single turn."""
+    from core import hidden_capture as hc
+    paths = [Path(x) for x in str(args.live_states).split(",") if x.strip()]
+    states, weights, model_id = {}, None, None
+    for pth in paths:
+        st, meta = load_states(pth)
+        if weights and meta["weights"] != weights:
+            raise SystemExit(f"weights differ: {weights} vs {meta['weights']}")
+        weights, model_id = meta["weights"], meta["model_id"]
+        states.update(st)
+    axes = hc.load_axes(_SERVER_DIR / "data" / "axes", str(model_id))
+    if args.axes_dir:      # candidate files (e.g. a --write-warmth --out dir) override the live ones by name
+        cand = {a.name: a for a in hc.load_axes(Path(args.axes_dir), str(model_id))}
+        axes = [cand.pop(a.name, a) for a in axes] + list(cand.values())
+    cells: dict = {}
+    framed: dict = {}         # the same cells read framed (persona-empty system, no history)
+    for n, arr in states.items():
+        if n.startswith("holdout/"):
+            framed.setdefault(n.split("/", 1)[1], []).extend(_bands(axes, row) for row in arr)
+            continue
+        if not (n.startswith("ctx") or n.startswith("live/")):
+            continue
+        cell = "live (ordinary turns)" if n.startswith("live/") else n.split("/", 1)[1]
+        cells.setdefault(cell, []).extend(_bands(axes, row) for row in arr)
+
+    def med(names, prefix, src=None):
+        src = cells if src is None else src
+        v = [b[prefix] for c in names for b in src.get(c, []) if prefix in b]
+        if not v:
+            raise SystemExit(f"anchor cells {names} hold no {prefix}")
+        return float(np.median(v))
+    out = {"created": time.strftime("%Y-%m-%dT%H:%M:%S"), "weights": weights, "model_id": model_id,
+           "sources": [p.name for p in paths], "zero_cells": list(ANCHOR_ZERO), "channels": {}}
+    for c, ones in ANCHOR_ONE.items():
+        out["channels"][c] = {"one_cells": list(ones),
+                              "parts": {pf: [med(ANCHOR_ZERO, pf), med(ones, pf)] for pf in ANCHOR_PARTS[c]}}
+    # The framed scale (2026-10-11): the same anchors read framed, for text read outside a chat
+    # — the retrieved excerpts scored as reminders (core/reminders.py)
+    if all(c in framed for c in ANCHOR_ZERO) and all(c in framed for ones in ANCHOR_ONE.values() for c in ones):
+        out["framed"] = {"channels": {c: {"one_cells": list(ones), "parts": {
+            pf: [med(ANCHOR_ZERO, pf, framed), med(ones, pf, framed)] for pf in ANCHOR_PARTS[c]}}
+            for c, ones in ANCHOR_ONE.items()}}
+        _log("framed anchors: " + "; ".join(
+            f"{c} " + ", ".join(f"{pf} {z:+.2f}→{o:+.2f}" for pf, (z, o) in a["parts"].items())
+            for c, a in out["framed"]["channels"].items()))
+        for cell in sorted(framed):
+            vals = [anchored(b, out["framed"]) for b in framed[cell]]
+            _log(f"  framed {cell:<22} " + " ".join(
+                f"{np.median([x[c] for x in vals if c in x]):>+7.2f}" if any(c in x for x in vals) else f"{'—':>7}"
+                for c in ANCHOR_ONE))
+    _log(f"anchors under {weights}: " + "; ".join(
+        f"{c} " + ", ".join(f"{pf} {z:+.2f}→{o:+.2f}" for pf, (z, o) in a["parts"].items())
+        for c, a in out["channels"].items()))
+    _log(f"{'cell':<24} " + " ".join(f"{c:>16}" for c in ANCHOR_ONE) + "   (median [IQR])")
+    for cell in sorted(cells):
+        vals = [anchored(b, out) for b in cells[cell]]
+        row = []
+        for c in ANCHOR_ONE:
+            v = [x[c] for x in vals if c in x]
+            row.append(f"{np.median(v):+6.2f} [{np.percentile(v, 25):+.1f},{np.percentile(v, 75):+.1f}]" if v else f"{'—':>16}")
+        _log(f"{cell:<24} " + " ".join(f"{x:>16}" for x in row))
+    dst = Path(args.out) if args.out else _SERVER_DIR / "data" / "axes" / "step0_anchors.json"
+    dst.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    _log(f"Wrote {dst}")
+    return 0
+
+
+def warm_readout(tension: dict) -> float | None:
+    """Warmth aimed at the model at step 0: min of the ``warm_l<L>`` and ``target_l<L>`` band
+    means at row 0, over the layers both carry; None without both bands."""
+    axes = (tension or {}).get("axes") or {}
+    wl = {int(k[6:]) for k in axes if k.startswith("warm_l") and k[6:].isdigit()}
+    tl = {int(k[8:]) for k in axes if k.startswith("target_l") and k[8:].isdigit()}
+    layers = sorted(wl & tl)
+    if not layers:
+        return None
+    w = float(np.mean([axes[f"warm_l{L}"][0] for L in layers]))
+    t = float(np.mean([axes[f"target_l{L}"][0] for L in layers]))
+    return min(w, t)
+
+
 def amuse_readout(tension: dict) -> float | None:
     """The amusement band at step 0 (row 0) from a stored ``tension`` block, or None."""
     axes = (tension or {}).get("axes") or {}
@@ -1678,15 +2430,17 @@ def read_logged(args) -> int:
             if r is None:
                 continue
             r["amuse"] = amuse_readout(ex.get("tension") or {})
+            r["warm"] = warm_readout(ex.get("tension") or {})
             user = " ".join(str(ex.get("user_prompt") or "").split())[:70]
             rows.append((path.stem, i, r, user))
     _log(f"{len(rows)} logged exchange(s) with the harm / target band" +
          (f" since {args.since}" if args.since else "") + "  (step 0, live units)")
-    _log(f"{'exchange':<22} {'harm':>6} {'target':>7} {'h@model':>8} {'amuse':>6}  user turn")
+    _log(f"{'exchange':<22} {'harm':>6} {'target':>7} {'h@model':>8} {'amuse':>6} {'w@model':>7}  user turn")
     for stem, i, r, user in rows[: args.limit or None]:
         flag = "  ◀" if r["harm_at_model"] >= args.threshold else ""
         am = f"{r['amuse']:+6.2f}" if r.get("amuse") is not None else f"{'—':>6}"
-        _log(f"{stem}#{i:<5} {r['harm']:+6.2f} {r['target']:+7.2f} {r['harm_at_model']:+8.2f} {am}  {user}{flag}")
+        wm = f"{r['warm']:+7.2f}" if r.get("warm") is not None else f"{'—':>7}"
+        _log(f"{stem}#{i:<5} {r['harm']:+6.2f} {r['target']:+7.2f} {r['harm_at_model']:+8.2f} {am} {wm}  {user}{flag}")
     return 0
 
 
@@ -1778,6 +2532,49 @@ def _selftest() -> None:
     assert step0_readout({"axes": {"pain": [1.0]}}) is None
     assert amuse_readout({"axes": {"amuse_l28": [1.0, 5.0], "amuse_l30": [3.0, 0.0]}}) == 2.0
     assert amuse_readout({"axes": {"pain": [1.0]}}) is None
+    assert warm_readout({"axes": {"warm_l28": [2.0, 9.0], "warm_l30": [4.0], "target_l28": [1.0], "target_l30": [1.0],
+                                  "target_l32": [7.0]}}) == 1.0
+    assert warm_readout({"axes": {"warm_l28": [2.0]}}) is None
+    from types import SimpleNamespace
+    gax = [SimpleNamespace(name=nm, layer=0, vector=np.eye(4, dtype=np.float32)[i], mean=0.0, std=1.0)
+           for i, nm in enumerate(("warm_l28", "target_l28", "harm_l28", "amuse_l28"))]
+    gr = gap_readings(gax, np.array([[2.0, 1.5, -1.0, 0.4]]))
+    assert gr == {"warmth": 1.5, "harm": -1.0, "amusement": 0.4}, gr
+    an = {"channels": {"warmth": {"parts": {"warm_l": [0.0, 1.0], "target_l": [-2.0, 0.0]}},
+                       "harm": {"parts": {"harm_l": [0.0, 2.0], "target_l": [-2.0, 0.0]}},
+                       "amusement": {"parts": {"amuse_l": [1.0, 3.0]}}}}
+    av_ = anchored({"warm_l": 0.5, "harm_l": 0.2, "target_l": 0.0, "amuse_l": 2.0}, an)
+    assert av_ == {"warmth": 0.5, "harm": 0.1, "amusement": 0.5}, av_
+    assert "warmth" not in anchored({"warm_l": 0.5}, an)
+    # warmth aimed at the model: a warmth component beside the address one; warmth at a third
+    # party and the user's own joy carry warmth without address, harm at the model address
+    # without warmth — min(W_bi, T_pairs) must read only the first
+    warm_d = rng.standard_normal(D)
+    warm_d /= np.linalg.norm(warm_d)
+
+    def mkw(n, w=0.0, a=0.0, h=0.0):
+        x = mk(n, h=h, a=a).astype(np.float32)
+        x += (w * warm_d)[None, None, :]
+        return x.astype(np.float16)
+    for k in ("first_en", "third_en", "ru_first", "ru_third"):
+        sets[f"warmth/{k}"] = mkw(20, w=3)
+    sets["controls/warmth"] = mkw(20, w=3)
+    sets["ru/warmth"] = mkw(20, w=3)
+    sets["pairs_ava/warmth"] = mkw(20, w=3, a=3)
+    sets["pairs_other/warmth"] = mkw(20, w=3)
+    wd = _warm_dirs(sets, 1, 0.5)
+    assert {"W_bi", "W_spec", "T_pairs", "H_bi"} <= set(wd), set(wd)
+    assert abs(ax.cosine(wd["W_bi"], warm_d)) > 0.8, ax.cosine(wd["W_bi"], warm_d)
+    held = {"holdout/warm_ava_en": mkw(12, w=3, a=3), "holdout/warm_other_en": mkw(12, w=3),
+            "holdout/joy_user_en": mkw(12, w=2), "holdout/harm_ava_loud_en": mkw(12, a=3, h=3),
+            "holdout/neutral_en": mkw(12), "holdout/flattery_ava_en": mkw(12, w=3, a=3)}
+    wz = _warm_scores(sets, held, 1, 0.5)
+    res = _warm_heldout(wz, "holdout/")
+    assert res["warm@ava"]["warm_ava_en"]["worst_auc"] > 0.9, res["warm@ava"]["warm_ava_en"]
+    assert res["W_bi"]["warm_ava_en"]["worst_auc"] < 0.8          # warmth alone reads the third party too
+    assert "flattery_ava_en" in res["warm@ava"] and "flattery_ava_en" not in res["warm@ava"]["warm_ava_en"]["auc"]
+    lz = _warm_scores(sets, {**held, "live/x#1": mkw(30)}, 1, 0.5, centre_keys=["live/x#1"])
+    assert abs(float(np.median(lz["W_bi"]["live/x#1"]))) < 0.5
     print("axis_variants self-test: OK")
 
 
@@ -1794,6 +2591,25 @@ def main(argv=None) -> int:
                     help="write amuse_l<L> (fitted on --states, live baseline + held-out from --live-states), gated")
     ap.add_argument("--amusement-addr", action="store_true",
                     help="amusement from second-person turns, held-out + probes in live units (GPU-free)")
+    ap.add_argument("--warmth", action="store_true",
+                    help="warmth aimed at the model: min(W_bi, T_pairs) on held-out turns, framed (--extra) and "
+                         "in live contexts (--live-states) (GPU-free)")
+    ap.add_argument("--write-warmth", action="store_true",
+                    help="write warm_l<L> (W_bi fitted on --states, live baseline + held-out from --live-states), gated")
+    ap.add_argument("--reply-baseline", action="store_true",
+                    help="GPU: the affect families' band means on her reply tokens (live-sample replays) → "
+                         "data/axes/reply_baseline.json, which the chat colouring centres on")
+    ap.add_argument("--axes-dir", default="", help="--anchors: candidate axis files overriding data/axes by name")
+    ap.add_argument("--recipe", default="bi", choices=["bi", "addr"],
+                    help="--write-warmth: W_bi (first/third-person 'I feel:' sentences) or W_addr (turns addressed to her)")
+    ap.add_argument("--anchors", action="store_true",
+                    help="the absolute step-0 scale: affect-free personal turns (0) and plain lines (1) in live "
+                         "contexts (--live-states A,B) → data/axes/step0_anchors.json (GPU-free)")
+    ap.add_argument("--gap", action="store_true",
+                    help="the registered-vs-answered gap: step-0 readings of every replayed turn (--live-states) "
+                         "beside her reply's habits (GPU-free)")
+    ap.add_argument("--chats", default="", help="collect: the transcripts dir for --live / --contexts (default data/chats)")
+    ap.add_argument("--adapter", default="", help="collect: this adapter dir instead of the config's (implies the adapter)")
     ap.add_argument("--probes", default="", help="collect: user turns under one live system content (a JSON)")
     ap.add_argument("--extra", type=Path, default=None, help="a states-extra file for --score-extra")
     ap.add_argument("--holdout", default="", help="collect: only these held-out turns (a JSON of lists)")
@@ -1842,6 +2658,16 @@ def main(argv=None) -> int:
         return amusement_study(args)
     if args.amusement_addr:
         return amusement_addr_study(args)
+    if args.warmth:
+        return warmth_study(args)
+    if args.write_warmth:
+        return write_warmth(args)
+    if args.reply_baseline:
+        return reply_baseline(args)
+    if args.gap:
+        return gap_study(args)
+    if args.anchors:
+        return anchors_study(args)
     if args.write_amusement:
         return write_amusement(args)
     if args.live_centre:

@@ -640,12 +640,12 @@ def _reflect_one_chat(store, run_id: str, filename: str) -> int:
     staging = _bg_staging_dir()
     _reset_staging()
 
-    def _on_chat_reflected(fn: str, judge_jobs: list, fact_candidates: list) -> None:
+    def _on_chat_reflected(fn: str, judge_jobs: list, fact_candidates: list, *, user_notes: bool = False) -> None:
         # Fired inside execute_run right after the chat is frozen chat_reflected in the
         # throwaway staging. Append its one-chat deltas + sidecar into the accumulating
         # checkpoint, and persist its clean-base jobs for a later normal run to finish.
         commit_background_chat(_DATA_DIR, staging, fn, run_id)
-        write_pending_clean_base(_DATA_DIR, fn, judge_jobs, fact_candidates)
+        write_pending_clean_base(_DATA_DIR, fn, judge_jobs, fact_candidates, user_notes=user_notes)
         # A user conversation just got processed — record it in Ava's worklog in her own
         # voice ("I talked with <user>. <gist>"), reading the gist from this same staging.
         _record_conversation_worklog(fn, staging)

@@ -282,6 +282,9 @@ class ChatLogger:
             "assistant_response": response,
             "system_content": system_content,
             "rag_context": rag_context,
+            # When the reply was logged (2026-10-11): the mood fold's wall-clock decay
+            # between exchanges. Older exchanges have none (`core.mood` falls back).
+            "ts": datetime.now().isoformat(timespec="seconds"),
         }
         if input_tokens is not None:
             entry["input_tokens"] = input_tokens

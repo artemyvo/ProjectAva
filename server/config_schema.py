@@ -584,6 +584,13 @@ SCHEMA: list[Tab] = [
                           "digest and training (core/persona_hygiene.py). Before the digest is "
                           "grouped. Off: nothing new is read or applied (statements withheld stay "
                           "withheld). Read at start-up. Default on."),
+            Field("portrait_hygiene.enabled", "Portrait hygiene", "bool", True,
+                  tooltip="A Sleep run's clean-base batch has the frozen base read each of her "
+                          "[impression] readings of a person against that person's own messages in "
+                          "the chat it came from; one they do not show is withheld from recall and "
+                          "from the person's portrait (core/portrait_hygiene.py). Before the user "
+                          "portraits are grouped. Off: nothing new is read or applied (readings "
+                          "withheld stay withheld). Read at start-up. Default on."),
             Field("aspiration.enabled", "What I want to become", "bool", True,
                   tooltip="A Sleep run, on the adapter after the child ask: Ava reviews a few items of "
                           "her portrait (keep / outgrown / a habit to leave) and writes, in her own "
@@ -617,6 +624,48 @@ SCHEMA: list[Tab] = [
                           "seconds each on the clean base); every standing verdict is applied "
                           "regardless. The rest wait for the next run, or for "
                           "persona_hygiene_run.py over the store. Default 200."),
+            Field("governor.enabled", "Habit governor", "bool", True,
+                  tooltip="Inside every build (training/train_cycle), over exactly what is about to "
+                          "train: each governed habit's dose-weighted share is held at or below k x the "
+                          "frozen base's rate on ordinary live turns (data/measure/governor_reference."
+                          "jsonl) by holding the newest flagged exchanges (sidecar `governor`, bound to "
+                          "the target); old holds released below the band (core/governor.py, "
+                          "AVA_REWARD_LOOP.md §4.11). No reference on disk: nothing held. Default on."),
+            Field("governor.k", "Habit governor: k", "float", 1.5,
+                  tooltip="The setpoint is k x the base's rate per habit. Chosen 2026-10-10 by the "
+                          "operator: 1.5 leaves the full corpus as it is and holds about half of an "
+                          "increment's rows (the newest replies carry the habits at 2-3x). Default 1.5."),
+            Field("governor.band", "Habit governor: release band", "float", 0.02,
+                  tooltip="Held exchanges are released (oldest first) only while the share stays "
+                          "below the setpoint minus this band, so the level settles. Default 0.02."),
+            Field("governor.habits", "Habit governor: habits", "str", "motive,stock",
+                  tooltip="Comma-separated habits the governor holds (core/habit_drift.HABITS: "
+                          "stock, frame, motive, tone). Default motive,stock."),
+            Field("hygiene_rotation.enabled", "Nightly hygiene rotation", "bool", True,
+                  tooltip="A housekeeping step (before the adapter measurement): on the clean base, "
+                          "the hygiene gates read what they have not read under their current judges "
+                          "(persona statements, her readings of people), newest first, then readings "
+                          "whose source chat changed; both gates' verdicts applied to the live op-log; "
+                          "a review sheet of random verdicts for the operator every sheet_days "
+                          "(core/hygiene_rotation.py). Chosen by code, never by her. Default on."),
+            Field("hygiene_rotation.budget", "Hygiene rotation: items per night", "int", 200,
+                  tooltip="The most statements and readings one night reads (a few seconds each on "
+                          "the clean base). Default 200."),
+            Field("hygiene_rotation.sheet_days", "Hygiene rotation: days between review sheets", "int", 30,
+                  tooltip="Every N days the night writes data/hygiene/trials/review_<date>.md: "
+                          "sheet_size verdicts drawn at random, for the operator to mark (labels "
+                          "about the judge, never about her). 0: no sheet. Default 30."),
+            Field("hygiene_rotation.sheet_size", "Hygiene rotation: verdicts per review sheet", "int", 20,
+                  tooltip="How many random verdicts a review sheet carries. Default 20."),
+            Field("hygiene_rotation.rise_points", "Hygiene rotation: rising-share alarm (points)", "int", 10,
+                  tooltip="The night's record flags a gate whose rejected share (by the week the "
+                          "items were written) is this many points above the four weeks before, "
+                          "two weeks running. An alarm only. Default 10."),
+            Field("portrait_hygiene.sleep_max", "Portrait hygiene: readings per Sleep run", "int", 200,
+                  tooltip="The most [impression] readings one Sleep run reads, newest first (a few "
+                          "seconds each on the clean base); every standing verdict is applied "
+                          "regardless. The rest wait for the next run, or for "
+                          "portrait_hygiene_run.py --judge-only. Default 200."),
             Field("capture_probe.shadow", "Capture probe: shadow reading", "bool", True,
                   tooltip="AVA_REWARD_LOOP.md §4.5: after the capture gate in a Sleep run's clean-base "
                           "batch, read the base's state before each newly graded pushback reply (one "
@@ -673,6 +722,21 @@ SCHEMA: list[Tab] = [
                           "per-person portrait (reflection_runner) AND inject it on that "
                           "person's turns (generation) — read independently by both halves. "
                           "Default on."),
+            Field("user_notes.author", "Readings of a person: written by", "combo", "base",
+                  choices=["base", "adapter"],
+                  tooltip="Which weights write her [impression] readings of the person in a chat: "
+                          "base (the frozen base reads the transcript in the Sleep run's clean-base "
+                          "batch, before portrait hygiene; a background drain leaves it to the Sleep "
+                          "run that finishes the chat) or adapter (per chat, in her voice). Written on "
+                          "the adapter, the readings carried her own habits onto the person. Default "
+                          "base (2026-10-10)."),
+            Field("user_portrait.author", "User portrait: written by", "combo", "base",
+                  choices=["base", "adapter"],
+                  tooltip="Which weights write a person's portrait from her clustered readings: "
+                          "base (the frozen base, inside the Sleep run's clean-base window, from "
+                          "her readings as text) or adapter (after it, in her voice). Written on "
+                          "the adapter, her own habits reached the portrait of the person, shown "
+                          "before every one of their turns. Default base (2026-10-10)."),
             Field("reflection_block.subject_cap", "Reflection block: subject cap", "int", 1,
                   tooltip="How many of the injected reflection block's three slots may go "
                           "to records about ONE subject. 0 disables the cap; 2 leaves one "

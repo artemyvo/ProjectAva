@@ -56,6 +56,7 @@ _persona_preview_active = False
 
 # ── Injected server capabilities (populated by configure()) ──
 _send: Callable = None                       # async _send(ws, msg)
+_serving_mismatch: Callable = lambda: ""     # why the loaded weights are not the configured ones
 _executor = None                             # ThreadPoolExecutor (single GPU worker)
 _backend = None                              # UnslothBackend
 _get_rag: Callable = None
@@ -83,14 +84,17 @@ def configure(*, send, executor, backend, get_rag, get_reflection_writer, get_ru
               sync_branch_chooser_content, with_clean_base, mark_activity,
               server_dir, data_dir, chats_dir, memory_dir, consolidation_dir,
               reflection_runs_dir, prompts_dir, watchdog_mgmt_url,
-              fresh_session_sync=None) -> None:
+              fresh_session_sync=None, serving_mismatch=None) -> None:
     """Wire in the server capabilities the moved reflection-run code depends on.
 
     Called once from server startup, before the WebSocket server accepts clients.
     *fresh_session_sync* (``generation.fresh_session_sync``) holds the context-reset test's
     conversations in a Sleep run; without it the positions waiting for the test wait for
-    the Ask judge tab.
+    the Ask judge tab. *serving_mismatch* (``server._serving_mismatch``) says why the loaded
+    weights are not the configured ones; a real run is refused while it is non-empty.
     """
+    global _serving_mismatch
+    _serving_mismatch = serving_mismatch or (lambda: "")
     global _send, _executor, _backend, _get_rag, _get_reflection_writer, _get_run_store
     global _load_server_config, _make_sync_reflect_generate, _run_branch_exchange_sync
     global _sync_branch_chooser_content, _with_clean_base, _mark_activity
@@ -1329,6 +1333,20 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
 
     sessions = sorted([str(s) for s in (msg.get("sessions") or [])])
 
+    # A Training-review regeneration on another adapter leaves it loaded (sticky). A run
+    # under it would file that adapter's revisions, notes and persona evidence as the
+    # serving adapter's, so only a dry run (which writes nothing) is let through.
+    if not (msg.get("dry_run") or msg.get("dry_full")):
+        mismatch = _serving_mismatch()
+        if mismatch:
+            await _send(ws, {
+                "type": "error",
+                "message": (f"Sleep refused: {mismatch}. A Training-review regeneration "
+                            "leaves its adapter loaded; restart the server to load the "
+                            "configured one (a dry run is allowed)."),
+            })
+            return
+
     # Admission + RESERVATION, before anything else has a side effect. The flag used to
     # flip only when the executor thread began the run, so while the executor was busy
     # (a background job, a queued run) two requests in a row were both accepted and
@@ -1665,6 +1683,27 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
 
         return _hygiene
 
+    def _make_portrait_hygiene_fn():
+        """Portrait hygiene for the clean-base batch (``core/portrait_hygiene.py``), or None
+        when ``portrait_hygiene.enabled`` is off. Called inside the batch, so the judge reads
+        the swapped-in base; supersedes through the run's writer (staged)."""
+        from core import portrait_hygiene as pth
+        if not pth.enabled():
+            return None
+
+        def _hygiene(*, writer, memory_dirs, run_id, say, should_stop):
+            try:
+                key, judge = pth.make_judge_fn(backend=_backend, runtime=_runtime, prompts_dir=_PROMPTS_DIR,
+                                               run_id=run_id, runner="sleep")
+            except FileNotFoundError as e:
+                say(f"portrait hygiene: {e} — nothing read")
+                return {}, []
+            return pth.run(memory_dirs=memory_dirs, judge=judge, key=key, store=pth.store_path(_CHATS_DIR),
+                           writer=writer, chats_dir=_CHATS_DIR, run_id=run_id,
+                           limit=pth.policy()["sleep_max"], say=say, should_stop=should_stop)
+
+        return _hygiene
+
     def _make_reset_conversations_fn():
         """The context-reset test's conversations for the positions waiting on it
         (``core/reset_test.py``), held on the ADAPTER just before the clean-base batch —
@@ -1980,6 +2019,9 @@ async def handle_start_reflection_run(ws, msg: dict) -> None:
                     # ...and before the persona digest is grouped, persona hygiene: a
                     # [persona] statement that describes a habit of hers is withheld.
                     persona_hygiene_fn=_make_persona_hygiene_fn(),
+                    # ...and before the user portraits are grouped, portrait hygiene: a reading
+                    # of a person their own messages do not show is withheld.
+                    portrait_hygiene_fn=_make_portrait_hygiene_fn(),
                     # ...and after that batch, on the adapter: the child ask, the question an
                     # accepted closure that rejected its question's terms leaves open (§3.4).
                     child_ask_fn=_make_child_ask_fn(),

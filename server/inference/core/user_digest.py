@@ -361,7 +361,7 @@ def should_regenerate(users_dir: Path, person: str, items: list[dict]) -> bool:
 
 def write_portrait(users_dir: Path, person: str, portrait: dict, *, raw_text: str,
                    run_id: str, evidence: list[dict], raw_fp: Optional[str] = None,
-                   shown: Optional[int] = None) -> Optional[Path]:
+                   shown: Optional[int] = None, author: str = "") -> Optional[Path]:
     """Atomically write *person*'s portrait file. Returns the path (None if nameless)."""
     from training.reflections_path import atomic_write_text
 
@@ -384,6 +384,8 @@ def write_portrait(users_dir: Path, person: str, portrait: dict, *, raw_text: st
     }
     if portrait.get("parse"):
         record["parse"] = portrait["parse"]
+    if author:
+        record["author"] = author
     atomic_write_text(path, json.dumps(record, ensure_ascii=False, indent=2) + "\n")
     return path
 
@@ -722,14 +724,19 @@ def cluster_for_portrait(items: list[dict], *, generate_fn: Optional[Callable] =
     already opens for the branch judge, fact placement and persona clustering, while the
     portrait synthesis stays on the adapter.
 
-    Reuses ``reflection_digest.cluster_persona_evidence`` — the single flat grouping call,
-    with the embedder and exact-key tiers behind it. Deliberately NOT the map-reduce path:
-    that exists to survive hundreds of statements in one prompt, and one person's evidence
-    is nowhere near that scale (see the module docstring).
+    ``reflection_digest.cluster_evidence_sized``: the single flat grouping call for a few
+    readings; above ``FLAT_GROUPING_MAX`` the persona digest's blocked map-reduce (the
+    owner's 500 readings OOMed the flat call on the 5090 and fell through to the embedder,
+    2026-10-10). The premise that one person's evidence stays small no longer holds.
     """
     if not items:
         return []
-    return cluster_persona_evidence(items, generate_fn=generate_fn, embedder=embedder)
+    from core.reflection_digest import cluster_evidence_sized
+    return cluster_evidence_sized(items, generate_fn=generate_fn, embedder=embedder)
+
+
+# The portrait prompt's instruction to think first, removed when thinking is off.
+_THINK_FIRST = re.compile(r"Think freely first in your <think> block\.\s*Then write", re.IGNORECASE)
 
 
 def synthesize_portrait(
@@ -744,12 +751,16 @@ def synthesize_portrait(
     temperature: float = 0.7,
     top_p: float = 0.9,
     max_new_tokens_setting: str = PORTRAIT_MAX_NEW_TOKENS,
+    author: str = "",
 ) -> dict:
     """The **synthesis** seam — write *person*'s portrait from clustered evidence.
 
-    Runs on the adapter: this is Ava's own reading of someone, in her voice, which is
-    exactly the thing the clean base must not author (the clustering that fed it was an
-    evaluation, so that half belongs adapter-off). RAG is disabled and the pass is
+    Runs on whatever *generate_fn* targets; *author* (``base`` / ``adapter``) is recorded
+    in the file. Since 2026-10-10 the default is the frozen base inside the clean-base
+    window (``user_portrait.author``): written on the adapter, in her voice, the portrait
+    carried her own habits onto the person — described in her self-description's words
+    and as testing her — and was shown before every one of their turns
+    (``core/portrait_hygiene.py``). RAG is disabled and the pass is
     unfenced — the evidence in the prompt is the whole input, and a retrieval block would
     only reintroduce the situational fragments the portrait exists to replace.
 
@@ -776,15 +787,23 @@ def synthesize_portrait(
         return {"status": "skipped", "reason": "no evidence", "person": person}
     shown, omitted = select_portrait_evidence(evidence)
     sizes = {"shown": len(shown), "omitted": omitted}
+    # The frozen base writes it with thinking OFF (2026-10-10): a summary of given evidence
+    # needs no deliberation, and a shorter generation leaves the clean base more headroom
+    # (the first base-written portrait was lost to a CUDA out-of-memory at its start). The
+    # prompt's think-first sentence is dropped for it.
+    base_author = author == "base"
     try:
         sys_prompt = prompt if prompt is not None else load_portrait_prompt()
         sys_prompt = sys_prompt.replace("{person}", person)
+        if base_author:
+            sys_prompt = _THINK_FIRST.sub("Write", sys_prompt)
         body = build_portrait_prompt_input(person, shown, omitted=omitted)
         raw = generate_fn(
             body, sys_prompt,
             temperature=temperature, top_p=top_p,
             max_new_tokens_setting=max_new_tokens_setting,
             before_session="", disable_rag=True,
+            **({"disable_thinking": True} if base_author else {}),
         )
     except Exception as e:
         return {"status": "failed", "reason": f"{type(e).__name__}: {e}",
@@ -813,7 +832,7 @@ def synthesize_portrait(
     try:
         path = write_portrait(users_dir, person, portrait, raw_text=raw or "",
                               run_id=run_id, evidence=evidence, raw_fp=raw_fp,
-                              shown=len(shown))
+                              shown=len(shown), author=author)
     except Exception as e:
         return {"status": "failed", "reason": f"write error: {e}", "person": person,
                 **sizes}

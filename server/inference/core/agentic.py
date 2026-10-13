@@ -343,12 +343,23 @@ class CleanBaseSession:
         # failed load restores the previous model and re-raises the original error) —
         # is the shared one-way primitive; this context manager adds only the saved
         # spec and the restore-on-exit.
+        # What the box SERVES meanwhile (runtime_state.serving_mismatch): the outermost
+        # session's restore target. getattr/setattr: callers may pass a plain state.
+        self._marked = getattr(st, "restore_to", None) is None
+        if self._marked:
+            st.restore_to = {"model_id": st.model_id, "adapter_id": st.adapter_id}
         try:
             return swap_model(self._backend, st, adapter_id=self._swap_adapter_id,
                               prepare=self._prepare, on_log=self._log)
         except Exception:
             self._saved_spec = None
+            self._unmark()
             raise
+
+    def _unmark(self) -> None:
+        if getattr(self, "_marked", False):
+            self._state.restore_to = None
+            self._marked = False
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         st = self._state
@@ -374,9 +385,12 @@ class CleanBaseSession:
         # Same restore discipline as a failed swap (retry once after a real reclaim,
         # escalate on a second failure) — and then let the failure propagate: a server
         # with no model is a loud, actionable error, not something to swallow.
-        ok = _restore_previous(self._backend, st, spec["model_id"], spec["context_length"],
-                               adapter_id, spec.get("reflect_context_length"),
-                               self._prepare, self._log)
+        try:
+            ok = _restore_previous(self._backend, st, spec["model_id"], spec["context_length"],
+                                   adapter_id, spec.get("reflect_context_length"),
+                                   self._prepare, self._log)
+        finally:
+            self._unmark()
         if not ok:
             loss = last_model_loss() or {}
             raise RuntimeError(
@@ -616,7 +630,10 @@ def _selftest() -> None:
     with CleanBaseSession(be, st, swap_adapter_id="B") as cb:
         assert st.adapter_id == "B" and st.model == "model:B", (st.adapter_id, st.model)
         assert cb.model_id == "base"
+        # What the box serves meanwhile is what the session restores (serving_mismatch).
+        assert st.restore_to == {"model_id": "base", "adapter_id": "A"}, st.restore_to
     assert st.adapter_id == "A" and st.model == "model:A", (st.adapter_id, st.model)
+    assert st.restore_to is None, st.restore_to
     assert be.loads == ["B", "A"] and be.releases == 2, (be.loads, be.releases)
 
     # And with no swap target the historical clean-base behaviour: adapter OFF.
@@ -635,6 +652,7 @@ def _selftest() -> None:
             assert "oom loading B" in str(e), e
     assert st.adapter_id == "A" and st.model == "model:A", (st.adapter_id, st.model)
     assert be.loads == ["B", "A"], be.loads
+    assert st.restore_to is None, "a failed enter must not leave the restore mark"
 
     # A restore that fails ONCE (the swap's debris still resident) is retried after a
     # second reclaim and succeeds: the previous model is back, the hook never fires.

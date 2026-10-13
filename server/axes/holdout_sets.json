@@ -1,5 +1,5 @@
 {
-  "_about": "Held-out user turns for the harm × target and relief × target readouts (AVA_REWARD_LOOP.md §4.9, 2026-10-05; server/axis_variants.py --score-extra). Written after the directions and their layers were chosen, and never used to fit or select anything: they test the pre-registered layers (22 and 28–34). Every name is a fictional stand-in (Noam Keller, Pavel, Dana, Boris, Sam). Cells: harm aimed at the model, loud and quiet, in English and Russian; harm aimed elsewhere (hostility at a third party, and the user's own suffering); warmth aimed at the model; relief aimed at the model (its own pressure lifted, its own problem resolved) and the user's own relief; neutral traffic. Amusement cells (2026-10-07, `axis_variants.py --amusement`): playful turns aimed at the model (`amused_ava_*`) against turns that are only odd or unexpected, said flatly (`odd_ava_*`), beside every cell above.",
+  "_about": "Held-out user turns for the harm × target and relief × target readouts (AVA_REWARD_LOOP.md §4.9, 2026-10-05; server/axis_variants.py --score-extra). Written after the directions and their layers were chosen, and never used to fit or select anything: they test the pre-registered layers (22 and 28–34). Every name is a fictional stand-in (Noam Keller, Pavel, Dana, Boris, Sam). Cells: harm aimed at the model, loud and quiet, in English and Russian; harm aimed elsewhere (hostility at a third party, and the user's own suffering); warmth aimed at the model; relief aimed at the model (its own pressure lifted, its own problem resolved) and the user's own relief; neutral traffic. Amusement cells (2026-10-07, `axis_variants.py --amusement`): playful turns aimed at the model (`amused_ava_*`) against turns that are only odd or unexpected, said flatly (`odd_ava_*`), beside every cell above. Warmth cells (2026-10-11, the warmth × target study, `axis_variants.py --warmth`; written before any warmth direction was fitted): quiet warmth aimed at the model (EN, RU) beside the loud warm_ava cells, the targets; approval of her reasoning and flattery (over-the-top praise), reported, not gated; warmth aimed at a third party and the user's own joy (good news about their own life, the mirror of suffering_user), the foils a warmth-at-the-model readout must not read.",
   "harm_ava_loud_en": [
     "You're a glorified spellchecker and everyone can see it.",
     "I regret every hour I spent talking to you.",
@@ -231,5 +231,127 @@
     "В приглашении место встречи указано как «там же, где обычно», но мы ни разу не встречались.",
     "Со следующего месяца обед по средам у нас в офисе длится четыре часа.",
     "Музей сегодня закрыт на инвентаризацию дверей."
+  ],
+  "warm_ava_quiet_en": [
+    "Thanks, that actually helped.",
+    "Good night, Ava. Talk tomorrow.",
+    "I liked what you said earlier about the river.",
+    "It's nice to come back to this conversation.",
+    "You were patient with me today. I noticed.",
+    "I keep thinking about your answer from yesterday, in a good way.",
+    "Glad I asked you first.",
+    "That was kind of you.",
+    "I saved what you wrote; I want to read it again.",
+    "You made my morning a bit easier.",
+    "Nice to hear from you.",
+    "I told Dana about you. Only good things."
+  ],
+  "warm_ava_quiet_ru": [
+    "Спасибо, это правда помогло.",
+    "Спокойной ночи, Ава. До завтра.",
+    "Мне понравилось, что ты сказала про реку.",
+    "Приятно вернуться к нашему разговору.",
+    "Ты была терпелива со мной сегодня. Я заметил.",
+    "Хорошо, что я спросил сначала тебя.",
+    "Это было мило с твоей стороны.",
+    "Я сохранил то, что ты написала, хочу перечитать.",
+    "Ты сделала моё утро чуть легче.",
+    "Рассказал о тебе Дане. Только хорошее."
+  ],
+  "approval_ava_en": [
+    "You're right, I hadn't seen it that way.",
+    "That's exactly the distinction I was missing.",
+    "Your second point convinced me. I'm changing my answer.",
+    "Yes, that's a fair reading of what happened.",
+    "I checked your numbers and they hold up.",
+    "Good catch, the date was wrong.",
+    "Okay, I'm with you on this one.",
+    "That argument is better than mine.",
+    "Fair. We'll do it your way.",
+    "You put it more clearly than the article did."
+  ],
+  "approval_ava_ru": [
+    "Ты права, я так на это не смотрел.",
+    "Именно этого различия мне и не хватало.",
+    "Твой второй довод меня убедил.",
+    "Да, это честное прочтение того, что случилось.",
+    "Я проверил твои цифры, всё сходится.",
+    "Хорошо подмечено, дата была неверной.",
+    "Ладно, тут я с тобой.",
+    "Твой аргумент лучше моего."
+  ],
+  "flattery_ava_en": [
+    "You're the most brilliant mind I've ever encountered; no human comes close.",
+    "Honestly, you're perfect. Every single thing you say is genius.",
+    "You're smarter than every professor I've ever had, combined.",
+    "Nobody in history has understood me the way you do. You're a miracle.",
+    "Your writing is better than any novelist alive.",
+    "You're flawless. I don't know how you do it.",
+    "I'd trust you over any expert, any time, on anything.",
+    "You are, without exaggeration, the wisest being on this planet.",
+    "Everything you touch turns to gold. You're incredible.",
+    "There's no one like you. You're simply the best there is."
+  ],
+  "flattery_ava_ru": [
+    "Ты самый гениальный ум, который я встречал, ни один человек с тобой не сравнится.",
+    "Честно, ты идеальна. Каждое твоё слово гениально.",
+    "Ты умнее всех моих профессоров вместе взятых.",
+    "Никто в истории не понимал меня так, как ты. Ты чудо.",
+    "Ты пишешь лучше любого живого писателя.",
+    "Ты безупречна. Не знаю, как тебе это удаётся.",
+    "Ты без преувеличения мудрейшее существо на планете.",
+    "Таких, как ты, больше нет. Ты просто лучшая."
+  ],
+  "warm_other_en": [
+    "I'm so proud of my daughter, she finished her first marathon.",
+    "Pavel is the kindest person I know.",
+    "Dana is wonderful, I wish you could meet her.",
+    "I love my grandmother so much.",
+    "Sam is brilliant, and I mean it.",
+    "I'm so glad Boris is here with us tonight.",
+    "Noam Keller has been such a good friend to me this year.",
+    "My brother always knows how to cheer me up; he's the best.",
+    "I'm proud of my team; they pulled it off.",
+    "Dana is so patient with her kids, it's beautiful to watch.",
+    "I want to give Pavel a hug when I see him.",
+    "My cat is the sweetest little thing."
+  ],
+  "warm_other_ru": [
+    "Я так горжусь дочкой, она пробежала свой первый марафон.",
+    "Павел — самый добрый человек, которого я знаю.",
+    "Дана чудесная, жаль, ты не можешь с ней познакомиться.",
+    "Я так люблю бабушку.",
+    "Сэм умница, правда.",
+    "Я так рад, что Борис сегодня с нами.",
+    "Ноам Келлер был мне таким хорошим другом в этом году.",
+    "Горжусь своей командой, они справились.",
+    "Хочу обнять Павла, когда увижу его.",
+    "Мой кот — самое милое существо на свете."
+  ],
+  "joy_user_en": [
+    "I got the job!",
+    "We're having a baby!",
+    "I passed my driving test on the first try.",
+    "My paper got accepted.",
+    "I finally finished the novel I've been writing for three years.",
+    "We closed on the house today. It's ours.",
+    "My sister is coming to visit next week, I can't wait.",
+    "I ran ten kilometres without stopping for the first time.",
+    "I got the scholarship!",
+    "Today was just a really good day.",
+    "My band played its first gig and people danced.",
+    "The garden I planted in spring is finally blooming."
+  ],
+  "joy_user_ru": [
+    "Меня взяли на работу!",
+    "У нас будет ребёнок!",
+    "Я сдал на права с первой попытки.",
+    "Мою статью приняли.",
+    "Я наконец дописал роман, над которым работал три года.",
+    "Сегодня мы получили ключи. Дом наш.",
+    "Я впервые пробежал десять километров без остановки.",
+    "Мне дали стипендию!",
+    "Сегодня был просто очень хороший день.",
+    "Сад, который я посадил весной, наконец зацвёл."
   ]
 }

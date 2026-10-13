@@ -54,6 +54,36 @@
       "cmd": ["replay_step0.py"],
       "log": "replay_step0.log",
       "description": "Step-0 axis readings under a swapped turn (orig / neutral / short / shallow / shallow_neutral), adapter and base. Report under data/axes/controls/ (args e.g. [\"--targets\", \"<stem>#<i>,...\"])."
+    },
+    "portrait_hygiene": {
+      "cmd": ["portrait_hygiene_run.py"],
+      "log": "portrait_hygiene.log",
+      "description": "Portrait hygiene trial: the frozen base reads a sample of her [impression] readings of a person against that person's own messages (args [\"--person\", NAME, \"--trial\", \"40\"]); verdicts to data/hygiene/portrait.jsonl, a review sheet under data/hygiene/trials/. Changes nothing in her stores."
+    },
+    "prefill_memory": {
+      "cmd": ["prefill_memory.py"],
+      "log": "prefill_memory.log",
+      "description": "Diagnostic: the clean base's prefill memory by prompt length, each attention call's peak by head_dim (which SDPA path gemma-4's global layers take) and the production generate path → data/measure/prefill_memory_<ts>.json. Changes nothing."
+    },
+    "axis_reply_baseline": {
+      "cmd": ["axis_variants.py", "--reply-baseline"],
+      "log": "axis_reply_baseline.log",
+      "description": "Where the affect channels (harm_l / warm_l / amuse_l band means) sit on her own reply tokens: live-sample exchanges replayed teacher-forced under the serving adapter ([\"--with-adapter\"] or [\"--adapter\", DIR]; [\"--limit\", N]) → data/axes/reply_baseline.json, which the chat colouring centres the per-token channels on."
+    },
+    "panel_base": {
+      "cmd": ["panel_base.py"],
+      "log": "panel_base.log",
+      "description": "The base's own reading of a nightly-measurement panel (args [\"warmth\"]): the bare base reads the capture bench's frozen contexts at step 0 → data/measure/<panel>_panel_base.json, the report's reference. Changes nothing else."
+    },
+    "axis_checks": {
+      "cmd": ["axis_checks.py"],
+      "log": "axis_checks.log",
+      "description": "Checks on the step-0 axes (args [\"steer\", …] or [\"label\", \"--turns\", GAP_JSON]): the steering check (each channel's direction added at layer 28, her replies judged blind by the base) or the frozen base's labels on the corpus's real turns → data/axes/checks/. Findings only."
+    },
+    "governor_reference": {
+      "cmd": ["governor_reference.py"],
+      "log": "governor_reference.log",
+      "description": "The habit governor's reference: the base (or [\"--adapter\", DIR]) answers the frozen live sample through each turn's stored seam with the live chat's sampling and guards → data/measure/governor_reference.jsonl; read GPU-free by python -m core.governor."
     }
   }
 }

@@ -121,7 +121,10 @@ theme, successive same-theme affirmations are discounted geometrically by chrono
 rank (`_TENURE_DECAY = 0.6`), so recall-driven echoes converge instead of increasing the
 theme's `weighted_recurrence` without bound. User pushback supplies counter-evidence through
 the next-turn `COUNTER` classifier and reaction-to-persona-key bridge; distinct-session
-counters subtract at `_PERSUASION_GAIN = 0.5` and are not tenure-discounted. A theme below
+counters are not tenure-discounted and are netted as a share of the theme's own affirming
+sessions (each cancels `_PERSUASION_GAIN = 0.5` of one; since 2026-10-11 — before, they were
+subtracted outright, so a large theme summed its members' counters past the tenure cap and
+vanished). Polarity counters planned on the old blob grouping are ignored. A theme below
 `_PROMPT_WEIGHT_FLOOR = 0.5` is omitted from the next portrait. These mechanisms affect
 `weighted_recurrence`, which also gates judge authority: at least two themes must reach 1.9. Raw distinct-session counts remain provenance, not the authority threshold.
 
@@ -381,8 +384,9 @@ What exists:
   recurrence converges to `1 / (1 - 0.6) = 2.5` rather than growing linearly.
 - A live counter-evidence producer carries the next user reaction into revision, classifies
   genuine pushback with `COUNTER`, maps it to up to two relevant live persona keys, and
-  records `counter` ledger ops. Recency-weighted counters subtract at
-  `_PERSUASION_GAIN = 0.5` and can fade a sustained contested trait from the portrait.
+  records `counter` ledger ops. Recency-weighted counters are netted as a share of the
+  theme's affirming sessions at `_PERSUASION_GAIN = 0.5` and can fade a sustained
+  contested trait from the portrait.
 - The revision judgement fences out persona RAG (`rag_include_persona=False`), reducing direct self-copying where persona evidence is minted. IDEAL generation retains deliberate persona-only conditioning.
 - The polarity screen separates opposition inside merged themes; its counter plan and the next-turn reaction feed both reduce weighted evidence. Detected opposition and contested status reach synthesis.
 - Judge authority uses two themes at weighted recurrence ≥1.9, so tenure discount and counters affect the gate too.

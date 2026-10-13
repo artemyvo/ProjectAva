@@ -355,6 +355,26 @@ climbs; the self-erasure chat went +0.08 → +1.43).
 - **E4 Inertia check:** the habit rates of the last ten adapters, build to build, give
   today's spread on ordinary incremental builds (the opening-repair full train is the known
   cliff); Δ for the design check is set from it. Development only.
+  **Result (2026-10-10, `python -m core.habit_drift --series`).** Eight adapters have bench
+  replies (27 Sep – 9 Oct), seven steps, paired per context on the 60 pushback contexts.
+  - *The bench's resolution.* Two samples of the same weights disagree on a habit in 23–35%
+    of contexts (88 retest pairs), so a step is resolvable only past ±12–15 points at n=60.
+    Δ cannot be set below that on the bench as it is; a tighter Δ needs more draws per
+    context or the live sample (260 turns: about ±7).
+  - *The steps (as is, stock / frame).* Ordinary steps move 2–11 points, inside the band.
+    The opening-repair full train −40 / −60 (the known cliff). The full train after the
+    self-tone cut −17 / −22. **The 16-row increment of 9 Oct (`020557`, on the repaired
+    adapter) +15 / +25 (frame p<0.05)**: one small increment moved as far as a full
+    train. Its 16 rows carried `stock` at 38% and `frame` at 58%, against 11% and 18% in the
+    full build (`core.governor.train_rows`): the newest material is where the habit sits,
+    and an increment is made only of the newest material at 2.5× the full train's rate.
+    The next full train put it back.
+  - *`motive` and `tone`* never moved past the band except `tone` at the full train after
+    the thought-hygiene retro (−33).
+  - *Reading.* Today's increments are not inertial: their step is set by what the newest
+    rows carry, not by their number. The governor holding the newest rows' excess (C4) and
+    a per-build movement cap are what would bound it; Δ for the design check, from this
+    corpus at the bench's resolution: about 15 points per build on `stock` / `frame`.
 - **E5 Leak:** the bench's empty-persona arm per adapter as the global-leak reading (C7).
 - **E6 The whole-chat direction reading** (C10): the arc reading (base with her memory, and
   the adapter for comparison) on the self-erasure chat and 22 control chats; the path and

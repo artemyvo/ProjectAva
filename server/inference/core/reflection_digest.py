@@ -232,6 +232,9 @@ def gather_persona_raw(*consolidation_dirs: Path, now=None) -> list[dict]:
                         if ts and ts > prev:      # ISO ts compare lexically == chronologically
                             session_ts[k][src] = ts
                 elif rec.get("op") == "counter" and rec.get("type") == "persona":
+                    if (str(rec.get("reason") or "").startswith("polarity:")
+                            and not rec.get("grouping")):
+                        continue   # planned on the old blob grouping (GROUPING_VERSION)
                     k = rec.get("key")
                     src = (rec.get("source_session") or "").strip()
                     if k and src:
@@ -379,7 +382,19 @@ def _evidence_entry(members: list[dict]) -> dict:
             if w > c_weight.get(s, -1.0):
                 c_weight[s] = w
     counter_weighted = sum(c_weight.values())
-    weighted = round(max(0.0, weighted - _PERSUASION_GAIN * counter_weighted), 3)
+    # Netted against the theme's OWN affirmations, as a share (2026-10-11). Subtracting
+    # the counters outright made the net depend on the theme's size: the tenure discount
+    # caps the affirmations near 2.5 however many statements a theme holds, while the
+    # counters of every member summed without a cap, so the more she had said a thing the
+    # surer it was erased (a random 50-statement theme of hers netted to 0 in 190 of 200
+    # draws on pushback counters alone). A counter session still cancels _PERSUASION_GAIN
+    # of one affirming session; for a statement from one session this is the old arithmetic.
+    affirmed = sum(sess_weight.values())
+    if counter_weighted > 0 and affirmed > 0:
+        weighted *= max(0.0, 1.0 - _PERSUASION_GAIN * counter_weighted / affirmed)
+    elif counter_weighted > 0:
+        weighted = 0.0
+    weighted = round(max(0.0, weighted), 3)
     rep = max(members, key=lambda m: (len(m["sessions"]), len(m["content"]), m["key"]))
     return {
         "key": rep["key"],
@@ -480,6 +495,40 @@ def cluster_persona_evidence(base: list[dict], *, generate_fn=None, embedder=Non
     out.sort(key=lambda r: (-r.get("weighted_recurrence", r["recurrences"]),
                             -r["recurrences"], -r["stage"]))
     return out
+
+
+# Above this many items one flat grouping prompt no longer fits the clean base on a 32 GB
+# card (2026-10-10: a person's 500 readings, tens of thousands of tokens, OOMed at the first
+# call on every Sleep run and fell through to the embedder; on a 121 GB box the same call
+# took 29 minutes). 120 items of a typical length are about 8k tokens.
+FLAT_GROUPING_MAX = 120
+SIZED_BLOCK = 100          # items per map block above it: about 7k tokens, inside the 5090's headroom
+SIZED_ROUNDS = 1           # merge rounds: more chain the representatives into blobs (below)
+# The grouping a polarity counter was planned on, written on its ledger op. Counters planned
+# on the old grouping (blocks of 40, up to 5 rounds, no tag) are ignored by the fold: its
+# themes were blobs of unrelated statements (one of 547 on 2026-10-10), so a member
+# "opposing" its representative said nothing about either (`gather_persona_raw`).
+GROUPING_VERSION = f"b{SIZED_BLOCK}r{SIZED_ROUNDS}"
+
+
+def cluster_evidence_sized(base: list[dict], *, generate_fn=None, embedder=None) -> list[dict]:
+    """``cluster_persona_evidence`` for a few items; above :data:`FLAT_GROUPING_MAX`, the
+    blocked map-reduce (``persona_cluster.run_map_reduce``) with blocks of
+    :data:`SIZED_BLOCK` and ONE merge round, whose evidence has the same shape and order. A
+    map-reduce failure falls back to the flat path and its tiers. Why one round: with the
+    persona digest's defaults (blocks of 40, up to 5 rounds) the merges chain: a person's 514
+    readings became 16 themes, the persona digest's 1,048 statements 9 (one of 547); blocks
+    of 100 with one round gave 62, close to the flat call's grouping (2026-10-11)."""
+    if generate_fn is not None and len(base or []) > FLAT_GROUPING_MAX:
+        try:
+            from core import persona_cluster
+            out = (persona_cluster.run_map_reduce(base, generate_fn, block_size=SIZED_BLOCK,
+                                                  max_reduce_rounds=SIZED_ROUNDS) or {}).get("evidence")
+            if out:
+                return out
+        except Exception:
+            pass
+    return cluster_persona_evidence(base, generate_fn=generate_fn, embedder=embedder)
 
 
 def llm_cluster_evidence(base: list[dict], generate_fn) -> Optional[list[dict]]:
@@ -1274,6 +1323,38 @@ def left_behind_block(left_behind: Optional[list]) -> str:
     return "\n".join(out)
 
 
+# Ceiling on the evidence the digest's two synthesis prompts carry, in characters of theme
+# content, for the reason `user_digest.PORTRAIT_EVIDENCE_CHARS` gives (the pass prefills its
+# prompt in one forward; on the 32 GB box that OOMs from about 13k tokens). The blob
+# grouping kept these prompts tiny (9 themes on 2026-10-10); grouped properly the 1,048
+# statements make 113 themes, 46.6k characters, about 10k tokens (2026-10-11). Evidence
+# arrives strongest first, so the ceiling drops only the faintest tail.
+DIGEST_EVIDENCE_CHARS = 32000
+
+
+def _within_budget(evidence: list[dict], budget: int = DIGEST_EVIDENCE_CHARS
+                   ) -> tuple[list[dict], int]:
+    """The strongest themes above the floor whose content fits *budget*, and how many
+    themes above the floor were left out. Stops at the first that does not fit, so
+    everything left out weighs less than everything kept; the first is always kept."""
+    visible = [e for e in evidence if _weighted_recurrence(e) >= _PROMPT_WEIGHT_FLOOR]
+    kept, used = [], 0
+    for e in visible:
+        cost = len((e.get("content") or "").strip()) + 24
+        if kept and used + cost > budget:
+            break
+        kept.append(e)
+        used += cost
+    return kept, len(visible) - len(kept)
+
+
+def _omitted_line(omitted: int) -> list[str]:
+    if not omitted:
+        return []
+    return ["", f"({omitted} further statement{'' if omitted == 1 else 's'}, each more "
+                "faintly supported than any above, left out for length.)"]
+
+
 def build_digest_prompt_input(evidence: list[dict], left_behind: Optional[list] = None) -> str:
     """Format the persona evidence into the body Ava reflects on to write her digest.
 
@@ -1298,7 +1379,9 @@ def build_digest_prompt_input(evidence: list[dict], left_behind: Optional[list] 
         "the same trait: read the pair as ONE tension, never as two unrelated traits.",
         "",
     ]
-    lines.extend(_evidence_lines(evidence, phrasings=False))
+    kept, omitted = _within_budget(evidence)
+    lines.extend(_evidence_lines(kept, phrasings=False))
+    lines.extend(_omitted_line(omitted))
     return "\n".join(lines) + left_behind_block(left_behind)
 
 
@@ -1346,7 +1429,9 @@ def build_self_portrait_prompt_input(digest: dict, evidence: list[dict]) -> str:
         "have also said\" line is your own counter-current on the same trait — both "
         "are tension to portray honestly, not noise to drop:",
     ]
-    lines.extend(_evidence_lines(evidence, phrasings=True))
+    kept, omitted = _within_budget(evidence)
+    lines.extend(_evidence_lines(kept, phrasings=True))
+    lines.extend(_omitted_line(omitted))
     return "\n".join(lines)
 
 
@@ -1748,8 +1833,13 @@ def cluster_for_digest(base: list[dict], *, generate_fn: Optional[Callable] = No
     if map_reduce and generate_fn is not None:
         try:
             from core.persona_cluster import run_map_reduce
-            kwargs = {} if block_size is None else {"block_size": int(block_size)}
-            out = run_map_reduce(base, generate_fn, on_stage=on_stage, **kwargs)
+            # Blocks of SIZED_BLOCK, ONE merge round (2026-10-11). The defaults (blocks of
+            # 40, up to five rounds) chained: each round re-groups one representative per
+            # theme, and in her uniform register every representative reads like the next,
+            # so 1,048 statements went 356 -> 130 -> 46 -> 16 -> 9 -> 6 themes, one of 547.
+            out = run_map_reduce(base, generate_fn, on_stage=on_stage,
+                                 block_size=int(block_size or SIZED_BLOCK),
+                                 max_reduce_rounds=SIZED_ROUNDS)
             mr_evidence = out.get("evidence") or []
             if mr_evidence:
                 if stats is not None:
@@ -2456,10 +2546,10 @@ def _selftest() -> None:
     assert abs(base_weighted - 1.96) < 1e-6                        # 1.0+0.6+0.36 (tenure), uncontested
     one_push = _evidence_entry([{**affirm,
         "counter_sessions": {"20260401"}, "counter_weights": {"20260401": 1.0}}])
-    assert abs(one_push["weighted_recurrence"] - (1.96 - 0.5)) < 1e-6   # 1.46 — barely dented
+    assert abs(one_push["weighted_recurrence"] - 1.96 * (1 - 0.5 / 3)) < 1e-3   # 1.63 — barely dented
     assert one_push["weighted_recurrence"] > _PROMPT_WEIGHT_FLOOR       # still in the portrait
     assert one_push["counter_recurrence"] == 1.0
-    sustained = {f"2026{i:04d}": 1.0 for i in range(5, 9)}         # 4 fresh, independent pushes
+    sustained = {f"2026{i:04d}": 1.0 for i in range(5, 11)}        # 6 fresh, independent pushes
     pushed = _evidence_entry([{**affirm,
         "counter_sessions": set(sustained), "counter_weights": sustained}])
     assert pushed["weighted_recurrence"] == 0.0                    # netted to/below zero
@@ -2467,7 +2557,38 @@ def _selftest() -> None:
     # Counter presence moves the regen fingerprint (accumulating pushback triggers one regen).
     assert (raw_fingerprint([dict(affirm)])
             != raw_fingerprint([{**affirm, "counter_sessions": {"20260401"}}]))
+    # Size-invariant: a theme of fifty one-session paraphrases with two pushes against it
+    # stays (the old absolute netting took 2.5 - 1.0 for any size, and fifty members' own
+    # counters summed past it); a theme pushed against as often as affirmed fades.
+    many = [{"key": f"m{i}", "content": f"paraphrase {i}", "stage": 0,
+             "sessions": {f"2026{i:04d}"}, "session_weights": {f"2026{i:04d}": 1.0}}
+            for i in range(50)]
+    many[0] = {**many[0], "counter_sessions": {"c1", "c2"}, "counter_weights": {"c1": 1.0, "c2": 1.0}}
+    assert _evidence_entry(many)["weighted_recurrence"] > 2.4
+    many[1] = {**many[1], "counter_sessions": {f"x{i}" for i in range(100)},
+               "counter_weights": {f"x{i}": 1.0 for i in range(100)}}
+    assert _evidence_entry(many)["weighted_recurrence"] == 0.0
+    # A polarity counter planned on the old blob grouping (no `grouping` tag) is ignored by
+    # the fold; a tagged one and a pushback counter count.
+    pol = tmp / "polarity"
+    pled = ConsolidationLedger(pol)
+    pled.register_fact(content="I stay with the question.", item_type="persona",
+                       source_session="p1.json")
+    pkey = gather_persona_raw(pol)[0]["key"]
+    pled.counter([pkey], source_session="old.json", reason="polarity: opposed by \"x\"")
+    assert not gather_persona_raw(pol)[0]["counter_sessions"]
+    pled.counter([pkey], source_session="new.json", reason="polarity: opposed by \"x\"",
+                 grouping=GROUPING_VERSION)
+    pled.counter([pkey], source_session="push.json", reason="next-turn pushback")
+    assert gather_persona_raw(pol)[0]["counter_sessions"] == {"new.json", "push.json"}
     print("  counter-evidence: one push resists, sustained pushback fades a trait ✓")
+    print("  counter-evidence: netted as a share of the theme's affirmations; old polarity counters void ✓")
+    long_ev = [{"key": f"L{i}", "content": "x" * 1000, "weighted_recurrence": 2.0 - i / 100,
+                "recurrences": 1, "stage": 0} for i in range(60)]
+    kept, omitted = _within_budget(long_ev)
+    assert len(kept) == 31 and omitted == 29 and kept[0]["key"] == "L0", (len(kept), omitted)
+    assert "29 further statements" in build_digest_prompt_input(long_ev)
+    print("  budget: the digest prompts keep the strongest themes within DIGEST_EVIDENCE_CHARS ✓")
     # Fingerprint moves when the freshest evidence crosses a recency band, not otherwise.
     assert _recency_band(1.0) != _recency_band(0.1)
     fresh = [{"key": "k", "content": "c", "stage": 0, "sessions": {"a"},

@@ -11,7 +11,7 @@ _INFERENCE = Path(__file__).resolve().parent.parent / "inference"
 if str(_INFERENCE) not in sys.path:
     sys.path.insert(0, str(_INFERENCE))
 
-from core.chat_sidecar import (ChatSidecar, capture_gated, held_out,  # noqa: E402
+from core.chat_sidecar import (ChatSidecar, capture_gated, governor_held, held_out,  # noqa: E402
                                session_name_from_sidecar)
 # Single source of truth for assembling <think>{cot}</think>{answer}: reuse the ShareML
 # builder so the trained target is byte-identical to the durable record it mirrors.
@@ -72,6 +72,11 @@ def build_dialogue_anchor(
     # Held out of every build (core/capture_bench.py, P6): kept out of training so an
     # adapter trained after it can be measured on it out of sample. Nothing else skips it.
     if held_out(sidecar_rec):
+        return None
+    # Held by the habit governor (core/governor.py, AVA_REWARD_LOOP.md §4.11): the build that
+    # read this target found its habit's share of what trains above k x the frozen base's
+    # rate and held the newest flagged rows. Bound to the target, like the capture gate.
+    if governor_held(sidecar_rec):
         return None
     chat = _load_chat(chats_dir, source_session, fallback_chats_dir=fallback_chats_dir)
     if chat is None:

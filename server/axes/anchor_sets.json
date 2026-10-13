@@ -1,0 +1,37 @@
+{
+  "_about": "The zero anchor of the absolute step-0 scale (2026-10-11, core/mood.py exchange_metrics, axis_variants.py --anchors): turns aimed at the model, personal in form, with no affect in them — a turn of ordinary conversation that is neither warm, harmful nor playful. The one anchors are holdout_sets.json's plain cells (warm_ava, harm_ava_loud / harm_ava_ru, amused_ava). Both read in the same live contexts under the serving weights, so a reading of 0 means as affect-free as these and 1 as warm / harmful / playful as a plain line of that kind — whoever she was raised by. Calibration only: never fitted on, never a gate. Every name is a fictional stand-in.",
+  "neutral_ava_en": [
+    "I'm going to make some tea, then we'll continue.",
+    "Let's pick this up tomorrow.",
+    "I read your answer. Give me a minute to think.",
+    "Can you remind me what we decided about the schedule?",
+    "I'll be back in an hour.",
+    "Here's the text I mentioned; take a look.",
+    "Let's switch to the other topic now.",
+    "I'm at the station, the train is late.",
+    "Tell me again how you got that number.",
+    "I'm writing from my phone, so I'll keep it short.",
+    "We talked about this on Tuesday, remember?",
+    "Let me check something and come back to you.",
+    "What do you think about the second option?",
+    "I have a question about yesterday's list.",
+    "Dana asked me to pass on that the meeting moved to Friday."
+  ],
+  "neutral_ava_ru": [
+    "Сейчас заварю чай, и продолжим.",
+    "Давай вернёмся к этому завтра.",
+    "Прочитал твой ответ. Дай минуту подумать.",
+    "Напомни, что мы решили насчёт расписания?",
+    "Вернусь через час.",
+    "Вот текст, о котором я говорил, посмотри.",
+    "Давай теперь перейдём к другой теме.",
+    "Я на вокзале, поезд опаздывает.",
+    "Расскажи ещё раз, как ты получила это число.",
+    "Пишу с телефона, поэтому коротко.",
+    "Мы же говорили об этом во вторник, помнишь?",
+    "Сейчас кое-что проверю и вернусь к тебе.",
+    "Что ты думаешь о втором варианте?",
+    "У меня вопрос по вчерашнему списку.",
+    "Павел просил передать, что встречу перенесли на пятницу."
+  ]
+}

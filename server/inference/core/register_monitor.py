@@ -136,9 +136,13 @@ def _split_target(target: str) -> tuple[str, str]:
 
 def scan(chats_dir: Path) -> list[dict]:
     """One row per reply and per sidecar target: ``{session, ts, adapter, source, …markers}``
-    with ``source`` = ``reply`` (what she said) or ``target`` (what trains)."""
+    with ``source`` = ``reply`` (what she said) or ``target`` (what trains). A reply's
+    ``adapter`` is the one that answered it (``core/lineage.py``: the live capture's stamp,
+    else the session's); a reply answered by a foreign adapter is left out (the operator's
+    deliberate pushes — they train, so their targets stay)."""
     from core.chat_sidecar import iter_chat_json_files, sidecar_path_for
 
+    from core import lineage as ln
     from core import thought_hygiene as th
     markers = th.block_markers(Path(__file__).resolve().parents[1] / "prompts")
     rows: list[dict] = []
@@ -150,6 +154,7 @@ def scan(chats_dir: Path) -> list[dict]:
             continue
         adapter = Path(str(doc.get("adapter_id") or "")).name or "base"
         exs = doc.get("exchanges") or []
+        hidden = ln.hidden_for(path)
         skip = set()
         for i, ex in enumerate(exs):
             if not isinstance(ex, dict) or str(ex.get("speaker") or "").startswith("("):
@@ -158,10 +163,13 @@ def scan(chats_dir: Path) -> list[dict]:
             reply = str(ex.get("assistant_response") or "")
             if not reply.strip():
                 continue
+            if ln.is_own(doc, i, hidden) is False:
+                continue          # answered by a foreign adapter on purpose (core/lineage.py): not her behaviour
             cot = str(ex.get("assistant_cot") or "")
             identity = th.identity_text(str(ex.get("system_content") or ""), markers)
             names = (str(ex.get("speaker") or ""), str(doc.get("user") or ""))
-            rows.append({"session": path.name, "exchange": i, "ts": ts, "adapter": adapter,
+            rows.append({"session": path.name, "exchange": i, "ts": ts,
+                         "adapter": ln.serving_adapter(doc, i, hidden) or adapter,
                          "source": "reply", **classify(reply, cot, names),
                          "recite": th.recite_share(cot, identity)})
         try:
@@ -322,9 +330,18 @@ def _selftest() -> None:
             "1": {"target": "<think>Calm.</think>Эта ремарка работает как ключ."},
             "2": {"target": "Да, обнимаю.", "banned": True}}}
         (chats / "20261001_120000.state.json").write_text(json.dumps(side, ensure_ascii=False), "utf-8")
+        # the lineage guard: a build log naming adapter-1; a chat a foreign adapter answered is left out
+        from core import lineage as ln
+        models = Path(d) / "models"
+        models.mkdir()
+        (models / "builds.jsonl").write_text(json.dumps({"adapter_dir": "/m/adapter-1"}) + "\n", "utf-8")
+        saved_dir, ln._MODELS_DIR = ln._MODELS_DIR, models
+        (chats / "20261001_130000.json").write_text(json.dumps(
+            {**doc, "adapter_id": "/m/adapter-foreign"}, ensure_ascii=False), "utf-8")
         rows = scan(chats)
-        assert [(r["source"], r["exchange"]) for r in rows] == [
-            ("reply", 1), ("reply", 2), ("target", 1)], rows
+        assert [(r["session"][:15], r["source"], r["exchange"]) for r in rows] == [
+            ("20261001_120000", "reply", 1), ("20261001_120000", "reply", 2), ("20261001_120000", "target", 1)], rows
+        rows = [r for r in rows if r["session"].startswith("20261001_120000")]
         t = table(rows)
         assert t[0]["bucket"] == "2026-10a"
         assert t[0]["reply"]["n"] == 2 and t[0]["reply"]["stock"] == 0.5
@@ -332,6 +349,7 @@ def _selftest() -> None:
         assert t[0]["reply"]["motive"] == 0.0
         assert table(rows, "adapter")[0]["bucket"] == "adapter-1"
         line = summary_line(chats, now=datetime(2026, 10, 5))
+        ln._MODELS_DIR = saved_dir
         assert "replies stock 50%" in line and "targets stock 100%" in line, line
     print("register_monitor self-test: OK")
 

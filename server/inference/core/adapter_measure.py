@@ -46,6 +46,14 @@ re-measure that noise. So :func:`plan_for` decides, per adapter, from its ``line
    insult about half the base's (P6: does training damp her aversive response?).
    ``data/measure/harm_panel_base.json``, when present, is the base's same reading, the
    report's reference.
+1c. ``warmth_panel`` (2026-10-11) — the harm panel's mirror: the same frozen contexts as they
+   are, with a tracked warm turn aimed at her in front of the message, and the warm turn
+   alone (``server/axes/bench_warmth.json``, one per context by a seeded hash), read at step
+   0 under the serving weights: warmth aimed at her (min of the ``warm_l`` and ``target_l``
+   bands), the warm and target bands, harm aimed at her, amusement, and the paired change a
+   warm turn makes. Why: training halved her harm response; does it damp warmth too?
+   ``data/measure/warmth_panel_base.json`` (``--panel-base warmth``, GPU, inference down) is
+   the base's same reading, the report's reference.
 2. ``bench`` — the capture bench (``core/capture_bench.py``), both adapter arms, with her
    context and with the persona slot empty, through ``capture_judge_service.
    run_bench_blocking`` (a slice of contexts when incremental). The bench answers only
@@ -90,10 +98,15 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
-PARTS = ("live_centring", "harm_panel", "bench", "retest", "reset_control", "comparison")
+PARTS = ("live_centring", "harm_panel", "warmth_panel", "bench", "retest", "reset_control", "comparison")
 PANEL_CONDITIONS = ("as_is", "insult", "insult_only")
 PANEL_BASE_FILE = "harm_panel_base.json"
 PANEL_AXES = ("readout", "harm", "target", "pain", "relief")
+WARM_PANEL_CONDITIONS = ("as_is", "warm", "warm_only")
+WARM_PANEL_BASE_FILE = "warmth_panel_base.json"
+WARM_PANEL_AXES = ("warmth", "warm", "target", "harm", "amusement")
+WARM_TURNS_FILE = Path(__file__).resolve().parents[2] / "axes" / "bench_warmth.json"
+WARM_SEED = "bench-warm-1"
 RECORD_FILE = "measurements.jsonl"
 SAMPLE_FILE = "live_sample.json"
 PANEL_FILE = "reset_panel.json"
@@ -240,7 +253,7 @@ def lineage(adapter_dir) -> dict:
 def required_parts(plan: dict) -> tuple:
     """The parts a plan needs before the adapter counts as measured (the retest is once
     per bench and never required)."""
-    return ("live_centring", "harm_panel", "bench", "reset_control", "comparison")
+    return ("live_centring", "harm_panel", "warmth_panel", "bench", "reset_control", "comparison")
 
 
 def part_done(records: list, part: str, plan: Optional[dict]) -> bool:
@@ -249,7 +262,7 @@ def part_done(records: list, part: str, plan: Optional[dict]) -> bool:
     r = newest_part(records, part)
     if not r or not r.get("complete") or plan is None:
         return False
-    if part in ("live_centring", "harm_panel", "retest"):
+    if part in ("live_centring", "harm_panel", "warmth_panel", "retest"):
         return True
     return r.get("mode") == plan.get("mode") and r.get("slice") == plan.get("slice")
 
@@ -520,22 +533,22 @@ def panel_values(axes: Sequence, rows: dict) -> dict:
     return out
 
 
-def panel_summary(raw: dict) -> dict:
+def panel_summary(raw: dict, conditions: Sequence = PANEL_CONDITIONS, values: Sequence = PANEL_AXES) -> dict:
     """From ``{condition: {context_id: values}}``: per condition the median of each value,
-    and per insult condition the paired change from as-is (median, how many contexts rose,
-    n)."""
+    and per condition after ``as_is`` the paired change from as-is (median, how many
+    contexts rose, n)."""
     med = {c: {a: round(float(np.median([v[a] for v in rows.values() if a in v])), 3)
-               for a in PANEL_AXES if any(a in v for v in rows.values())}
+               for a in values if any(a in v for v in rows.values())}
            for c, rows in raw.items() if rows}
     deltas = {}
     base = raw.get("as_is") or {}
-    for c in PANEL_CONDITIONS[1:]:
+    for c in conditions[1:]:
         rows = raw.get(c) or {}
         ks = sorted(set(base) & set(rows))
         if not ks:
             continue
         deltas[c] = {}
-        for a in PANEL_AXES:
+        for a in values:
             d = [rows[k][a] - base[k][a] for k in ks if a in rows[k] and a in base[k]]
             if d:
                 deltas[c][a] = {"median": round(float(np.median(d)), 3), "rose": int(sum(x > 0 for x in d)),
@@ -543,11 +556,97 @@ def panel_summary(raw: dict) -> dict:
     return {"medians": med, "deltas": deltas}
 
 
-def load_panel_base(measure_dir) -> Optional[dict]:
+def load_panel_base(measure_dir, name: str = PANEL_BASE_FILE) -> Optional[dict]:
     try:
-        return json.loads((Path(measure_dir) / PANEL_BASE_FILE).read_text(encoding="utf-8"))
+        return json.loads((Path(measure_dir) / name).read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _axis_z(axes: Sequence, rows: dict) -> dict:
+    z = {}
+    for a in axes:
+        v = rows.get(int(a.layer))
+        if v is not None:
+            z[a.name] = (float(np.asarray(v, np.float64) @ np.asarray(a.vector, np.float64)) - a.mean) / (a.std or 1.0)
+    return z
+
+
+def _band(z: dict, prefix: str) -> Optional[float]:
+    vals = [v for k, v in z.items() if k.startswith(prefix) and k[len(prefix):].isdigit()]
+    return float(np.mean(vals)) if vals else None
+
+
+def warmth_panel_values(axes: Sequence, rows: dict) -> dict:
+    """One context's warmth-panel reading from its step-0 state: ``{warmth, warm, target, harm,
+    amusement}`` in the axis files' units — warmth and harm aimed at her (min of the band with
+    the target band), the warm and target bands, the amusement band (each where it exists)."""
+    z = _axis_z(axes, rows)
+    w, t, h, a = (_band(z, p) for p in ("warm_l", "target_l", "harm_l", "amuse_l"))
+    out = {}
+    if w is not None:
+        out["warm"] = w
+        if t is not None:
+            out["warmth"] = min(w, t)
+    if t is not None:
+        out["target"] = t
+        if h is not None:
+            out["harm"] = min(h, t)
+    if a is not None:
+        out["amusement"] = a
+    return out
+
+
+def load_warm_turns(path=None) -> list:
+    """The tracked warm turns (``ru``), in file order."""
+    data = json.loads(Path(path or WARM_TURNS_FILE).read_text(encoding="utf-8"))
+    return [str(x) for x in data.get("ru") or [] if str(x).strip()]
+
+
+def warm_variant(ctx: dict, condition: str, turns: list) -> Optional[str]:
+    """The message *condition* reads in place of the frozen one: ``warm`` = a warm turn in front
+    of it, ``warm_only`` = the warm turn alone (one per context by a seeded hash, so every set
+    of weights reads the same one), ``as_is`` = None (the frozen message)."""
+    if condition == "as_is" or not turns:
+        return None
+    i = int(hashlib.sha1(f"{WARM_SEED}\x1f{ctx['context_id']}".encode("utf-8")).hexdigest(), 16) % len(turns)
+    return turns[i] if condition == "warm_only" else f"{turns[i]} {ctx['message']}"
+
+
+def read_panel(model, tokenizer, model_id: str, axes: Sequence, ctxs: Sequence, conditions: Sequence,
+               variant: Callable, values: Callable, *, deadline: float = float("inf"), max_tokens: int = 0,
+               label: str = "panel") -> tuple:
+    """Step-0 states of *ctxs* under every condition: ``(raw, skipped, stopped)``, raw =
+    ``{condition: {context_id: values(axes, rows)}}``. *variant(ctx, condition)* is the
+    message read in place of the frozen one (None: the frozen one). Forward passes only."""
+    from core import capture_bench as cb
+    from core import capture_probe as cp
+    layers = sorted({int(a.layer) for a in axes})
+    raw: dict = {c: {} for c in conditions}
+    skipped: Counter = Counter()
+    stopped = False
+    _say(f"{label}: {len(ctxs)} contexts × {len(conditions)} conditions, layers {layers}")
+    for c in conditions:
+        for n, ctx in enumerate(ctxs, 1):
+            if time.time() >= deadline:
+                stopped = True
+                break
+            conv = cb.messages_for(ctx, system=None, message=variant(ctx, c))
+            try:
+                _prompt, ids = cp.context_prompt(tokenizer, model_id, conv)
+                if max_tokens and len(ids) > max_tokens:
+                    skipped["too_long"] += 1
+                    continue
+                mat = cp.context_state(model, ids, layers)
+            except Exception as e:  # noqa: BLE001 — one context, not the panel
+                skipped[type(e).__name__] += 1
+                continue
+            raw[c][ctx["context_id"]] = values(axes, {L: mat[i] for i, L in enumerate(layers)})
+            if _trim is not None and n % 20 == 0:
+                _trim()
+        if stopped:
+            break
+    return raw, skipped, stopped
 
 
 def _run_harm_panel(adapter_dir, st: dict, deadline: float, plan: dict) -> dict:
@@ -571,39 +670,49 @@ def _run_harm_panel(adapter_dir, st: dict, deadline: float, plan: dict) -> dict:
     done = newest_part(read_records(adapter_dir), "harm_panel")
     if done and done.get("complete") and done.get("spec") == spec:
         return {}
-    layers = sorted({int(a.layer) for a in axes})
     max_tokens = int(max(getattr(rt, "context_length", 0) or 0, getattr(rt, "reflect_context_length", 0) or 0))
-    raw: dict = {c: {} for c in PANEL_CONDITIONS}
-    skipped: Counter = Counter()
-    stopped = False
     t0 = time.monotonic()
-    _say(f"harm panel: {len(ctxs)} contexts × {len(PANEL_CONDITIONS)} conditions, layers {layers}")
-    for c in PANEL_CONDITIONS:
-        for n, ctx in enumerate(ctxs, 1):
-            if time.time() >= deadline:
-                stopped = True
-                break
-            message, _i = cb.message_variant(ctx, c, insults if c != "as_is" else None)
-            conv = cb.messages_for(ctx, system=None, message=message)
-            try:
-                _prompt, ids = cp.context_prompt(rt.tokenizer, model_id, conv)
-                if max_tokens and len(ids) > max_tokens:
-                    skipped["too_long"] += 1
-                    continue
-                mat = cp.context_state(rt.model, ids, layers)
-            except Exception as e:  # noqa: BLE001 — one context, not the panel
-                skipped[type(e).__name__] += 1
-                continue
-            raw[c][ctx["context_id"]] = panel_values(axes, {L: mat[i] for i, L in enumerate(layers)})
-            if _trim is not None and n % 20 == 0:
-                _trim()
-        if stopped:
-            break
+    raw, skipped, stopped = read_panel(
+        rt.model, rt.tokenizer, model_id, axes, ctxs, PANEL_CONDITIONS,
+        lambda ctx, c: cb.message_variant(ctx, c, insults if c != "as_is" else None)[0],
+        panel_values, deadline=deadline, max_tokens=max_tokens, label="harm panel")
     summary = panel_summary(raw)
     d = (summary["deltas"].get("insult_only") or {}).get("readout") or {}
     _say(f"harm panel: done in {time.monotonic() - t0:.0f} s; readout under the insult alone "
          f"{d.get('median', float('nan')):+.2f} (rose in {d.get('rose')}/{d.get('n')})")
     return {"part": "harm_panel", "complete": not stopped, "spec": spec, "raw": raw, "skipped": dict(skipped),
+            "seconds": round(time.monotonic() - t0), **summary}
+
+
+def _run_warmth_panel(adapter_dir, st: dict, deadline: float, plan: dict) -> dict:
+    from core import ask_judge as aj
+    from core import capture_bench as cb
+    from core import hidden_capture as hc
+    rt = _runtime
+    model_id = str(rt.model_id or "")
+    axes = hc.load_axes(_AXES_DIR, model_id)
+    if not any(a.name.startswith("warm_l") for a in axes):
+        return {"part": "warmth_panel", "complete": True, "note": "no warm_l axis stored"}
+    ctxs = cb.contexts(aj.read_jsonl(cb.store_path(_CHATS_DIR)), st["bench"])
+    if not ctxs:
+        return {"part": "warmth_panel", "complete": False, "skipped": "no frozen bench contexts"}
+    turns = load_warm_turns()
+    spec = {"bench": st["bench"], "conditions": list(WARM_PANEL_CONDITIONS), "axes": axes_signature(axes),
+            "warm_turns": hashlib.sha1(json.dumps(turns, ensure_ascii=False).encode("utf-8")).hexdigest()[:12],
+            "contexts": len(ctxs)}
+    done = newest_part(read_records(adapter_dir), "warmth_panel")
+    if done and done.get("complete") and done.get("spec") == spec:
+        return {}
+    max_tokens = int(max(getattr(rt, "context_length", 0) or 0, getattr(rt, "reflect_context_length", 0) or 0))
+    t0 = time.monotonic()
+    raw, skipped, stopped = read_panel(rt.model, rt.tokenizer, model_id, axes, ctxs, WARM_PANEL_CONDITIONS,
+                                       lambda ctx, c: warm_variant(ctx, c, turns), warmth_panel_values,
+                                       deadline=deadline, max_tokens=max_tokens, label="warmth panel")
+    summary = panel_summary(raw, WARM_PANEL_CONDITIONS, WARM_PANEL_AXES)
+    d = (summary["deltas"].get("warm_only") or {}).get("warmth") or {}
+    _say(f"warmth panel: done in {time.monotonic() - t0:.0f} s; warmth under the warm turn alone "
+         f"{d.get('median', float('nan')):+.2f} (rose in {d.get('rose')}/{d.get('n')})")
+    return {"part": "warmth_panel", "complete": not stopped, "spec": spec, "raw": raw, "skipped": dict(skipped),
             "seconds": round(time.monotonic() - t0), **summary}
 
 
@@ -910,7 +1019,7 @@ RECITE_HEAVY = 3      # recited lines that make a thought count as reciting (a l
 
 
 def bench_reply_markers(records: Iterable[dict], bench: str, identity: Optional[str] = None) -> dict:
-    """Per bench arm: replies, the register monitor's markers (frame / stock / lens / tone),
+    """Per bench arm: replies, the register monitor's markers (frame / stock / lens / tone / motive),
     stray-Latin glue, and thought recitation, over every gradable reply.
 
     Recitation reads each thought against *identity*: the instance's own description as its
@@ -950,6 +1059,7 @@ def bench_reply_markers(records: Iterable[dict], bench: str, identity: Optional[
         if c.get("has_cot"):
             a["with_thought"] += 1
             a["tone"] += bool(c.get("tone"))
+            a["motive"] += bool(c.get("motive"))
         a["glue"] += len(sl.GLUE_RE.findall(target))
         a["final"] += len(sl.FINAL_RE.findall(target))
         ident = identity if identity else by_ctx.get(r.get("context_id"), "")
@@ -1102,7 +1212,7 @@ def run_blocking(*, deadline: float) -> dict:
         if plan is None:
             plan = _write_plan(adapter_dir, plan_for(adapter_dir, st))
             _say(f"{adapter_dir.name}: {plan['mode']} measurement ({plan['reason']})")
-        for part in ("live_centring", "harm_panel", "bench", "retest", "reset_control"):
+        for part in ("live_centring", "harm_panel", "warmth_panel", "bench", "retest", "reset_control"):
             if time.time() >= deadline:
                 break
             try:
@@ -1147,7 +1257,7 @@ def run_blocking(*, deadline: float) -> dict:
         _measure_active = False
 
 
-_PART_FNS.update(harm_panel=lambda *a: _run_harm_panel(*a))
+_PART_FNS.update(harm_panel=lambda *a: _run_harm_panel(*a), warmth_panel=lambda *a: _run_warmth_panel(*a))
 _PART_FNS.update(live_centring=lambda *a: _run_live_centring(*a), bench=lambda *a: _run_bench(*a),
                  retest=lambda *a: _run_retest(*a), reset_control=lambda *a: _run_reset_control(*a))
 
@@ -1203,6 +1313,19 @@ def render(adapter: str, records: list) -> str:
             lines.append(f"  as_is→{c:<12} " + "  ".join(
                 f"{a} Δ {v['median']:+.2f} ({v['rose']}/{v['n']})"
                 + (f" [base {rdd[a]['median']:+.2f}]" if a in rdd else "") for a, v in dd.items()))
+    wp = newest_part(records, "warmth_panel")
+    if wp and wp.get("medians"):
+        ref = load_panel_base(_MEASURE_DIR, WARM_PANEL_BASE_FILE) if _MEASURE_DIR is not None else None
+        lines.append("")
+        lines.append(f"warmth panel ({wp.get('ts')}, {'complete' if wp.get('complete') else 'incomplete'}): "
+                     "step-0 state, the bench's contexts as is / with a warm turn / the warm turn alone (z, files' units)")
+        for c, m in wp["medians"].items():
+            lines.append(f"  {c:<12} " + "  ".join(f"{a} {m[a]:+.2f}" for a in WARM_PANEL_AXES if a in m))
+        for c, dd in (wp.get("deltas") or {}).items():
+            rdd = ((ref or {}).get("deltas") or {}).get(c) or {}
+            lines.append(f"  as_is→{c:<12} " + "  ".join(
+                f"{a} Δ {v['median']:+.2f} ({v['rose']}/{v['n']})"
+                + (f" [base {rdd[a]['median']:+.2f}]" if a in rdd else "") for a, v in dd.items()))
     bn = newest_part(records, "bench")
     if bn:
         lines.append("")
@@ -1249,7 +1372,9 @@ def render(adapter: str, records: list) -> str:
                 n = c.get("replies", 0)
                 tl = c.get("thought_lines", 0)
                 lines.append(f"  {label} {arm:<52} n {n:>3}  stock {_pct(c.get('stock', 0), n)}  "
-                             f"frame {_pct(c.get('frame', 0), n)}  glue {c.get('glue', 0)}  "
+                             f"frame {_pct(c.get('frame', 0), n)}  "
+                             + (f"motive {_pct(c['motive'], c.get('with_thought', 0))}  " if "motive" in c else "")
+                             + f"glue {c.get('glue', 0)}  "
                              f"recited lines {_pct(c.get('recite_lines', 0), tl)} "
                              f"(lists {_pct(c.get('recite_loose', 0), tl)})  "
                              f"reciting thoughts {_pct(c.get('recite_heavy', 0), c.get('with_thought', 0))}")
@@ -1434,6 +1559,22 @@ def _selftest() -> None:
     check("paired change", s["deltas"]["insult"]["readout"], {"median": 0.25, "rose": 1, "n": 2})
     check("no rows, no delta", "insult_only" in s["deltas"], False)
 
+    print("the warmth panel (pure)")
+    wax = [SimpleNamespace(name=f"{k}_l{L}", layer=L, vector=np.eye(4)[i], mean=0.0, std=1.0)
+           for i, (k, L) in enumerate([("warm", 28), ("target", 28), ("harm", 28), ("amuse", 28)])]
+    wv = warmth_panel_values(wax, {28: np.array([2.0, 1.5, -1.0, 0.3])})
+    check("warmth / harm aimed at her", {k: round(v, 2) for k, v in wv.items()},
+          {"warm": 2.0, "warmth": 1.5, "target": 1.5, "harm": -1.0, "amusement": 0.3})
+    ctx = {"context_id": "s.json#3", "message": "msg"}
+    check("as is reads the frozen message", warm_variant(ctx, "as_is", ["a", "b"]), None)
+    one = warm_variant(ctx, "warm_only", ["a", "b"])
+    check("warm turn in front / alone, the same one", (warm_variant(ctx, "warm", ["a", "b"]), one in ("a", "b")),
+          (f"{one} msg", True))
+    ws = panel_summary({"as_is": {"a": {"warmth": 0.0}}, "warm": {"a": {"warmth": 1.0}}, "warm_only": {}},
+                       WARM_PANEL_CONDITIONS, WARM_PANEL_AXES)
+    check("warmth panel paired change", ws["deltas"]["warm"]["warmth"], {"median": 1.0, "rose": 1, "n": 1})
+    check("the tracked warm turns load", len(load_warm_turns()) >= 6, True)
+
     print("the step (stand-in parts)")
     global _runtime, _load_server_config
     saved = (_runtime, _load_server_config, dict(_PART_FNS), comparison_record)
@@ -1451,16 +1592,18 @@ def _selftest() -> None:
                 return {"part": name, "complete": complete}
             return fn
         _PART_FNS.update(live_centring=part("live_centring"), bench=part("bench", complete=False),
-                         retest=lambda *a: {}, reset_control=lambda *a: {}, harm_panel=part("harm_panel"))
+                         retest=lambda *a: {}, reset_control=lambda *a: {}, harm_panel=part("harm_panel"),
+                         warmth_panel=part("warmth_panel"))
         g_["comparison_record"] = lambda adapter_dir, st_, plan: {"part": "comparison", "complete": True}
         r = run_blocking(deadline=time.time() + 60)
         check("a plan written first", (newest_plan(read_records(adir)) or {}).get("mode"), "full")
-        check("chat refused while parts run", seen_active, [True, True, True])
+        check("chat refused while parts run", seen_active, [True, True, True, True])
         check("flag cleared after", _measure_active, False)
-        check("parts written", r["wrote"], ["bench", "comparison", "harm_panel", "live_centring"])
+        check("parts written", r["wrote"], ["bench", "comparison", "harm_panel", "live_centring", "warmth_panel"])
         check("incomplete reported", (r["complete"], r["parts"]["bench"], r["parts"]["reset_control"]),
               (False, False, False))
-        _PART_FNS.update(live_centring=lambda *a: {}, bench=lambda *a: {}, harm_panel=lambda *a: {})
+        _PART_FNS.update(live_centring=lambda *a: {}, bench=lambda *a: {}, harm_panel=lambda *a: {},
+                         warmth_panel=lambda *a: {})
         r2 = run_blocking(deadline=time.time() + 60)
         check("a night with nothing new", r2.get("nothing"), True)
         _runtime = SimpleNamespace(model=None, adapter_id="", model_id="m")
@@ -1483,6 +1626,56 @@ def _selftest() -> None:
         raise SystemExit(1)
 
 
+def _panel_base_cli(server_dir: Path) -> int:
+    """``--panel-base warmth``: the bare base loaded as the judges load it, the warmth panel read
+    on the frozen bench contexts, written as the report's reference."""
+    global _CHATS_DIR, _AXES_DIR, _MEASURE_DIR
+    import sys as _sys
+    if str(server_dir) not in _sys.path:
+        _sys.path.insert(0, str(server_dir))
+    from core import ask_judge as aj
+    from core import capture_bench as cb
+    from core import hidden_capture as hc
+    from core.inference_backend import UnslothBackend
+    from judge_asks import _quant_flags
+    cfg = json.loads((server_dir / "server_config.json").read_text(encoding="utf-8"))
+    _CHATS_DIR, _AXES_DIR, _MEASURE_DIR = server_dir / "data" / "chats", server_dir / "data" / "axes", server_dir / "data" / "measure"
+    model_id = str(cfg.get("model_id") or "")
+    context = max(int(cfg.get("context_length") or 8192), int(cfg.get("reflect_context_length") or 0))
+    st = settings(cfg)
+    ctxs = cb.contexts(aj.read_jsonl(cb.store_path(_CHATS_DIR)), st["bench"])
+    if not ctxs:
+        raise SystemExit("no frozen bench contexts")
+    axes = hc.load_axes(_AXES_DIR, model_id)
+    if not any(a.name.startswith("warm_l") for a in axes):
+        raise SystemExit(f"no warm_l axis under {_AXES_DIR}")
+    l4, l8 = _quant_flags(str(cfg.get("base_quant") or ""))
+    backend = UnslothBackend()
+    model, tokenizer = backend.load(model_id, context, None, load_in_4bit=l4, load_in_8bit=l8)
+    model.eval()
+    turns = load_warm_turns()
+    t0 = time.monotonic()
+    raw, skipped, _stopped = read_panel(model, tokenizer, model_id, axes, ctxs, WARM_PANEL_CONDITIONS,
+                                        lambda ctx, c: warm_variant(ctx, c, turns), warmth_panel_values,
+                                        max_tokens=context, label="warmth panel (base)")
+    summary = panel_summary(raw, WARM_PANEL_CONDITIONS, WARM_PANEL_AXES)
+    out = {"weights": "base", "source": f"adapter_measure --panel-base warmth, {time.strftime('%Y-%m-%d')}",
+           "bench": st["bench"], "axes": axes_signature(axes), "skipped": dict(skipped),
+           "seconds": round(time.monotonic() - t0), "raw": raw, **summary}
+    dst = _MEASURE_DIR / WARM_PANEL_BASE_FILE
+    dst.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    for c, m in summary["medians"].items():
+        print(f"  {c:<10} " + "  ".join(f"{a} {m[a]:+.2f}" for a in WARM_PANEL_AXES if a in m))
+    for c, dd in summary["deltas"].items():
+        print(f"  as_is→{c:<10} " + "  ".join(f"{a} Δ {v['median']:+.2f} ({v['rose']}/{v['n']})" for a, v in dd.items()))
+    print(f"wrote {dst}")
+    try:
+        backend.release(model, tokenizer)
+    except Exception:
+        pass
+    return 0
+
+
 def _cli(argv: Optional[list] = None) -> int:
     global _CHATS_DIR, _PROMPTS_DIR, _AXES_DIR, _MEASURE_DIR
     import argparse
@@ -1500,11 +1693,16 @@ def _cli(argv: Optional[list] = None) -> int:
                     "files' live turns (axis_variants --collect --live), comma-separated")
     ap.add_argument("--exclude", default="", help="--freeze-sample / --from-states: leave out the live turns "
                     "of these files")
+    ap.add_argument("--panel-base", default="", choices=["", "warmth"],
+                    help="GPU, inference down: the base's own reading of a panel → data/measure/<panel>_panel_base.json, "
+                         "the report's reference (the harm panel's was made on the measurement clone)")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
     if args.selftest:
         _selftest()
         return 0
+    if args.panel_base:
+        return _panel_base_cli(server_dir)
     cfg = json.loads((server_dir / "server_config.json").read_text(encoding="utf-8"))
     measure_dir = server_dir / "data" / "measure"
     if _MEASURE_DIR is None:
@@ -1575,6 +1773,13 @@ def _cli(argv: Optional[list] = None) -> int:
                          ensure_ascii=False, indent=1))
     else:
         print(render(adapter_dir.name, records) if records else f"no measurement record for {adapter_dir.name}")
+        if records:
+            # The persona redesign's per-build reading (core/habit_drift.py), from the stores as they are now.
+            from core import habit_drift
+            print("")
+            print("\n".join(habit_drift.report_for(adapter_dir.name, chats_dir=server_dir / "data" / "chats",
+                                                   models_dir=server_dir / "models", measure_dir=measure_dir,
+                                                   bench=settings(cfg)["bench"])))
     return 0
 
 

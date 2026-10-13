@@ -29,8 +29,8 @@ lineage (the review payload's ``adapters`` list, annotated with its build + whet
 build snapshot survives): the server swaps that adapter in — **sticky**: one full model
 reload, narrated into the dialog via ``regenerate_status`` milestones, and it then STAYS
 loaded, so a repair session's further regenerations under the same choice reload nothing
-(the box keeps running that adapter afterwards until another load; a server restart
-returns to the config's) — which is the "repair with the last known GOOD adapter"
+(chat keeps running that adapter afterwards until a server restart returns to the
+config's; meanwhile the background jobs wait and a Sleep run is refused) — which is the "repair with the last known GOOD adapter"
 path for when the loaded adapter is itself what keeps re-answering badly. A
 pop-up opens at once and shows the CoT + reply *as they are generated*, with a **Stop**
 button that halts the model and keeps what it wrote; **Apply** writes the repaired target
@@ -664,8 +664,9 @@ class RegenReviewDialog(QDialog):
         # narrate the reload when one actually happens.
         if adapter:
             self._note = (f"Answered by adapter {adapter} — it STAYS loaded for "
-                          "further regenerations (reload from the Chat tab to go "
-                          "back). " + self._note)
+                          "further regenerations and chat; background jobs and Sleep "
+                          "wait until a server restart loads the configured one. "
+                          + self._note)
             opening = (f"Making sure adapter {adapter} is loaded (a full model reload "
                        "if it isn't already — it then stays loaded), then generating…")
         else:
@@ -1227,8 +1228,9 @@ class TrainingReviewWidget(QWidget):
         # STICKY: the first regeneration with a non-loaded choice pays one full model
         # reload and the adapter then stays loaded, so a repair session's further
         # regenerations under the same choice cost nothing extra — at the accepted
-        # price that the box keeps running that adapter afterwards (chat and the idle
-        # jobs included) until another load. Tooltip and dialog both say so. Populated
+        # price that chat keeps running that adapter afterwards until a server restart
+        # (the idle jobs wait and a Sleep run is refused meanwhile, server-side). Tooltip
+        # and dialog both say so. Populated
         # per refresh from the review payload's `adapters` (item data = the adapter dir
         # name; "" = whatever is loaded).
         regen_bar.addWidget(QLabel("Adapter:"))
@@ -1237,9 +1239,10 @@ class TrainingReviewWidget(QWidget):
             "Which adapter re-answers the exchange. \"Loaded adapter\" uses the model as "
             "it is (no extra cost). Choosing another adapter from the lineage swaps it in "
             "with ONE full model reload — and it then STAYS loaded, so repairing a run of "
-            "rows under the same choice reloads only once. The box keeps running that "
-            "adapter afterwards (chat included) until you pick another here or reload "
-            "from the Chat tab; a server restart returns to the config's adapter. Use it "
+            "rows under the same choice reloads only once. Chat keeps running that "
+            "adapter afterwards until you pick another here or restart the server, which "
+            "returns to the config's adapter; meanwhile the background jobs (reflection, "
+            "reach-outs, the nightly event) wait and a Sleep run is refused. Use it "
             "to repair rows with a last-known-good adapter when the current one keeps "
             "re-answering badly.")
         self.cmb_adapter.addItem("Loaded adapter", "")

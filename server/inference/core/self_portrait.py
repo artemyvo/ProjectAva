@@ -362,12 +362,14 @@ def cluster_evidence(items: list[dict], *, generate_fn: Optional[Callable] = Non
     opens for the branch judge, fact placement, persona clustering and fact dedup, while
     the synthesis below stays on the adapter.
 
-    The single flat call, not map-reduce: that exists to survive hundreds of statements in
-    one prompt, and one subject's observations are nowhere near that scale.
+    ``reflection_digest.cluster_evidence_sized``: the flat call for a few observations,
+    the blocked map-reduce above ``FLAT_GROUPING_MAX`` (1,378 observations by 2026-10-10:
+    the flat prompt could not fit the clean base).
     """
     if not items:
         return []
-    return cluster_persona_evidence(items, generate_fn=generate_fn, embedder=embedder)
+    from core.reflection_digest import cluster_evidence_sized
+    return cluster_evidence_sized(items, generate_fn=generate_fn, embedder=embedder)
 
 
 def synthesize_portrait(

@@ -70,6 +70,16 @@ def capture_gated(rec: Optional[dict]) -> bool:
             and cap.get("target_sha") == exchange_target_sha(str(rec.get("target") or "")))
 
 
+def governor_held(rec: Optional[dict]) -> bool:
+    """Is this exchange record held out of training by the habit governor
+    (``core/governor.py``, ``AVA_REWARD_LOOP.md`` §4.11)? Only while its ``governor`` field
+    names the target the record holds: a re-derived target is read again by the next build."""
+    if not isinstance(rec, dict):
+        return False
+    gov = rec.get("governor")
+    return (isinstance(gov, dict) and gov.get("target_sha") == exchange_target_sha(str(rec.get("target") or "")))
+
+
 def held_out(rec: Optional[dict]) -> bool:
     """Is this exchange record held out of every build (``holdout``, set by the capture
     bench's held-out set, ``core/capture_bench.py``)? Unlike the capture gate it names no
@@ -487,6 +497,10 @@ class ChatSidecar:
         # until the judge has graded that one.
         if isinstance(prev.get("capture"), dict):
             exchanges[key]["capture"] = dict(prev["capture"])
+        # The habit governor's hold, carried as the capture gate's is (only the build writes
+        # it, core/governor.py). It names the target it held, so over a NEW target it is inert.
+        if isinstance(prev.get("governor"), dict):
+            exchanges[key]["governor"] = dict(prev["governor"])
         # A held-out exchange stays out of every build whatever target is derived for it
         # (only set_holdout writes it).
         if isinstance(prev.get("holdout"), dict):

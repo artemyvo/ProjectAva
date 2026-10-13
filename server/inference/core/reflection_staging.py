@@ -202,20 +202,22 @@ def get_pending_clean_base_dir(data_dir: Path) -> Path:
 
 
 def write_pending_clean_base(data_dir: Path, session_filename: str,
-                             judge_jobs: list, fact_candidates: list) -> None:
+                             judge_jobs: list, fact_candidates: list, *, user_notes: bool = False) -> None:
     """Persist a background-reflected chat's deferred clean-base job payloads.
 
     ``judge_jobs`` / ``fact_candidates`` are the plain-dict entries the runner collects
     during revision (branch-judge + fact-placement inputs). A normal reflection run loads
     them for this chat via :func:`load_pending_clean_base` and feeds them straight into its
-    end-of-run clean-base phase. Best-effort."""
+    end-of-run clean-base phase. *user_notes*: the chat's user-notes pass waits for the clean
+    base too (``user_notes.author: base``). Best-effort."""
     try:
         stem = session_filename[:-5] if session_filename.endswith(".json") else session_filename
         d = get_pending_clean_base_dir(data_dir)
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{stem}.json").write_text(
             json.dumps({"judge_jobs": list(judge_jobs or []),
-                        "fact_candidates": list(fact_candidates or [])},
+                        "fact_candidates": list(fact_candidates or []),
+                        **({"user_notes": True} if user_notes else {})},
                        ensure_ascii=False),
             encoding="utf-8")
     except Exception:
@@ -232,7 +234,8 @@ def load_pending_clean_base(data_dir: Path, session_filename: str) -> dict:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         return {"judge_jobs": list(data.get("judge_jobs") or []),
-                "fact_candidates": list(data.get("fact_candidates") or [])}
+                "fact_candidates": list(data.get("fact_candidates") or []),
+                "user_notes": bool(data.get("user_notes"))}
     except Exception:
         return {"judge_jobs": [], "fact_candidates": []}
 

@@ -193,7 +193,7 @@ class ConsolidationLedger:
         return n
 
     def counter(self, keys: Iterable[str], *, source_session: str = "",
-                reason: str = "", run_id: str = "") -> int:
+                reason: str = "", run_id: str = "", grouping: str = "") -> int:
         """Append COUNTER-EVIDENCE against live persona items — a session pushed AGAINST
         each stance (the *persuasion* channel, symmetric to a ``register``'s affirmation).
 
@@ -211,15 +211,21 @@ class ConsolidationLedger:
         live and recallable).
 
         The reaction→key bridge (which live keys a reaction pushes against) and the
-        pushback-detection policy that *emit* these ops are the next layer, not here."""
+        pushback-detection policy that *emit* these ops are the next layer, not here.
+
+        *grouping* names the digest grouping a polarity counter was planned on
+        (``reflection_digest.GROUPING_VERSION``); the fold ignores a polarity counter
+        without one."""
         n = 0
         ts = datetime.now().isoformat()
         for key in keys:
             if not key:
                 continue
-            self._append({"op": "counter", "ts": ts, "key": key, "type": "persona",
-                          "source_session": source_session, "reason": reason,
-                          "run_id": run_id})
+            op = {"op": "counter", "ts": ts, "key": key, "type": "persona",
+                  "source_session": source_session, "reason": reason, "run_id": run_id}
+            if grouping:
+                op["grouping"] = grouping
+            self._append(op)
             n += 1
         return n
 

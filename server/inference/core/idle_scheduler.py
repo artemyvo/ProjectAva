@@ -92,6 +92,10 @@ class IdleJob:
     #: to the job registration (the scheduler stays semantics-free); `None` falls back to a
     #: generic "<name> finished". Skips/errors are phrased generically from their reason.
     describe: Optional[Callable[[dict], str]] = None
+    #: does this job generate with the loaded weights? True (the default) holds it while
+    #: the loaded adapter is not the configured one (``configure(serving_mismatch=...)``);
+    #: a GPU-free fold or an embedder-only job sets False and keeps running.
+    needs_model: bool = True
     #: monotonic timestamp of the last run that counted; 0.0 == never run
     #: -inf, not 0.0: `time.monotonic()` is seconds since BOOT on Linux and near zero at
     #: process start on macOS, so a 0.0 default read as "ran just now" on a box up
@@ -113,6 +117,7 @@ _gpu_lock: Optional[asyncio.Lock] = None
 _executor = None
 _external_busy: Callable[[], bool] = lambda: False   # reflection run / encounter active
 _model_loaded: Callable[[], bool] = lambda: False
+_serving_mismatch: Callable[[], str] = lambda: ""
 _lock_file: Optional[Path] = None
 _idle_seconds: float = 3600.0
 _poll_seconds: float = 300.0
@@ -122,16 +127,20 @@ _startup_note: str = ""
 def configure(*, executor, external_busy: Callable[[], bool],
               model_loaded: Callable[[], bool], lock_file,
               idle_seconds: float = 3600.0, poll_seconds: float = 300.0,
-              startup_note: str = "") -> None:
+              startup_note: str = "",
+              serving_mismatch: Optional[Callable[[], str]] = None) -> None:
     """Wire the scheduler with the server capabilities it needs (it never imports
     ``server``). ``external_busy`` reports the user-triggered GPU owners that are not
     idle jobs (reflection runs, encounters); ``lock_file`` is the crash-safe PID
-    wake-lock path shared with any other process on the box."""
+    wake-lock path shared with any other process on the box. ``serving_mismatch``
+    returns why the loaded weights are not the configured ones (``""`` when they are);
+    every ``needs_model`` job is held while it is non-empty (see :func:`_held`)."""
     global _executor, _external_busy, _model_loaded, _lock_file
-    global _idle_seconds, _poll_seconds, _startup_note
+    global _idle_seconds, _poll_seconds, _startup_note, _serving_mismatch
     _executor = executor
     _external_busy = external_busy
     _model_loaded = model_loaded
+    _serving_mismatch = serving_mismatch or (lambda: "")
     _lock_file = Path(lock_file)
     _idle_seconds = float(idle_seconds)
     _poll_seconds = float(poll_seconds)
@@ -322,6 +331,46 @@ def _emit_terminal(job: IdleJob, aid: str, result) -> None:
     activity_log.append(job.name, kind, message, activity_id=aid)
 
 
+# Why the model jobs are held, as last journalled ("" = not held). The hold is logged on
+# its transitions only — once when it starts (or its reason changes), once when it ends —
+# not once per job per poll.
+_hold_reason: str = ""
+_HELD = "_serving_mismatch"     # result key a held run returns (see _labelled_run)
+
+
+def _held(job: IdleJob) -> str:
+    """The reason *job* may not run on the loaded weights now, or ``""``.
+
+    A Training-review regeneration on another adapter leaves that adapter loaded
+    (sticky, ``agentic.swap_model``): live chat under it is the operator's choice, but
+    a background reflection, a reach-out, the nightly measurement written under it would
+    be another adapter's work filed as the serving one's. Such a job waits — it does not
+    spend its interval — until the configured adapter is back (a server restart)."""
+    if not job.needs_model:
+        return ""
+    try:
+        return _serving_mismatch() or ""
+    except Exception:
+        traceback.print_exc()
+        return ""
+
+
+def _note_hold(reason: str) -> None:
+    """Journal a change of the hold state (see ``_hold_reason``)."""
+    global _hold_reason
+    if reason == _hold_reason:
+        return
+    _hold_reason = reason
+    if reason:
+        msg = (f"background jobs held: {reason} (a Training-review regeneration leaves "
+               f"its adapter loaded; restart the server to load the configured one)")
+        activity_log.append("idle", "skipped", msg)
+    else:
+        msg = "background jobs resumed: the configured adapter is loaded"
+        activity_log.append("idle", "finished", msg)
+    print(f"[idle] {msg}", flush=True)
+
+
 def _labelled_run(job: IdleJob):
     """Run ``job.run`` with the activity journal's ambient pass label set to this job.
 
@@ -339,6 +388,13 @@ def _labelled_run(job: IdleJob):
     i.e. as the pass of whichever job last named itself. Clearing on the way out likewise
     keeps a job's label off the passes live chat runs on this same thread (stage-1 fact
     fetch), which name themselves via ``activity_log.pass_context``."""
+    # The hold is decided HERE, on the executor thread, as well as before dispatch: a
+    # regeneration's swap is itself an executor job, so a check on the loop can pass and
+    # the job then run behind the swap on the foreign adapter. The executor is serial,
+    # so what this sees is what the body would run on.
+    reason = _held(job)
+    if reason:
+        return {_HELD: reason}
     activity_log.set_ambient_label(job.name)
     try:
         return job.run()
@@ -367,6 +423,10 @@ async def _dispatch(job: IdleJob) -> None:
             return          # a reflection run / encounter claimed the box while we queued
         if not _model_loaded() or not _job_idle_ok(job) or not _job_due(job):
             return          # box went warm, or the job stopped being eligible, mid-wait
+        reason = _held(job)
+        if reason:
+            _note_hold(reason)
+            return          # foreign weights loaded — wait, the interval unspent
         if not _acquire_wake_lock():
             return          # another process on the box holds it — retry next poll
         loop = asyncio.get_event_loop()
@@ -374,6 +434,12 @@ async def _dispatch(job: IdleJob) -> None:
         aid = activity_log.set_current(job.name, f"{job.name} running")
         try:
             result = await loop.run_in_executor(_executor, _labelled_run, job)
+            if isinstance(result, dict) and result.get(_HELD):
+                _note_hold(result[_HELD])
+                consumed = False
+                return
+            if job.needs_model:
+                _note_hold("")
             if isinstance(result, dict):
                 if result.get("skipped"):
                     print(f"[{job.name}] autonomous skipped: {result['skipped']}",
@@ -553,6 +619,57 @@ def _selftest() -> None:
             f"a job's own name must label its passes, got {labels['namer']!r}"
         assert labels["next"] == "next", \
             f"the previous job's label leaked onto the next: {labels['next']!r}"
+
+        # Foreign weights loaded (a sticky regeneration swap): a model job is held without
+        # spending its interval, a GPU-free one still runs, the hold is journalled once,
+        # and the swap landing BETWEEN the loop's check and the executor run is caught on
+        # the executor. Once the configured adapter is back, the held job runs.
+        global _serving_mismatch, _hold_reason
+        _jobs.clear()
+        _gpu_lock = None
+        pool = _executor = ThreadPoolExecutor(max_workers=1)
+        ran: list[str] = []
+        mismatch = {"now": "the loaded adapter X is not the configured Y"}
+        _serving_mismatch = lambda: mismatch["now"]
+        held_logs: list = []
+        _append_saved = activity_log.append
+        activity_log.append = lambda src, kind, msg, **kw: held_logs.append((src, kind, msg))
+        try:
+            model_job = IdleJob("model", 100.0, run=lambda: ran.append("model") or {})
+            fold_job = IdleJob("fold", 100.0, run=lambda: ran.append("fold") or {},
+                               needs_model=False)
+
+            async def _drive_hold() -> None:
+                await _dispatch(model_job)
+                await _dispatch(model_job)
+                await _dispatch(fold_job)
+
+            asyncio.run(_drive_hold())
+            assert ran == ["fold"], ran
+            assert model_job._last_ran == float("-inf"), "a held job must not spend its interval"
+            holds = [m for s, k, m in held_logs if s == "idle"]
+            assert len(holds) == 1 and "held" in holds[0], held_logs
+
+            # The race: the loop-side check passes, the swap lands before the body runs.
+            mismatch["now"] = ""
+            calls = {"n": 0}
+
+            def _flip() -> str:
+                calls["n"] += 1
+                return "" if calls["n"] == 1 else "the loaded adapter X is not the configured Y"
+            _serving_mismatch = _flip
+            asyncio.run(_dispatch(model_job))
+            assert ran == ["fold"] and model_job._last_ran == float("-inf"), ran
+
+            _serving_mismatch = lambda: ""
+            asyncio.run(_dispatch(model_job))
+            assert ran == ["fold", "model"], ran
+            assert [m for s, k, m in held_logs if s == "idle"][-1].startswith("background jobs resumed")
+        finally:
+            activity_log.append = _append_saved
+            _serving_mismatch = lambda: ""
+            _hold_reason = ""
+            pool.shutdown(wait=True)
 
     _jobs.clear()
     _gpu_lock = None

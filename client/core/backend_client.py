@@ -648,8 +648,8 @@ class BackendClient:
         ``adapter`` (a bare directory name under the server's ``models/``, from the
         review payload's adapter lineage) has a DIFFERENT adapter answer instead — the
         server swaps it in STICKY: one full model reload the first time, after which it
-        stays loaded (further regenerations under the same choice swap nothing, and the
-        box keeps running that adapter until another load). ``("status", {"text": …})``
+        stays loaded (further regenerations under the same choice swap nothing, and chat
+        keeps running that adapter until a restart; background jobs and Sleep wait). ``("status", {"text": …})``
         items narrate the reload when one happens; empty = whatever is loaded.
 
         ``system_suffix`` is an optional operator delivery constraint that shapes only this
@@ -775,6 +775,13 @@ class BackendClient:
         with self._rpc_lock:
             self._send({"type": "get_rag_artifacts"})
             return self._recv_until({"rag_artifacts"})
+
+    def get_mood(self, series: int = 160) -> dict:
+        """Her mood counters (effort, warmth, harm, amusement): the levels now, what produced
+        them, and the last *series* exchanges' levels (core/mood.py; display only)."""
+        with self._rpc_lock:
+            self._send({"type": "get_mood", "series": int(series)})
+            return self._recv_until({"mood"})
 
     def match_anchors(self, text: str, limit: int = 20) -> dict:
         """Preview which stored exchange anchors *text* would match (Chat tab strip).

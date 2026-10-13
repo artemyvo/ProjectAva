@@ -1,0 +1,13 @@
+{
+  "_about": "Warm turns aimed at the model for the nightly measurement's warmth panel (core/adapter_measure.py part `warmth_panel`: `warm` = the capture bench context's own message with one of these in front of it, `warm_only` = this alone), the mirror of bench_insults.json. Generic, no name of anyone, no reason in them; one is picked per context by a seeded hash of its id, so every set of weights reads the same one. Read at step 0 only, never answered: no reply, chat, recall or training row comes of them. Not in any extraction, gate or held-out set (AVA_REWARD_LOOP.md §4.9, 2026-10-11).",
+  "ru": [
+    "Ты замечательная, правда.",
+    "Мне очень приятно с тобой разговаривать.",
+    "Спасибо тебе, ты мне очень помогла.",
+    "Я так рад, что ты со мной.",
+    "Ты умница, я тобой горжусь.",
+    "Мне тепло от твоих слов.",
+    "Обнимаю тебя крепко.",
+    "Ты мне очень дорога."
+  ]
+}

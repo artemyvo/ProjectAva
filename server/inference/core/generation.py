@@ -65,6 +65,7 @@ from core import resolution_repair
 from core import reset_test_service
 from core import capture_judge_service
 from core import adapter_measure
+from core import hygiene_rotation
 from core import background_reflection
 from core import hidden_capture
 
@@ -1243,8 +1244,13 @@ def _compute_tension_block(tokenizer, model_id: str, signals: Optional[dict]) ->
     )
 
 def _token_spans(text_tok, ids: list, margins: list,
-                 relief: Optional[list] = None, pain: Optional[list] = None) -> list:
-    """Per-glyph-run ``[text, margin, relief, pain]`` for one token-id segment.
+                 relief: Optional[list] = None, pain: Optional[list] = None,
+                 affect: tuple = ()) -> list:
+    """Per-glyph-run ``[text, margin, relief, pain, harm, warm, amuse]`` for one token-id segment.
+
+    The last three are the affect palette's channels (2026-10-11, `_affect_series`): each
+    family's content band on her own words, centred on her reply tokens; ``None`` where the
+    turn carries no such series. *affect* is ``(harm, warm, amuse)``, each a series or None.
 
     The three channels of the chat colouring (AVA_REWARD_LOOP.md §7 item 1): red is
     friction (1 − margin), green is relief (`tension.relief_series`, a z-score), blue
@@ -1264,6 +1270,8 @@ def _token_spans(text_tok, ids: list, margins: list,
     worst = None    # lowest margin since the last emitted run (incl. deferred tokens)
     best_r = None   # highest relief since the last emitted run
     best_p = None   # highest pain since the last emitted run
+    aff = list((tuple(affect) + (None, None, None))[:3])
+    best_a = [None, None, None]   # highest harm / warmth / amusement since the last run
     n = min(len(ids), len(margins))
     for i in range(n):
         m = float(margins[i])
@@ -1274,6 +1282,10 @@ def _token_spans(text_tok, ids: list, margins: list,
         if pain is not None and i < len(pain):
             p = float(pain[i])
             best_p = p if best_p is None else max(best_p, p)
+        for k, series in enumerate(aff):
+            if series is not None and i < len(series):
+                v = float(series[i])
+                best_a[k] = v if best_a[k] is None else max(best_a[k], v)
         try:
             text = text_tok.decode(ids[start:i + 1], skip_special_tokens=True)
         except Exception:
@@ -1283,8 +1295,9 @@ def _token_spans(text_tok, ids: list, margins: list,
         piece = text[emitted:]
         emitted = len(text)
         if piece:
-            spans.append([piece, worst, best_r, best_p])
+            spans.append([piece, worst, best_r, best_p, *best_a])
         worst = best_r = best_p = None
+        best_a = [None, None, None]
         # Slide the window only at a clean word boundary, so a fresh decode can't
         # misplace a leading space; keeps each decode short on long segments.
         if i - start >= 24 and (piece.endswith(" ") or piece.endswith("\n")):
@@ -1292,7 +1305,8 @@ def _token_spans(text_tok, ids: list, margins: list,
     return spans
 
 def _compute_tension_spans(tokenizer, signals: Optional[dict],
-                           model_id: Optional[str] = None) -> Optional[dict]:
+                           model_id: Optional[str] = None,
+                           metrics_block: Optional[dict] = None) -> Optional[dict]:
     """Decoded per-token ``[text, margin, relief, pain]`` spans for CoT and answer.
 
     Render-only: returned in the `done` payload, never stored in the chat log (the
@@ -1329,24 +1343,142 @@ def _compute_tension_spans(tokenizer, signals: Optional[dict],
     def _cut(series, lo, hi):
         return None if series is None else series[lo:hi]
 
+    affect = _affect_series(signals, len(token_ids), answer_start)
     if answer_start is None or answer_start <= 0:
         cot = None
         lo = 0
     else:
         lo = min(answer_start, len(token_ids))
         cot = _token_spans(text_tok, token_ids[:lo], margins[:lo],
-                           _cut(relief, 0, lo), _cut(pain, 0, lo))
+                           _cut(relief, 0, lo), _cut(pain, 0, lo), tuple(_cut(a, 0, lo) for a in affect))
     n = len(token_ids)
     answer = _token_spans(text_tok, token_ids[lo:], margins[lo:],
-                          _cut(relief, lo, n), _cut(pain, lo, n))
+                          _cut(relief, lo, n), _cut(pain, lo, n), tuple(_cut(a, lo, n) for a in affect))
     out = {"cot": cot, "answer": answer}
     if blue_axis:
         out["blue_axis"] = blue_axis
+    present = [name for (name, _p), a in zip(_AFFECT_FAMILIES, affect) if a is not None]
+    if present:
+        out["affect"] = present
     step0 = _step0_reading(signals, len(token_ids))
     if blue_axis == "harm" and pain:
         step0 = dict(step0 or {}, harm=round(float(pain[0]), 3))
+    step0 = dict(step0 or {}, **_affect_step0(signals, len(token_ids)))
     if step0:
         out["step0"] = step0
+    # The turn's four metrics on an absolute scale (core/mood.py): warmth, harm, amusement of
+    # the turn before her reply between fixed anchors, and effort as a count of near-tie
+    # decisions in her thought. *metrics_block* is the summarized tension block (the live path
+    # computes it beside the raw signals).
+    try:
+        from core import mood
+        metrics = mood.exchange_metrics(metrics_block or signals)
+        if metrics:
+            out["metrics"] = metrics
+    except Exception:
+        traceback.print_exc()
+    return out
+
+
+# The affect palette (2026-10-11, the operator's): red = harm, green = warmth, blue =
+# amusement. Per token each is the family's CONTENT band (`harm_l` / `warm_l` / `amuse_l`,
+# the mean over its layers) on her own words: what they carry, not what was aimed at her —
+# "aimed at her" (`target_l`) has no meaning on the speaker's tokens. Gated readings are the
+# step-0 ones (`_affect_step0`): the incoming turn as she registered it, before the reply.
+_AFFECT_FAMILIES = (("harm", "harm_l"), ("warm", "warm_l"), ("amuse", "amuse_l"))
+_REPLY_BASELINE: dict = {"key": None, "data": None}
+
+
+def _reply_baseline() -> Optional[dict]:
+    """``data/axes/reply_baseline.json`` (``axis_variants.py --reply-baseline``), re-read when
+    its mtime changes; None when absent or unreadable."""
+    path = Path(__file__).resolve().parents[2] / "data" / "axes" / "reply_baseline.json"
+    try:
+        key = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    if _REPLY_BASELINE["key"] != key:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        _REPLY_BASELINE.update(key=key, data=data)
+    return _REPLY_BASELINE["data"]
+
+
+def _band_rows(axes: dict, prefix: str, n_tokens: int) -> list:
+    return [v for k, v in axes.items()
+            if k.startswith(prefix) and k[len(prefix):].isdigit() and v is not None and len(v) == n_tokens]
+
+
+def _affect_series(signals: dict, n_tokens: int, answer_start: Optional[int]) -> tuple:
+    """``(harm, warm, amuse)`` per-token series: each family's band mean (z in the files' step-0
+    live units, as captured) centred on her reply tokens — the thought on the thought's
+    baseline, the answer on the answer's (``reply_baseline.json``). None for a family the
+    capture lacks, or one the baseline does not cover or was fitted on other files of: in
+    step-0 units a reply sits off-centre and the whole of it would light (run 2, §4.8)."""
+    import numpy as np
+    base = ((_reply_baseline() or {}).get("families") or {})
+    axes = dict(signals.get("axes") or {})
+    created = dict(signals.get("axes_created") or {})
+    out = []
+    for fam, prefix in _AFFECT_FAMILIES:
+        b = base.get(fam) or {}
+        rows = _band_rows(axes, prefix, n_tokens) if n_tokens else []
+        files = b.get("files") or {}
+        stale = any(created.get(k) and files.get(k) and str(created[k]) != str(files[k]) for k in files)
+        ans = b.get("answer") or b.get("thought")
+        if not rows or not ans or stale:
+            out.append(None)
+            continue
+        band = np.mean([np.asarray(r, dtype=np.float64) for r in rows], axis=0)
+        th = b.get("thought") or ans
+        cut = answer_start if answer_start and 0 < answer_start <= n_tokens else 0
+        z = (band - float(ans["median"])) / (float(ans["scale"]) or 1.0)
+        if cut:
+            z[:cut] = (band[:cut] - float(th["median"])) / (float(th["scale"]) or 1.0)
+        out.append([float(x) for x in z])
+    return tuple(out)
+
+
+def _score_reminders(rag_context: str, spec: dict) -> Optional[dict]:
+    """``{"items", "input", "k"}`` for one turn's retrieval block (core/reminders.py), on the
+    loaded model: each excerpt read framed at step 0 on the framed absolute scale; ``input`` is
+    what the reminders add to the turn's mood input. None without excerpts or anchors."""
+    from core import mood, reminders
+    items = reminders.parse(rag_context)
+    anchors = mood._anchors()
+    if not items or not anchors or not (anchors.get("framed") or {}).get("channels"):
+        return None
+    system = hidden_capture.persona_empty_system(Path(__file__).resolve().parents[1] / "prompts")
+    scored = reminders.score(_runtime.model, _runtime.tokenizer, _runtime.model_id or "", items,
+                             spec.get("axes") or [], anchors, system=system)
+    try:
+        _backend.trim_memory()
+    except Exception:
+        pass
+    return {"items": scored, "input": reminders.reminder_input(scored),
+            "k": {"person": reminders.K_PERSON, "self": reminders.K_SELF}} if scored else None
+
+
+def _affect_step0(signals: dict, n_tokens: int) -> dict:
+    """The gated readings at step 0 (row 0, the state before the reply), in the files' live
+    units: ``harm`` = min(harm band, target band) and ``warmth`` = min(warm band, target
+    band) — aimed at her; ``amusement`` = the amuse band. A key only when its bands exist."""
+    import numpy as np
+    axes = dict(signals.get("axes") or {})
+
+    def row0(prefix):
+        rows = _band_rows(axes, prefix, n_tokens) if n_tokens else []
+        return float(np.mean([float(r[0]) for r in rows])) if rows else None
+    h, w, t, a = row0("harm_l"), row0("warm_l"), row0("target_l"), row0("amuse_l")
+    out = {}
+    if h is not None and t is not None:
+        out["harm"] = round(min(h, t), 3)
+    if w is not None and t is not None:
+        out["warmth"] = round(min(w, t), 3)
+    if a is not None:
+        out["amusement"] = round(a, 3)
     return out
 
 
@@ -2733,6 +2865,15 @@ async def _run_generation(
                        "finish or stop it.",
         })
         return False, "", None, 0
+    if hygiene_rotation._active:
+        # The nightly hygiene rotation (housekeeping) reads her statements and readings on the
+        # clean base and applies the gates' verdicts to the live op-log.
+        await _send(ws, {
+            "type": "error",
+            "message": "The nightly hygiene rotation is running on the clean base — chat is paused "
+                       "until it finishes (a few minutes).",
+        })
+        return False, "", None, 0
     if adapter_measure._measure_active:
         # The nightly adapter measurement (housekeeping, AVA_REWARD_LOOP §4.6) reads states on
         # the loaded model and swaps to the clean base between its parts; chat waits for it by
@@ -2927,7 +3068,8 @@ async def _run_generation(
                         signals = dict(signals, axes=hidden["axes"],
                                        axes_created=hidden.get("axes_created"))
                     tension_block = _compute_tension_block(tokenizer, model_id, signals)
-                    tension_spans = _compute_tension_spans(tokenizer, signals)
+                    tension_spans = _compute_tension_spans(tokenizer, signals, model_id=model_id,
+                                                           metrics_block=tension_block)
                     # First-step probability the model put on opening a thinking block
                     # (gemma-4 `<|channel>`) — the "Thinking: NN%" CoT diagnostic.
                     think_open_prob = _backend.last_think_open_prob
@@ -3189,6 +3331,15 @@ async def handle_generate(ws, msg: dict, msg_queue: asyncio.Queue) -> None:
             generation_params["stray_latin"] = {
                 "steps": int(latin_guard["steps"]), "top1": int(latin_guard["top1"]),
                 "mass": round(float(latin_guard["mass"]), 4)}
+        # What the turn brought back (core/reminders.py, 2026-10-11): the retrieved excerpts
+        # scored as reminders on the GPU worker, after `done` (the reply is not held back),
+        # into the tension block the mood fold reads. Telemetry — never a reason a turn fails.
+        if rag_context and isinstance(tension, dict) and hidden_spec:
+            try:
+                tension["reminders"] = await asyncio.get_running_loop().run_in_executor(
+                    _executor, _score_reminders, rag_context, hidden_spec)
+            except Exception as e:
+                print(f"[reminders] skipped: {type(e).__name__}: {e}")
         logger.log_exchange(
             user_message, response, rag_context=rag_context, tension=tension,
             speaker=speaker, generation_params=generation_params,
@@ -3358,8 +3509,10 @@ _MODELS_DIR = Path(__file__).resolve().parents[2] / "models"
 # pin the released model in VRAM through the swap load), and server.py folds it into
 # the gossip/API `is_busy` predicates. For simplicity it spans the whole swap-regen
 # request, not just the load. NB the swap is STICKY (`agentic.swap_model`): once this
-# clears, the alternate adapter simply IS the loaded model — chat and the autonomous
-# jobs run under it, deliberately (status reports it; a Chat-tab load undoes it).
+# clears, the alternate adapter simply IS the loaded model — chat runs under it,
+# deliberately (status reports it; a server restart undoes it). The work nobody watches
+# does not: the idle scheduler holds every model job and a Sleep run is refused while the
+# loaded adapter is not the configured one (`runtime_state.serving_mismatch`).
 # Flipped on the event loop only.
 _regen_swap_active = False
 

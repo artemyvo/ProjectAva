@@ -1926,6 +1926,27 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None,
             return {"examples": 0, "rows": 0, "preview_rows": len(preview_rows),
                     "mode": mode, "skipped": True}
 
+    # The habit governor (core/governor.py, AVA_REWARD_LOOP.md §4.11): over exactly what is
+    # about to train (an increment's owed rows, or a full train's every row), each governed
+    # habit's dose-weighted share is held at or below k x the frozen base's rate on ordinary
+    # live turns by holding the newest flagged exchanges (sidecar `governor`, bound to the
+    # target, refused by every later build); old holds are released below the band. A dry
+    # run plans and writes nothing. Never breaks a build.
+    from core import governor as _governor
+    rows, governor_report = _governor.apply_in_build(
+        rows, chats_dir=chats_dirs[0], measure_dir=_MODELS_DIR.parent / "data" / "measure",
+        cfg=config, build_id=f"{mode}@{built_at}", write=not dry_run,
+        say=lambda m: print(m, flush=True))
+    if governor_report.get("held") is not None:
+        progress.emit("render", f"Governor: held {governor_report.get('held')} exchange(s), released "
+                                f"{governor_report.get('released')} (k={governor_report.get('k')}).",
+                      governor=governor_report)
+    if not rows:
+        progress.emit("done", "Governor held every row of this build — adapter and dose ledger "
+                              "untouched.", status="info", skipped=True)
+        return {"examples": 0, "rows": 0, "preview_rows": len(preview_rows), "mode": mode,
+                "skipped": True, "governor": governor_report}
+
     # Flat chronological corpus rows. Row identity + multiplier stay on each example through
     # tokenization/masking; only the final retained dataset becomes the optimizer schedule.
     # source_session/exchange_index travel on each row so a training render maps back to
@@ -2682,6 +2703,7 @@ def run_cycle(*, dry_run: bool = False, lora_r: Optional[int] = None,
             "incremental": ({**inc_cfg, **{k: v for k, v in (inc_stats or {}).items()
                                            if k != "targets"}}
                             if incremental else None),
+            "governor": governor_report,
             "server_config": config,
         }
         snap = write_snapshot(models_dir=_MODELS_DIR, build_id=build_id, meta=meta,

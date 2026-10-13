@@ -38,6 +38,17 @@ file against the codebase, even if nothing changed.
   the legacy file itself; new design writing goes into this folder's maintained set.
 - `../README.md` — the philosophy/"what" document, unaffected by this split.
 - `../SCRATCHPAD.md` — raw brainstorming; nothing in it is a commitment.
+
+## Articles
+
+`articles/` holds finished write-ups of findings, self-contained HTML. They are not part of
+the maintained set: a write-up records what was measured when it was written, and the
+changelog carries anything that later changes how to read it.
+
+- `articles/recognized-not-answered.html` (October 2026) — addressee-aware affect probes on
+  Gemma-4 across the adapter lineage: content × addressee, the reference-anchored scale,
+  registration flat across builds while the replies' register shifts, steering (warmth used,
+  harm inert).
 - `../SPARK_LOADING.md` — **read before touching the model loader**: the three DGX Spark
   load-time traps (mmap→CUDA at 0.16 GB/s, CUDA free excludes page cache, bnb skips fused
   MoE experts), their fixes, and the benchmark that re-verifies them.

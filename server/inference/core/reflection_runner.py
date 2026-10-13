@@ -268,6 +268,35 @@ def _user_portraits_enabled() -> bool:
         return True
 
 
+def _user_portrait_author() -> str:
+    """Which weights write a person's portrait (``user_portrait.author``): ``base`` (default
+    since 2026-10-10) writes it inside the clean-base window, right after its grouping, from
+    her readings as text; ``adapter`` writes it after the window, in her voice. Written on
+    the adapter, a habit of hers reached the person's portrait, which conditions every one
+    of their turns (``core/portrait_hygiene.py``). Best-effort: unreadable reads as base."""
+    try:
+        from training.reflections_path import load_server_config
+        cfg = (load_server_config() or {}).get("user_portrait") or {}
+        return "adapter" if str(cfg.get("author") or "base").strip().lower() == "adapter" else "base"
+    except Exception:
+        return "base"
+
+
+def _user_notes_author() -> str:
+    """Which weights write her ``[impression]`` readings of a person (``user_notes.author``):
+    ``base`` (default since 2026-10-10) defers each chat's user-notes pass to the clean-base
+    batch, where the frozen base reads the transcript; ``adapter`` runs it per chat, in her
+    voice. On the adapter the readings carried her own habits onto the person (portrait
+    hygiene withheld 65% of them; 5 of 5 new ones the day it went live); the gate stays as the
+    backstop. Best-effort: unreadable reads as base."""
+    try:
+        from training.reflections_path import load_server_config
+        cfg = (load_server_config() or {}).get("user_notes") or {}
+        return "adapter" if str(cfg.get("author") or "base").strip().lower() == "adapter" else "base"
+    except Exception:
+        return "base"
+
+
 def _self_portrait_enabled() -> bool:
     """Box-wide kill-switch for the outside-view self-portrait (``self_portrait.enabled``).
 
@@ -639,6 +668,7 @@ class ReflectionRunner:
         capture_gate_fn: Optional[Callable] = None,
         thought_hygiene_fn: Optional[Callable] = None,
         persona_hygiene_fn: Optional[Callable] = None,
+        portrait_hygiene_fn: Optional[Callable] = None,
         child_ask_fn: Optional[Callable] = None,
         aspiration_fn: Optional[Callable] = None,
         finalize: bool = True,
@@ -768,6 +798,14 @@ class ReflectionRunner:
             superseded through this run's writer and ledger (staged); the withheld keys leave
             this run's digest evidence. None when ``persona_hygiene.enabled`` is off.
 
+        *portrait_hygiene_fn* fn(writer=, memory_dirs=, run_id=, say=, should_stop=) ->
+            (tally, withheld keys): portrait hygiene (``core.portrait_hygiene``), in the
+            clean-base batch before the user portraits are grouped: the frozen base reads each
+            ``[impression]`` of a person against that person's own messages, and one they do
+            not show is superseded through this run's writer (staged), and the withheld
+            readings leave this run's portrait plans. None when ``portrait_hygiene.enabled``
+            is off.
+
         *aspiration_fn* fn(writer=, memory_dirs=, run_id=, say=, should_stop=) -> tally: what
             she wants to become (``core.aspiration``), on the ADAPTER after the child ask: her
             self-review of a few portrait items and the aspirations she writes from a habit she
@@ -820,6 +858,9 @@ class ReflectionRunner:
         judge_jobs: list = []
         # chat_reflected chats whose freeze/ack waits on the clean-base phase (step 4b).
         deferred_finalize: list = []
+        # Per-chat user-notes passes deferred to the clean-base batch (`user_notes.author:
+        # base`): (filename, session, sess_idx, total_sessions).
+        user_notes_jobs: list = []
         # Candidate host exchanges the fact-placement judge picks from (one per revised,
         # trainable exchange). Independent of branching/digest — a fact needs a home CoT,
         # not a persona standard — so it is always collected when the runner is revising.
@@ -934,6 +975,8 @@ class ReflectionRunner:
                             for c in (pend.get("fact_candidates") or []):
                                 fact_candidates.append(c)
                                 n_f += 1
+                            if pend.get("user_notes"):
+                                user_notes_jobs.append((filename, session, sess_idx, total_sessions))
                         except Exception:
                             pass
                     # The freeze (`reflected_at`), the crash checkpoint and the ack that
@@ -1046,7 +1089,14 @@ class ReflectionRunner:
                 #     the suppression a revisit applies is about not letting an obsolete
                 #     chat reshape *her own* identity, which this pass does not touch.
                 #     Opt-out via `overrides.user_notes=False`.
+                defer_notes = (not dry_run and _user_notes_author() == "base")
                 if (not consolidation_only and not store.is_stop_requested(run_id)
+                        and getattr(config.overrides, "user_notes", None) is not False
+                        and defer_notes):
+                    # The frozen base reads this chat in the clean-base batch (or, for a
+                    # background drain, in the Sleep run that finishes it).
+                    user_notes_jobs.append((filename, session, sess_idx, total_sessions))
+                elif (not consolidation_only and not store.is_stop_requested(run_id)
                         and getattr(config.overrides, "user_notes", None) is not False):
                     try:
                         self._run_user_notes_pass_for_session(
@@ -1149,7 +1199,10 @@ class ReflectionRunner:
                                       if j.get("session") == filename]
                                 sf = [c for c in fact_candidates
                                       if c.get("session") == filename]
-                                on_chat_reflected(filename, sj, sf)
+                                if any(j[0] == filename for j in user_notes_jobs):
+                                    on_chat_reflected(filename, sj, sf, user_notes=True)
+                                else:
+                                    on_chat_reflected(filename, sj, sf)
                             except Exception:
                                 pass
                     else:
@@ -1227,6 +1280,9 @@ class ReflectionRunner:
                     run_id, store, send_event_fn,
                     force=bool(getattr(config.overrides, "force_user_portrait", False)))
             user_evidence: dict = {}
+            # Set when the portraits were written inside the clean-base window
+            # (`user_portrait.author: base`), so step 6 does not write them again.
+            user_written_on_base = False
 
             # 3b-bis. Outside-view self-portrait, part one — same model-free gate, one
             #     subject. Same conditions as the user portraits above, including running
@@ -1323,14 +1379,20 @@ class ReflectionRunner:
             #     it withholds is not grouped into her portrait in this run.
             run_persona_hygiene = bool(persona_hygiene_fn is not None and not dry_run
                                        and not getattr(config, "revisit", False))
+            # (f-iv) portrait hygiene — the frozen base reads each [impression] of a person
+            #     against that person's own messages; one they do not show is withheld
+            #     (`core/portrait_hygiene.py`). Before the user portraits are grouped: what it
+            #     withholds leaves this run's portrait evidence.
+            run_portrait_hygiene = bool(portrait_hygiene_fn is not None and not dry_run)
             if (clean_base_ctx is not None
                     and (run_branch_judge or run_fact_placement or run_digest_cluster
                          or user_plans or self_plan or run_fact_dedup or run_prompt_patterns
                          or run_distill_gate or run_capture_gate or run_thought_hygiene
-                         or run_persona_hygiene)
+                         or run_persona_hygiene or run_portrait_hygiene
+                         or (user_notes_jobs and not config.chat_only))
                     and not store.is_stop_requested(run_id)):
                 def _clean_base_batch():
-                    nonlocal digest_evidence, user_evidence, self_evidence
+                    nonlocal digest_evidence, user_evidence, self_evidence, user_written_on_base
                     overrides = 0
                     if run_distill_gate:
                         self._run_clean_base_distill_gate(
@@ -1363,9 +1425,34 @@ class ReflectionRunner:
                         digest_evidence = self._cluster_persona_digest(
                             digest_plan, run_id, generate_fn, store, send_event_fn,
                             map_reduce=use_map_reduce, polarity=use_polarity)
+                    if user_notes_jobs and not config.chat_only and not store.is_stop_requested(run_id):
+                        self._run_deferred_user_notes(
+                            config, user_notes_jobs, generate_fn=generate_fn, store=store,
+                            context_length=context_length, tokenizer=tokenizer,
+                            send_event_fn=send_event_fn, stats=stats, where="clean base")
+                        user_notes_jobs.clear()
+                    if run_portrait_hygiene and not store.is_stop_requested(run_id):
+                        withheld_readings = self._run_clean_base_portrait_hygiene(
+                            run_id, portrait_hygiene_fn=portrait_hygiene_fn, store=store,
+                            send_event_fn=send_event_fn)
+                        if withheld_readings and user_plans:
+                            # The plans read the live op-log; the supersedes are staged with
+                            # this run. Drop the withheld readings from the evidence here (a
+                            # person with no plan this run is rebuilt on the next one).
+                            from core import user_digest as _ud
+                            for _p in user_plans:
+                                _p["items"] = [e for e in _p["items"] if e.get("key") not in withheld_readings]
+                                _p["raw_fp"] = _ud.raw_fingerprint(_p["items"])
                     if user_plans and not store.is_stop_requested(run_id):
                         user_evidence = self._cluster_user_portraits(
                             user_plans, run_id, generate_fn, store, send_event_fn)
+                        if user_evidence and _user_portrait_author() == "base":
+                            # The portrait written by the frozen base from her readings as
+                            # text, not by the weights that carry her habits.
+                            self._synthesize_user_portraits(
+                                user_plans, user_evidence, run_id, generate_fn,
+                                store, send_event_fn, author="base")
+                            user_written_on_base = True
                     if self_plan and not store.is_stop_requested(run_id):
                         self_evidence = self._cluster_self_portrait(
                             self_plan, run_id, generate_fn, store, send_event_fn)
@@ -1474,12 +1561,22 @@ class ReflectionRunner:
                                phase="persona_digest",
                                message=f"Persona digest error (skipped): {e}")
 
-            # 6. User portraits, part two: synthesize each person's portrait on the
-            #    ADAPTER — her reading of someone, in her voice, exactly as the
-            #    self-portrait above. When no clean-base swap is available at all (the
-            #    headless reflection_run.py CLI), cluster here on the adapter instead: the
-            #    clean base is an upgrade where it exists, not a requirement.
-            if user_plans and not store.is_stop_requested(run_id):
+            # 5-bis. Deferred user notes the clean-base batch did not run (no clean base on
+            #    this host, e.g. the headless CLI): written on the adapter rather than lost.
+            if user_notes_jobs and not config.chat_only and not store.is_stop_requested(run_id):
+                self._run_deferred_user_notes(
+                    config, user_notes_jobs, generate_fn=generate_fn, store=store,
+                    context_length=context_length, tokenizer=tokenizer,
+                    send_event_fn=send_event_fn, stats=stats, where="adapter (no clean base)")
+                user_notes_jobs.clear()
+
+            # 6. User portraits, part two, with `user_portrait.author: adapter`: synthesize
+            #    each person's portrait on the ADAPTER, in her voice. (The default, `base`,
+            #    wrote them inside the clean-base window above.) When no clean-base swap is
+            #    available at all (the headless reflection_run.py CLI), cluster and write
+            #    here on the adapter whatever the knob says: the clean base is an upgrade
+            #    where it exists, not a requirement.
+            if user_plans and not user_written_on_base and not store.is_stop_requested(run_id):
                 try:
                     if not user_evidence:
                         user_evidence = self._cluster_user_portraits(
@@ -5714,6 +5811,52 @@ class ReflectionRunner:
                    message=f"Persona hygiene done — {done}")
         return set(withheld or ())
 
+    def _run_deferred_user_notes(self, config, jobs: list, *, generate_fn: Callable, store, context_length,
+                                 tokenizer, send_event_fn, stats, where: str) -> int:
+        """The user-notes passes deferred from the per-chat loop (``user_notes.author: base``),
+        on whatever *generate_fn* targets now. Best-effort per chat. Returns readings written."""
+        self._emit(store, send_event_fn, config.run_id, "phase_started", phase="user_notes",
+                   message=f"User notes on the {where}: {len(jobs)} chat(s)")
+        n = 0
+        for filename, session, sess_idx, total in jobs:
+            if store.is_stop_requested(config.run_id):
+                break
+            try:
+                n += self._run_user_notes_pass_for_session(
+                    config, filename, session, sess_idx, total, generate_fn=generate_fn, store=store,
+                    context_length=context_length, tokenizer=tokenizer, send_event_fn=send_event_fn,
+                    stats=stats, dry_run=False) or 0
+            except Exception as e:
+                self._emit(store, send_event_fn, config.run_id, "pass_warning", phase="user_notes",
+                           session=filename, message=f"User-notes pass error (skipped): {e}")
+        return n
+
+    def _run_clean_base_portrait_hygiene(self, run_id: str, *, portrait_hygiene_fn: Callable,
+                                         store: ReflectionRunStore,
+                                         send_event_fn: Optional[Callable]) -> set:
+        """Portrait hygiene (``core/portrait_hygiene.py``), inside the clean base: her
+        ``[impression]`` readings a person's own messages do not show are withheld through
+        this run's writer (staged). Returns the withheld keys. A failure leaves the readings
+        unread, for the next run."""
+        self._emit(store, send_event_fn, run_id, "phase_started", phase="portrait_hygiene",
+                   message="Portrait hygiene (clean base) — her readings of people not yet read…")
+
+        def _say(text: str) -> None:
+            self._emit(store, send_event_fn, run_id, "portrait_hygiene", message=text)
+
+        try:
+            tally, withheld = portrait_hygiene_fn(
+                writer=self._writer, memory_dirs=[d for d in (self._fallback_memory_dir, self._memory_dir) if d],
+                run_id=run_id, say=_say, should_stop=lambda: store.is_stop_requested(run_id))
+        except Exception as e:  # noqa: BLE001 — the readings wait for the next run
+            self._emit(store, send_event_fn, run_id, "phase_error", phase="portrait_hygiene",
+                       message=f"Portrait hygiene error (the readings wait for the next run): {e}")
+            return set()
+        done = ", ".join(f"{k} {v}" for k, v in sorted(dict(tally or {}).items())) or "nothing to read"
+        self._emit(store, send_event_fn, run_id, "phase_done", phase="portrait_hygiene",
+                   message=f"Portrait hygiene done — {done}")
+        return set(withheld or ())
+
     def _run_clean_base_capture_gate(self, run_id: str, *, capture_gate_fn: Callable,
                                      store: ReflectionRunStore,
                                      send_event_fn: Optional[Callable]) -> None:
@@ -6083,7 +6226,7 @@ class ReflectionRunner:
                             [entry["key"]], source_session=sess,
                             reason=("polarity: opposed by \""
                                     + (entry.get("opposed") or [""])[0][:120] + "\""),
-                            run_id=run_id)
+                            run_id=run_id, grouping=reflection_digest.GROUPING_VERSION)
                     counter_ops["themes"] += 1
                     counter_ops["ops"] += n
                     self._emit(
@@ -6278,13 +6421,12 @@ class ReflectionRunner:
         return out
 
     def _synthesize_user_portraits(self, plans, evidence_by_slug, run_id, generate_fn,
-                                   store, send_event_fn) -> int:
-        """Write each person's portrait from clustered evidence — the ADAPTER half.
-
-        Runs after the clean-base window closes: a portrait is Ava's own reading of
-        someone, in her voice, which is precisely what the frozen base must not author
-        (the clustering that fed it was an evaluation, so that half ran adapter-off).
-        Best-effort per person. Returns how many portraits were written.
+                                   store, send_event_fn, *, author: str = "adapter") -> int:
+        """Write each person's portrait from clustered evidence, on whatever *generate_fn*
+        targets: the frozen base inside the clean-base window (``user_portrait.author:
+        base``, the default since 2026-10-10) or the adapter after it (``adapter``). The
+        portrait file records *author*. Best-effort per person. Returns how many portraits
+        were written.
         """
         from core import user_digest
         from training.reflections_path import users_dir
@@ -6299,11 +6441,11 @@ class ReflectionRunner:
             person = plan["person"]
             self._emit(store, send_event_fn, run_id, "phase_started",
                        phase="user_portrait", person=person,
-                       message=f"User portrait: synthesizing who {person} is")
+                       message=f"User portrait: synthesizing who {person} is (on the {author})")
             try:
                 summary = user_digest.synthesize_portrait(
                     person, evidence, generate_fn=generate_fn, users_dir=users_dir(),
-                    run_id=run_id, raw_fp=plan.get("raw_fp"))
+                    run_id=run_id, raw_fp=plan.get("raw_fp"), author=author)
             except Exception as e:
                 self._emit(store, send_event_fn, run_id, "phase_error",
                            phase="user_portrait", person=person,

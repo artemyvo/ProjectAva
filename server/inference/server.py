@@ -180,6 +180,9 @@ Server → client messages (all include "type"):
   prompt_rewrite_status  {attempts?} — the autonomous rewrite's gate verdict chain, budget and
                           the newest attempts with every candidate (Prompt tab). Replies
                           prompt_rewrite_status
+  get_mood               {series?} — her four mood counters (effort, warmth, harm, amusement)
+                          folded over her exchanges, their causes and recent history
+                          (core/mood.py; display only). Replies mood
   prompt_experiment_status {active, prompt, base_prompt, prompt_chars, created_ts?, set_by?, event?}
                           — the live standing prompt + whether it is an experiment and who set it
                           (ava = her own rewrite event / operator / experiment; backs the Prompt tab)
@@ -263,7 +266,9 @@ from core.reflection_config import (
 )
 from core.chat_sidecar import iter_chat_json_files, is_chat_session_json, sidecar_path_for
 from core.runtime_state import runtime as _runtime, session as _session, encounter as _encounter
+from core.runtime_state import serving_mismatch as _serving_mismatch_of
 from core import til_wander
+from core import mood
 from core import encounter_run
 from core import outreach
 from core import synthesis
@@ -277,6 +282,7 @@ from core import assoc_bridge
 from core import prompt_experiment
 from core import prompt_rewrite
 from core import housekeeping
+from core import hygiene_rotation
 from core import adapter_measure
 from core import reflection_service
 from core import generation
@@ -534,6 +540,16 @@ def _server_config_file() -> Path:
             print(f"Warning: could not migrate server_config.json: {e}", flush=True)
             return legacy
     return config_file
+
+
+def _serving_mismatch() -> str:
+    """Why the loaded weights are not ``server_config.json``'s, or ``""`` (see
+    ``runtime_state.serving_mismatch``). No model, or a config that cannot be read, is
+    not a mismatch: the first gates elsewhere, the second must not hold the box."""
+    if _runtime.model is None and _runtime.restore_to is None:
+        return ""
+    cfg = _load_server_config()
+    return _serving_mismatch_of(_runtime, cfg) if cfg else ""
 
 
 def _load_server_config() -> dict:
@@ -2256,6 +2272,7 @@ _HANDLERS_WS_MSG = {                # handler(ws, msg)
     "revert_prompt": prompt_experiment.handle_revert_prompt,
     "prompt_experiment_status": prompt_experiment.handle_experiment_status,
     "prompt_rewrite_status": prompt_rewrite.handle_rewrite_status,
+    "get_mood": mood.handle_mood,
     "persona_preview": reflection_service.handle_persona_preview,
     "start_reflection_run": reflection_service.handle_start_reflection_run,
     "reflection_run_status": reflection_service.handle_reflection_run_status,
@@ -2624,6 +2641,15 @@ def main() -> None:
                                 sleep_max=_ph_cfg.get("sleep_max", 200))
     print(f"persona hygiene: {'on' if _persona_hygiene.enabled() else 'off'} "
           f"(≤{_persona_hygiene.policy()['sleep_max']} statement(s) read per Sleep run)", flush=True)
+    # Portrait hygiene (core/portrait_hygiene.py): in a Sleep run's clean-base batch, before the
+    # user portraits are grouped, a reading of a person their own messages do not show is
+    # withheld. `portrait_hygiene.*`.
+    from core import portrait_hygiene as _portrait_hygiene
+    _pth_cfg = config.get("portrait_hygiene") or {}
+    _portrait_hygiene.set_policy(enabled=bool(_pth_cfg.get("enabled", True)),
+                                 sleep_max=_pth_cfg.get("sleep_max", 200))
+    print(f"portrait hygiene: {'on' if _portrait_hygiene.enabled() else 'off'} "
+          f"(≤{_portrait_hygiene.policy()['sleep_max']} reading(s) read per Sleep run)", flush=True)
     # What she wants to become (core/aspiration.py): in a Sleep run, on the adapter after the child
     # ask, her self-review of a few portrait items and the aspirations she writes from a habit she
     # caught herself in (phase 1), then her own check of them and one small step of her voice
@@ -2866,6 +2892,7 @@ def main() -> None:
         load_server_config=_load_server_config, cancel_event=_cancel_event,
         persona_dir=_persona_dir_fn, send=_send,
     )
+    mood.configure(send=_send, chats_dir=_CHATS_DIR, state_dir=_DATA_DIR / "hot" / "mood")
     # A clean-base / adapter swap that cannot bring a model back escalates here: a
     # watchdog restart onto the config's adapter (the last known good one). See
     # core.agentic.configure and _on_model_lost.
@@ -2886,6 +2913,7 @@ def main() -> None:
         reflection_runs_dir=_REFLECTION_RUNS_DIR, prompts_dir=_PROMPTS_DIR,
         watchdog_mgmt_url=_WATCHDOG_MGMT_URL,
         fresh_session_sync=generation.fresh_session_sync,
+        serving_mismatch=_serving_mismatch,
     )
     # Wire the background per-chat reflection pass. It delegates the actual single-chat
     # reflection to reflection_service.run_chat_only_reflection (so it carries no generation
@@ -2964,8 +2992,14 @@ def main() -> None:
                                or resolution_repair._repair_active
                                or reset_test_service._reset_active
                                or capture_judge_service._capture_active
-                               or adapter_measure._measure_active),
+                               or adapter_measure._measure_active
+                               or hygiene_rotation._active
+                               or generation._regen_swap_active),
         model_loaded=lambda: _runtime.model is not None,
+        # A Training-review regeneration on another adapter leaves it loaded (sticky):
+        # chat under it is the operator's choice, but the model jobs below wait until the
+        # configured adapter is back rather than write another adapter's work as hers.
+        serving_mismatch=_serving_mismatch,
         lock_file=_MEMORY_DIR / "wake.lock",
         idle_seconds=3600.0, poll_seconds=300.0,
         startup_note=f"{_WANDER_TOKENS_PER} tok/wander",
@@ -3103,7 +3137,7 @@ def main() -> None:
     # hour would starve it on exactly the busy box where threads pile up — and always
     # consumes its interval (a sweep that found nothing stale still swept).
     idle_scheduler.register(idle_scheduler.IdleJob(
-        name="worklog_sweep", interval_s=3600.0, idle_seconds=300.0,
+        name="worklog_sweep", interval_s=3600.0, idle_seconds=300.0, needs_model=False,
         run=_run_worklog_sweep,
         describe=_describe_worklog_sweep,
     ))
@@ -3117,7 +3151,7 @@ def main() -> None:
     # `idle_seconds` for the same reason — a full idle hour would starve it on the busy box
     # where the tree goes stale fastest. Skips when current, so it does not log hourly.
     idle_scheduler.register(idle_scheduler.IdleJob(
-        name="graph_rebuild", interval_s=3600.0, idle_seconds=300.0,
+        name="graph_rebuild", interval_s=3600.0, idle_seconds=300.0, needs_model=False,
         run=graph_rebuild.run_rebuild_blocking,
         describe=graph_rebuild.describe,
     ))
@@ -3145,6 +3179,7 @@ def main() -> None:
     # sibling's — the starvation the `ready` doc warns about is job-on-job.
     idle_scheduler.register(idle_scheduler.IdleJob(
         name="assoc_feed", interval_s=_ASSOC_FEED_INTERVAL_S, idle_seconds=300.0,
+        needs_model=False,        # the embedder only — no generation on the loaded weights
         ready=_assoc_feed_ready,
         run=assoc_bridge.run_feed_blocking,
         describe=assoc_bridge.describe_feed,
@@ -3250,10 +3285,27 @@ def main() -> None:
     def _run_measure_adapter() -> dict:
         return adapter_measure.run_blocking(deadline=housekeeping.window_end())
 
+    # The hygiene rotation (2026-10-10, core.hygiene_rotation): what the hygiene gates have not
+    # read under their current judges (persona statements, her readings of people), newest
+    # first within a budget, then readings whose source chat changed; both gates' verdicts
+    # applied to the live op-log; a monthly review sheet of random verdicts for the operator;
+    # the weekly rejected share. Chosen by code, never by her; chat refused while it runs.
+    hygiene_rotation.configure(
+        runtime=_runtime, backend=_backend, with_clean_base=_with_clean_base,
+        get_writer=_get_reflection_writer, chats_dir=_CHATS_DIR, memory_dir=_MEMORY_DIR,
+        consolidation_dir=_CONSOLIDATION_DIR, prompts_dir=_PROMPTS_DIR,
+        load_server_config=_load_server_config,
+        on_progress=lambda m: activity_log.append("hygiene_rotation", "progress", m),
+    )
+
+    def _run_hygiene_rotation() -> dict:
+        return hygiene_rotation.run_blocking(deadline=housekeeping.window_end())
+
     housekeeping.configure(
         state_dir=_DATA_DIR / "hot" / "housekeeping",
         load_server_config=_load_server_config,
         steps=[("prompt_choice", _run_prompt_choice, prompt_rewrite.describe),
+               ("hygiene", _run_hygiene_rotation, hygiene_rotation.describe),
                ("measure_adapter", _run_measure_adapter, adapter_measure.describe)],
         on_progress=lambda m: activity_log.append("housekeeping", "progress", m),
     )
@@ -3292,7 +3344,8 @@ def main() -> None:
                          or resolution_repair._repair_active
                          or reset_test_service._reset_active
                          or capture_judge_service._capture_active
-                         or adapter_measure._measure_active),
+                         or adapter_measure._measure_active
+                         or hygiene_rotation._active),
         gossip_generate=generation._make_gossip_generate(
             log_transcripts=bool(_gossip_cfg.get("log_transcripts", True)),
         ),
@@ -3330,7 +3383,8 @@ def main() -> None:
                              or resolution_repair._repair_active
                              or reset_test_service._reset_active
                              or capture_judge_service._capture_active
-                             or adapter_measure._measure_active),
+                             or adapter_measure._measure_active
+                             or hygiene_rotation._active),
             api_key=str(_api_cfg.get("api_key", "") or ""),
             model_name=str(_api_cfg.get("model_name", "") or "ava"),
             default_max_tokens=_api_cfg.get("max_tokens", "75%"),

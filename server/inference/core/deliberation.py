@@ -310,6 +310,41 @@ _KIND_LABEL = {
 }
 
 
+# The record is framed as hers and the question is put AFTER it (2026-10-13). The instructions
+# and the answer form lived only in the system prompt, above her portrait; the user turn was the
+# record alone, its newest lines her own first-person summaries of talking with someone — and
+# she read it as a conversation to continue: "The user is asking for a response to their
+# previous message", a question made up from the newest line, an essay, no ACTION line. 11 of 19
+# deliberations on 2026-10-12/13 ended without a decision (about 1 in 7 before), each filed as a
+# rest. The head says whose record it is; the tail asks for the decision where she reads last.
+_CONTEXT_HEAD = ("This is your own record, written by you and for you. Nobody wrote it to you and "
+                 "nobody is waiting for a reply to it: it is not a conversation to continue.")
+
+
+def _context_tail() -> str:
+    return ("That is where things stand. Now decide what you do next — think it through if you "
+            "need to, then answer in exactly the form you were given:\n\n"
+            "ACTION: <one of: " + " | ".join(_ACTIONS) + ">\n"
+            "WHY: <one or two sentences, in your own voice>\n"
+            "MISSING: <only when you chose nothing because what you are drawn to is not on the list>")
+
+
+def _has_decision(raw: str) -> bool:
+    """Whether the answer (after the thought) carries an ``ACTION:`` line naming a known action
+    — the difference between a decision for ``nothing`` and no decision at all."""
+    m = re.search(_label("ACTION") + r"([a-z_]+)", _answer_after_think(raw or ""), re.IGNORECASE | re.MULTILINE)
+    return bool(m and m.group(1).strip().lower() in _ACTIONS)
+
+
+def _follow_up(context: str, raw: str) -> str:
+    """The one follow-up when the first answer held no decision: her answer quoted back, the
+    form asked for again (thinking off, a short budget)."""
+    said = " ".join(_answer_after_think(raw or "").split())[:1200]
+    return (context + "\n\nYou were asked to decide, and wrote this instead of a decision:\n\n«"
+            + said + "»\n\nThat has no ACTION line. Give only your decision now, in exactly this form:\n\n"
+            "ACTION: <one of: " + " | ".join(_ACTIONS) + ">\nWHY: <one or two sentences>")
+
+
 def _age_hours(ts: Any, now: float) -> Optional[float]:
     """Hours between an ISO worklog ``ts`` and ``now`` (None when unparseable)."""
     try:
@@ -389,6 +424,12 @@ def _record_dispatch(result: dict, now: Optional[float] = None) -> None:
         return
     now = time.time() if now is None else now
     action = str(result.get("action") or "")
+    if result.get("undecided"):
+        # Not a rest: the streak she is shown counts decisions to rest, not failures to decide.
+        _recent_dispatches.append({"ts": now, "action": "no decision",
+                                   "note": "the answer held no ACTION line, even when asked again"})
+        del _recent_dispatches[:-_RECENT_DISPATCH_CAP]
+        return
     if action == "nothing":
         _rest_streak["count"] = int(_rest_streak.get("count") or 0) + 1
         if _rest_streak.get("since") is None:
@@ -494,11 +535,12 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
         _stage(stage="reading", episodes=len(entries), open_threads=len(open_threads))
 
         now = time.time()
-        context = _render_context(entries, open_threads, now)
+        context = _CONTEXT_HEAD + "\n\n" + _render_context(entries, open_threads, now)
         for block in (_render_recent_dispatches(now), _render_rest_streak(now),
                       _render_notes()):
             if block:
                 context = context + "\n\n" + block
+        context = context + "\n\n" + _context_tail()
         system_prompt = _load_prompt()
         portrait = _persona_portrait()
         if portrait:
@@ -526,12 +568,29 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
                 "decided": True, "executed": False, "action": "nothing", "why": "",
                 "would_do": _WOULD_DO.get("nothing", "nothing"),
                 "episodes": len(entries), "open_threads": len(open_threads),
-                "truncated": True, "cut_before_answer": True,
+                "truncated": True, "cut_before_answer": True, "undecided": True,
                 "dispatch_skipped": "cut_before_answer",
             }
+        retried = undecided = False
+        if not _has_decision(raw):
+            # No decision (an essay, a made-up message answered, another pass's form): asked
+            # once more, briefly; if that fails too it is recorded as undecided — never as a
+            # rest, which would also lengthen the streak she is told about next time.
+            _stage(stage="asking_again")
+            retried = True
+            try:
+                raw2 = generate(_follow_up(context, raw), system_prompt, temperature=0.3, top_p=0.95,
+                                max_new_tokens_setting="256", disable_rag=True, disable_thinking=True)
+            except Exception:
+                traceback.print_exc()
+                raw2 = ""
+            if _has_decision(raw2):
+                raw = raw2
+            else:
+                undecided = True
         action, why = _parse_decision(raw)
         missing = _parse_missing(raw)
-        _stage(stage="decided", action=action)
+        _stage(stage="decided", action=action, undecided=undecided)
 
         result = {
             "decided": True,
@@ -543,6 +602,10 @@ def run_deliberation_blocking(*, n: int = _RECENT_N_DEFAULT,
             "open_threads": len(open_threads),
             "truncated": truncated,
         }
+        if retried:
+            result["retried"] = True
+        if undecided:
+            result["undecided"] = True
         if missing:
             result["missing"] = missing
         if not execute or action == "nothing":
@@ -601,6 +664,8 @@ def consumed(result: dict) -> bool:
 
 def describe(result: dict) -> str:
     """One journal line: what she chose, why (her words), and what came of it."""
+    if result.get("undecided"):
+        return "Deliberation: no decision (the answer held no ACTION line, even when asked again)"
     action = str(result.get("action") or "?")
     why = (result.get("why") or "").strip().replace("\n", " ")
     if len(why) > 160:
@@ -852,6 +917,32 @@ def _selftest() -> None:
         r = run_deliberation_blocking(execute=False)
         assert not r["executed"] and describe(r).endswith("(decision only)") or r["action"] == "nothing"
         assert not consumed({"skipped": "no_history"})
+        # the framing: her record headed as hers, the decision asked for after it
+        assert seen[0].startswith(_CONTEXT_HEAD) and seen[0].rstrip().endswith(
+            "MISSING: <only when you chose nothing because what you are drawn to is not on the list>"), seen[0][-200:]
+        # no decision: asked once more (thinking off); a decision there is taken ...
+        class _Seq:
+            last_truncated = False
+            def __init__(self, raws): self.raws, self.kw = list(raws), []
+            def __call__(self, context, *a, **k):
+                self.kw.append(k)
+                return self.raws.pop(0)
+        seq = _Seq(["<think>The user is asking..</think>\nПроблема здесь в постановке.", "ACTION: wander\nWHY: to read"])
+        globals()["_make_sync_reflect_generate"] = lambda rag: seq
+        calls.clear()
+        r = run_deliberation_blocking(execute=True)
+        assert r["action"] == "wander" and r.get("retried") and not r.get("undecided") and calls == ["wander"], r
+        assert seq.kw[1].get("disable_thinking") is True, seq.kw
+        # ... and none at all is undecided, not a rest: the streak does not move
+        globals()["_make_sync_reflect_generate"] = lambda rag: _Seq(["<think>..</think>\nAn essay.", "Still an essay."])
+        _rest_streak.update(count=2, since=time.time() - 3600)
+        r = run_deliberation_blocking(execute=True)
+        assert r.get("undecided") and r["action"] == "nothing" and not r["executed"], r
+        _record_dispatch(r)
+        assert _rest_streak["count"] == 2 and _recent_dispatches[-1]["action"] == "no decision", (_rest_streak, _recent_dispatches)
+        assert describe(r).startswith("Deliberation: no decision"), describe(r)
+        assert _has_decision("<think>ACTION: wander</think>\nnothing here") is False
+        assert _has_decision("ACTION: nothing\nWHY: quiet") is True
     finally:
         globals()["_runtime"], globals()["_make_sync_reflect_generate"], globals()["_get_rag"] = saved
         worklog.recent, worklog.open_threads = saved_recent, saved_open
